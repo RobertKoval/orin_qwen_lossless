@@ -10,8 +10,8 @@ BF16 even if that fitted.
 | | |
 |---|---|
 | resident weights | **46.5 GB** instead of 69.3 GB (ratio 0.671), all 472 tensors verified bit-exact at load |
-| decode, 1 sequence | **28.7–29.5 tok/s** (context 0 and 2048) |
-| prefill | **305 tok/s** (2048-token prompt ≈ 6.7 s) |
+| decode, 1 sequence | **≈ 30 tok/s** (mean 30.3 at context 0 and 2048; single runs 28.9–31.0) |
+| prefill | **305–311 tok/s** (2048-token prompt ≈ 6.6 s) |
 | outputs | greedy text identical to llama.cpp's own dequant + cuBLAS BF16 path |
 | CPU | no weights and no model ops: the whole graph, embedding included, runs on the GPU (the host only samples) |
 
@@ -28,7 +28,8 @@ Platform findings (bandwidth, EMC, gpu-unlock, accelerators): [docs/ORIN_NOTES.m
 * Weights are converted while llama.cpp loads a normal BF16 GGUF, then decoded back on the GPU and compared bit-for-bit.
 * CUDA kernels: fused decode + GEMV for `MUL_MAT` / `MUL_MAT_ID` (MoE experts selected on the GPU, CUDA-graph friendly),
   `GET_ROWS` for the embedding, exact dequantisation to BF16 + the stock cuBLAS path for prefill. The gated-delta-net kernel
-  reads its recurrent state in place instead of a gathered copy.
+  reads its recurrent state in place instead of a gathered copy, and the GEMV prologue issues all of its independent loads
+  (code table, activations, first bitstream words) before the first use.
 
 ## Quick start (on the Orin)
 

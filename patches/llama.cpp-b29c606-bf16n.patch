@@ -367,7 +367,7 @@
                                                ggml_cuda_gated_delta_net_fused_cache cache);
 --- a/ggml/src/ggml-cuda/bf16n.cu
 +++ b/ggml/src/ggml-cuda/bf16n.cu
-@@ -0,0 +1,1420 @@
+@@ -0,0 +1,1472 @@
 +// GGML_TYPE_BF16N: lossless BF16 weights resident in compressed form.
 +//
 +// The ggml tensor holds the sign|mantissa byte plane (1 B/weight, 512-weight chunks, lane-major:
@@ -864,19 +864,33 @@
 +struct nib_ptrs { const uint8_t * sm; const uint8_t * nib; const uint4 * lut_row; const uint32_t * esc_off; const uint32_t * esc; };
 +struct huf_ptrs { const uint8_t * sm; const uint32_t * lut; const uint32_t * lane_off; const uint32_t * stream; };
 +
-+// dot(row gr, x) for the nibble format; x read through L1 (no shared staging); result in every lane
++// one row of the nibble format held in registers: loads are issued before any of them is used
 +template <int C>
-+__device__ __forceinline__ float nib_row_dot(const nib_ptrs & w, int64_t gr, const float * __restrict__ x, int lane) {
++struct nib_row {
++    uint4 smv[C];
++    uint2 nbv[C];
++    uint4 L;
++};
++
++template <int C>
++__device__ __forceinline__ void nib_row_load(nib_row<C> & d, const nib_ptrs & w, int64_t gr, int lane) {
 +    constexpr int K = C * 512;
 +    const uint8_t * sp = w.sm + gr * K;
 +    const uint8_t * np = w.nib + gr * (K / 2);
-+    uint4 smv[C]; uint2 nbv[C];
 +#pragma unroll
 +    for (int c = 0; c < C; c++) {
-+        smv[c] = __ldg((const uint4 *) (sp + c * 512) + lane);
-+        nbv[c] = __ldg((const uint2 *) (np + c * 256) + lane);
++        d.smv[c] = __ldg((const uint4 *) (sp + c * 512) + lane);
++        d.nbv[c] = __ldg((const uint2 *) (np + c * 256) + lane);
 +    }
-+    const uint4 L = __ldg(w.lut_row + gr);
++    d.L = __ldg(w.lut_row + gr);
++}
++
++// dot(row gr, x) for the nibble format; x read through L1 (no shared staging); result in every lane
++template <int C>
++__device__ __forceinline__ float nib_row_dot(const nib_row<C> & d, const nib_ptrs & w, int64_t gr, const float * __restrict__ x, int lane) {
++    const uint4 * smv = d.smv;
++    const uint2 * nbv = d.nbv;
++    const uint4 L = d.L;
 +    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
 +#pragma unroll
 +    for (int c = 0; c < C; c++) {
@@ -977,7 +991,9 @@
 +    col_setup(p, blockIdx.y, xg, out, rbase);
 +    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 +    for (int64_t r = blockIdx.x * 8 + warp; r < p.nrows; r += gridDim.x * 8) {
-+        const float v = nib_row_dot<C>(w, rbase + r, xg, lane);
++        nib_row<C> d;
++        nib_row_load<C>(d, w, rbase + r, lane);
++        const float v = nib_row_dot<C>(d, w, rbase + r, xg, lane);
 +        if (lane == 0) {
 +            out[r] = v;
 +        }
@@ -991,8 +1007,11 @@
 +    col_setup(p, blockIdx.y, xg, out, rbase);
 +    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 +    for (int64_t r = blockIdx.x * 8 + warp; r < p.nrows; r += gridDim.x * 8) {
-+        const float gv = nib_row_dot<C>(g, rbase + r, xg, lane);
-+        const float uv = nib_row_dot<C>(u, rbase + r, xg, lane);
++        nib_row<C> dg, du;
++        nib_row_load<C>(dg, g, rbase + r, lane); // both rows in flight before either is decoded
++        nib_row_load<C>(du, u, rbase + r, lane);
++        const float gv = nib_row_dot<C>(dg, g, rbase + r, xg, lane);
++        const float uv = nib_row_dot<C>(du, u, rbase + r, xg, lane);
 +        if (lane == 0) {
 +            out[r] = uv * ggml_cuda_op_silu_single(gv);
 +        }
@@ -1196,6 +1215,14 @@
 +    idx += 1 + HP_PF;                                                                                \
 +    uint32_t v = 32, pa = 0, pb = 0;
 +
++// re-point the decoder state declared by HP_UNIT_BEGIN at another unit
++#define HP_UNIT_RESET(W, GU)                                                                         \
++    idx = __ldg((W).ubase + (GU)) + __ldg((W).lrel + (GU) * 32 + lane);                               \
++    buf = (uint64_t) __ldg(lst + idx) << 32;                                                         \
++    _Pragma("unroll") for (int i_ = 0; i_ < HP_PF; i_++) { wq[i_] = __ldg(lst + idx + 1 + i_); }    \
++    idx += 1 + HP_PF;                                                                                \
++    v = 32; pa = 0; pb = 0;
++
 +// decode one row (C chunks) and leave dot(row, x) summed over the warp in ACC
 +#define HP_ROW(SM, GR, ACC)                                                                          \
 +    {                                                                                                \
@@ -1251,17 +1278,42 @@
 +    extern __shared__ float shm[];
 +    float * xs = shm;
 +    uint32_t * lut = (uint32_t *) (shm + K);
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int wpb = blockDim.x >> 5;
++    const int t = threadIdx.x;
++    // warm start: issue every independent load of the prologue (LUT, ids -> x, the first unit's stream words) before
++    // the first use, so their latencies overlap instead of stalling the in-order issue one after another
++    const bool one_pass = blockDim.x * 4 >= (1 << HP_LP) && blockDim.x * 4 >= K;
++    uint4 l4 = make_uint4(0, 0, 0, 0);
++    if (one_pass && t < (1 << HP_LP) / 4) {
++        l4 = __ldg((const uint4 *) w.lut + t);
++    }
 +    const float * xg; float * out; int64_t rbase;
 +    col_setup(p, blockIdx.y, xg, out, rbase);
-+    HP_STAGE(xg, w.lut, lut)
-+    __syncthreads();
-+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-+    HP_XREG
++    float4 x4 = make_float4(0.f, 0.f, 0.f, 0.f);
++    if (one_pass && t < K / 4) {
++        x4 = __ldg((const float4 *) xg + t);
++    }
 +    const int64_t units = p.nrows / R;
-+    const int wpb = blockDim.x >> 5;
-+    for (int64_t u = blockIdx.x * wpb + warp; u < units; u += gridDim.x * wpb) {
++    const int64_t u0 = blockIdx.x * wpb + warp;
++    HP_UNIT_BEGIN(w, rbase / R + (u0 < units ? u0 : 0))
++    if (one_pass) {
++        if (t < (1 << HP_LP) / 4) {
++            ((uint4 *) lut)[t] = l4;
++        }
++        if (t < K / 4) {
++            ((float4 *) xs)[t] = x4;
++        }
++    } else {
++        HP_STAGE(xg, w.lut, lut)
++    }
++    __syncthreads();
++    HP_XREG
++    for (int64_t u = u0; u < units; u += gridDim.x * wpb) {
 +        const int64_t gu = rbase / R + u;
-+        HP_UNIT_BEGIN(w, gu)
++        if (u != u0) {
++            HP_UNIT_RESET(w, gu)
++        }
 +        for (int rr = 0; rr < R; rr++) {
 +            float acc;
 +            HP_ROW(w.sm, gu * R + rr, acc)

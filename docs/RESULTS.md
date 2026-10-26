@@ -28,12 +28,22 @@ fit into the 61 GiB of unified memory at all.
 | + exponent-pair Huffman experts (HUFPAIR) | 28.80 | 28.40 | |
 | + HUFPAIR for dense ≥ 8M weights, router F32→BF16N | 29.31 | 29.31 | |
 | + GDN state read in place, no gate/up fusion for HUFPAIR | 29.0–29.4 | 29.2–29.6 | 3 runs |
-| + embedding on GPU (nothing on the CPU) | **28.70** | **28.72** | measured with a busy desktop, see below |
+| + embedding on GPU (nothing on the CPU) | 28.70 | 28.72 | busy desktop, see below |
+| + warm-start prologue in the pair-Huffman GEMV (final) | **30.3** | **30.3** | mean of 6 processes, range 28.9–31.0 |
 
-Prefill (pp512 / pp2048): **307 / 305 tok/s** (exact dequantisation + stock BF16 cuBLAS GEMM), i.e. ≈ 6.7 s for a
+Final A/B in alternating processes (three quiet rounds): without the warm start 30.36 / 30.42 / 30.42, with it
+30.91 / 30.83 / 30.91 tok/s (+1.5 % in every pair). The same final patch on a clean upstream tree measured 29.76 / 29.84 in a
+single noisier run.
+
+Prefill (pp512 / pp2048): **307 / 305–311 tok/s** (exact dequantisation + stock BF16 cuBLAS GEMM), i.e. ≈ 6.7 s for a
 2048-token prompt.
 
-Run-to-run spread between processes is about ±2 %. Desktop activity matters a lot on Orin because the compositor and remote
+The patch was also verified on a clean upstream checkout (`git archive b29c606` + `patch -p1`, built with
+`scripts/build_llama.sh` flags): it applies without fuzz, builds, passes all 472 round-trip checks and decodes at
+28.6–29.6 tok/s depending on the run.
+
+Run-to-run spread between processes is ±2–3 % even on an idle system, so every comparison above was made with
+alternating runs of the two variants in separate processes. Desktop activity matters a lot on Orin because the compositor and remote
 desktop share the GPU and DRAM: with the Ubuntu *Software Updater* window open, `bwprobe` medians dropped to 156–168 GB/s
 (from 180) and decode to **25.0 tok/s**; closing that single window restored 180 GB/s and 28.7 tok/s. A run with the GUI
 stopped (`systemctl isolate multi-user.target`) is still to be done.
