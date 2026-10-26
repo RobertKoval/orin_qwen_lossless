@@ -30,7 +30,7 @@ decodes it inside llama.cpp's CUDA matrix–vector kernels, so a decode step str
 * **Lossless.** All 34.66 B weights round-trip bit-exactly, verified on the GPU for every tensor when the model loads.
   Greedy generations match llama.cpp's stock BF16 path token for token.
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671), which leaves space for long contexts.
-* **Fast.** ≈ 30 tok/s single-stream decode and 500–810 tok/s prefill on a 60 W board. Per matrix, the fused
+* **Fast.** ≈ 30 tok/s single-stream decode and 510–900 tok/s prefill on a 60 W board. Per matrix, the fused
   decode+GEMV beats raw BF16: the 248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **GPU only.** Embedding, weights and every model op run on the GPU; MoE experts are picked on the GPU, so the decode
   step stays one CUDA graph.
@@ -74,20 +74,21 @@ GA10B, L1 behaviour, what did not work) is in [docs/RESULTS.md](docs/RESULTS.md)
 
 ## Results
 
-Jetson AGX Orin Developer Kit 64GB, MAXN, CUDA 12.6, L4T R36.5, `llama-bench -ngl 99 -fa 1`, single sequence.
+Jetson AGX Orin Developer Kit 64GB, MAXN with GPU and CPU clocks pinned at maximum, CUDA 12.6, L4T R36.5,
+`llama-bench -ngl 99 -fa 1`, single sequence.
 
 | | |
 |---|---|
 | resident weights | **46.5 GB** of 69.3 GB (ratio 0.671), 472/472 tensors bit-exact |
-| decode | **29.8 tok/s** at context 0, **30.5 tok/s** at 2048 (±0.3 % over 3 processes; +0.5 % with the desktop stopped) |
-| prefill (8K prompt) | **495 tok/s** with the default `-ub 512`, **768** with `-ub 2048`, **810** with `-b 4096 -ub 4096` (1.6–1.9× the dequant + cuBLAS path) |
+| decode | **30.5 tok/s** at context 0 and at 2048 (±0.3 % between processes) |
+| prefill (8K prompt) | **514 tok/s** with the default `-ub 512`, **820** with `-ub 2048`, **900** with `-b 8192 -ub 4096` (1.47–1.68× the dequant + cuBLAS path) |
 | previous best on this board, PyTorch runtime with a fused lossless format | 5.0 tok/s |
 | BF16 without compression | does not fit |
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-dark.svg">
-    <img alt="Prefill of an 8192-token prompt: -ub 512 266 vs 495, -ub 2048 436 vs 768, -ub 4096 505 vs 810 tokens/s for dequant + cuBLAS vs the batched MoE kernel" src="docs/img/prefill-light.svg" width="760">
+    <img alt="Prefill of an 8192-token prompt: -ub 512 306 vs 514, -ub 2048 530 vs 820, -ub 4096 613 vs 900 tokens/s for dequant + cuBLAS vs the batched MoE kernel" src="docs/img/prefill-light.svg" width="760">
   </picture>
 </p>
 
@@ -109,6 +110,8 @@ layers keep a fixed-size state. The step time fits `33.5 ms + 0.138 µs × conte
 |---|---:|---:|---:|---:|---:|---:|
 | decode, tok/s | 30.4 | 29.7 | 26.3 | 23.4 | 19.3 | 14.4 |
 
+Measured before the clocks were pinned (see [docs/RESULTS.md](docs/RESULTS.md)); with pinned clocks the 2K point is 30.5.
+
 Correctness, methodology and the full history of what was tried: [docs/RESULTS.md](docs/RESULTS.md).
 
 ## Quick start (on the Orin)
@@ -122,7 +125,7 @@ LLAMA_BF16N=hybrid ./llama.cpp/build/bin/llama-server -m qwen3.6-35b-a3b-bf16.gg
 ```
 
 Loading reads the 69 GB GGUF and encodes it (≈ 3–4 min on the Orin's NVMe and CPU). Run fully offloaded (`-ngl 99`).
-For long prompts use larger micro-batches: `-ub 2048` lifts prefill from ≈ 500 to ≈ 770 tok/s (measured with
+For long prompts use larger micro-batches: `-ub 2048` lifts prefill from ≈ 510 to ≈ 820 tok/s (measured with
 `llama-bench`; it needs a larger compute buffer).
 Close desktop applications for best speed: on Orin the compositor and remote desktop share the GPU and DRAM.
 
@@ -184,8 +187,9 @@ what worked, what did not, and by how much.
 * Tested on one configuration: Qwen3.6-35B-A3B, Jetson AGX Orin 64GB (SM87), CUDA 12.6, llama.cpp `b29c606`.
 * The compressed exponent buffers are allocated outside ggml's buffers, so llama.cpp's automatic memory fitting does not
   see them (≈ 11 GB); set the context size explicitly.
-* Dense matrices in prefill are still dequantised to BF16 per micro-batch; the gated delta net and its conv-state concat
-  are upstream kernels and now take a quarter of the prefill time.
+* Dense matrices in prefill are still dequantised to BF16 per micro-batch; the gated delta net is the upstream
+  token-by-token kernel and takes 19 % of the prefill time.
+* The chunk-major expert layout that the prefill kernel needs costs 0.5 % of decode speed (gate/up GEMV 82 vs 80 µs).
 * The in-place recurrent-state read is only enabled for single-sequence batches.
 
 ## Roadmap

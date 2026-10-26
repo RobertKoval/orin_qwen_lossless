@@ -21,22 +21,23 @@ Single items below ~1 % are not worth doing on their own; they only pay off bund
 
 ## Stage 1 — prefill
 
-Done: the batched MoE kernel ([RESULTS.md](RESULTS.md#prefill-batched-moe-kernel)) took prefill from 266 / 436 / 505 to
-495 / 768 / 810 tok/s (pp8192 at `-ub 512 / 2048 / 4096`) with decode unchanged. A 2048-token forward at `-ub 2048` now
-spends 46 % in the MoE kernel, 18 % in `gated_delta_net_cuda`, 8 % in the conv-state `concat_non_cont`, 7 % in cuBLAS
-for the dense matrices, 9 % in norms and conversions, and leaves the GPU idle 12 %.
+Done: the batched MoE kernel ([RESULTS.md](RESULTS.md#prefill-batched-moe-kernel)) and a tiled transpose for the
+conv-state concat took prefill from 306 / 530 / 613 to 514 / 820 / 900 tok/s (pp8192 at `-ub 512 / 2048 / 4096`,
+pinned clocks) for −0.5 % decode. The "12 % GPU idle" of the first profile was cold start; steady state is ≈ 2 %. A
+2048-token forward at `-ub 2048` now spends 48 % in the MoE kernel, 19 % in `gated_delta_net_cuda`, 7 % in cuBLAS for
+the dense matrices, 5 % in F32→BF16 conversions, 5 % in `rms_norm`, 0.9 % in the conv-state concat.
 
-1. **MoE kernel decode rate** (46 %): it decodes ≈ 4.6 G weights/s per SM against 7.8 in the GEMV, because only 16 warps
+1. **MoE kernel decode rate** (48 %): it decodes ≈ 4.6 G weights/s per SM against 7.8 in the GEMV, because only 16 warps
    per SM decode (8 for down) and decode and products alternate behind block barriers. Options: persistent blocks per
    expert (one LUT load, overlap the next unit's stream start), double-buffered half-chunk slabs so decode and mma
    overlap, 16 decode warps for down. Expected 1.3–1.6× on this part; measure with `bench/moe_prefill.cpp` (warmed GPU).
-2. **Gated delta net** (18 %, 16.8 ms per layer for 2048 tokens): a chunked formulation on the tensor cores instead of the
+2. **Gated delta net** (19 %, 15.9 ms per layer for 2048 tokens): a chunked formulation on the tensor cores instead of the
    token-by-token recurrence. Expected several times faster for long prompts. Upstream kernel; effort large.
-3. **Conv-state concat** (8 %): the generic `concat_non_cont` takes 7.6 ms per layer to prepend the conv state to the
-   2048-token input; a contiguous copy or fusing it into `ssm_conv` should be several times faster. Effort small.
-4. **Dense matrices** (7 % + dequant + conversions): run them through the same decode-in-shared-memory kernel instead of
+3. **Conversions** (5 %): the MoE kernel and the dense cuBLAS path each convert F32 activations to BF16; the norm that
+   produces them could write BF16 directly.
+4. **Dense matrices** (7 % + dequant): run them through the same decode-in-shared-memory kernel instead of
    dequantising to BF16 per micro-batch.
-5. **Micro-batch size**: `-ub 2048` is worth 1.55× over 512 and `-ub 4096` another 5 % at 8K; still open: memory headroom
+5. **Micro-batch size**: `-ub 2048` is worth 1.6× over 512 and `-ub 4096` another 10 % at 8K; still open: memory headroom
    of large micro-batches at long contexts and whether llama-server should pick it for BF16N models.
 6. **GEMV/batched threshold** (now 8 tokens): batched costs 1.2 ms at 9 tokens vs 0.6 ms for the GEMV at 8; the crossover
    is probably at 24–32 tokens (speculative decoding and parallel requests sit there).

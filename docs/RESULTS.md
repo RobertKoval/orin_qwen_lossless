@@ -1,8 +1,15 @@
 # Results
 
 Hardware: Jetson AGX Orin Developer Kit 64GB (P3701-0005, GA10B SM87 @ 1300.5 MHz, LPDDR5 3199 MHz = 204.8 GB/s,
-SK hynix DRAM), L4T R36.5, CUDA 12.6, `nvpmodel` MAXN, `jetson_clocks` on. Model: `Qwen/Qwen3.6-35B-A3B`, BF16 GGUF
+SK hynix DRAM), L4T R36.5, CUDA 12.6, `nvpmodel` MAXN. Model: `Qwen/Qwen3.6-35B-A3B`, BF16 GGUF
 converted with llama.cpp. llama.cpp `b29c606` + `patches/llama.cpp-b29c606-bf16n.patch`. Single sequence, greedy.
+
+Clocks: until 2026-10-26 the board ran with dynamic clocks (GPU devfreq `nvhost_podgov` 306–1300.5 MHz, CPU `schedutil`
+from 729 MHz), not with `jetson_clocks` as this file said earlier. Since a reboot that day the GPU is pinned at
+1300.5 MHz and the CPU at ≥ 2.2 GHz, and the measurement scripts print both before every run. Sections marked
+**pinned clocks** were measured that way; everything else (Throughput, Long context, the first prefill table) with
+dynamic clocks. Pinning made decode ≈ 1–3 % faster and the host-bound published prefill path 16–22 % faster, so
+ratios between variants are only compared within one clock state.
 
 ## Memory
 
@@ -117,8 +124,8 @@ Every result is checked against a CPU reference (exact BF16 weights, BF16-rounde
 max |error| / Σ|w·x| ≤ 4.1e-7 for 9 to 4096 tokens, also with skewed routing; the GEMV path (≤ 8 tokens, F32
 activations) ≤ 1.1e-7.
 
-End to end, alternating processes, caches dropped before each (`llama-bench -p 2048,8192 -n 0 -b 8192`, tok/s, two runs
-each):
+End to end, dynamic clocks (see the hardware note), alternating processes, caches dropped before each
+(`llama-bench -p 2048,8192 -n 0 -b 8192`, tok/s, two runs each):
 
 | | published patch | batched MoE kernel |
 |---|---:|---:|
@@ -128,25 +135,64 @@ each):
 | pp8192, `-ub 2048` | 435.9 / 435.7 | **768.5 / 766.7** |
 | pp8192, `-ub 4096` | 505.2 / 504.8 | **811.0 / 809.5** |
 
-Decode is unchanged: tg64 @ 2048 30.32 / 30.30 tok/s with chunk-major gate/up vs 30.38 / 30.37 with the row-major format
-(same build, `GGML_BF16N_NO_CM`, alternating). Getting there took three attempts: the first chunk-major GEMV, with 8 rows
-unrolled in its loop body, cost 3.2–3.8 % of decode speed; nsys in real decode showed 97 vs 84 µs per gate/up call while
-an isolated microbenchmark (the same 8 experts every repetition, partly L2-resident) showed the opposite, and the SASS
-had the same instruction count per weight but a loop body twice as large. A 4-row body with rotating accumulators fits
-the instruction cache and restores parity. Adding prefetch registers instead pushed it past the 64-register cap (spills,
-−8 %).
+The 1.6–1.9× in this table is inflated: with dynamic clocks the published path's host loop over experts ran slower.
+
+**Pinned clocks, final patch** (batched MoE kernel + conv-state concat below), the same alternating protocol
+(published, new, new, published; `tg64 -r 3`, then `-p 8192 -n 0 -b 8192 -r 2`), tok/s:
+
+| | published patch | this patch | |
+|---|---:|---:|---:|
+| pp8192, `-ub 512` | 306.5 / 306.0 | **514.4 / 514.2** | 1.68× |
+| pp8192, `-ub 2048` | 526.5 / 532.7 | **820.9 / 819.3** | 1.55× |
+| pp8192, `-ub 4096` | 613.1 / 612.5 | **901.2 / 898.7** | 1.47× |
+| tg64 @ 0 | 30.64 / 30.67 | 30.51 / 30.47 | −0.5 % |
+| tg64 @ 2048 | 30.70 / 30.66 | 30.52 / 30.49 | −0.6 % |
 
 Model-level check (`scripts/run_prompts.sh`, now with a ~1500-token prompt, greedy, against `GGML_BF16N_REFERENCE=1`):
 the batched path is text-identical on the three short prompts and first differs at token 64 of the long one; the
 published prefill path differs on one short prompt (token 47) and at the same token 64 of the long one. Median top-1
-|Δlogprob| 3.9e-5 vs 3.6e-5: both are summation-order differences at near-ties.
+|Δlogprob| 3.9e-5 vs 3.6e-5: both are summation-order differences at near-ties. The final patch reproduces these outputs
+bit for bit (texts and logprobs of all four prompts).
 
-Where pp2048 (`-ub 2048`, one forward ≈ 2.7 s) goes now: `k_hp_mm_ids` 46 %, `gated_delta_net_cuda` 18 % (16.8 ms per
-layer), `concat_non_cont` of the conv state 8 %, cuBLAS GEMMs of the dense matrices 7 %, `rms_norm` + conversions 9 %,
-GPU idle 12 %.
+### Conv-state concat
 
-Measurement note: the GPU clock governor (`nvhost_podgov`, 306–1300 MHz) ramps up only under sustained load, so kernel
-microbenchmarks need a warm-up; without one, two runs of the same kernel differed by 1.5×.
+Each Gated DeltaNet layer prepends its conv state to the micro-batch: `concat(conv_state [3, C], transpose(qkv) [T, C])`
+along dim 0, i.e. a transpose of a T × C matrix. The generic `concat_non_cont` read the transposed source with a stride
+of C·4 bytes (one 4-byte read per 32-byte sector): 7.6 ms per layer at T = 2048, 8 % of the forward.
+`concat_dim0_transposed` stages 32 × 32 tiles through shared memory: **0.80 ms**. Same build with a temporary switch,
+alternating, pp2048: `-ub 512` 511.8 / 512.8 → 529.8 / 530.8 (+3.5 %), `-ub 2048` 779.2 / 783.6 → 838.6 / 838.6
+(+7.3 %); outputs bitwise identical. The tiled path is taken only when both dims of the transposed source are ≥ 32:
+with one token (decode) the tile is almost empty and it cost 0.85 % of decode speed. `test-backend-ops` has cases for
+transposed sources (partial tiles, 31/32/33 in both dims, one token; F32/F16/BF16/I32).
+
+### GPU idle
+
+The earlier profile's "12 % idle" was cold start inside the one forward nsys traced per kernel: lazy loading of CUDA
+modules, the first cuBLAS call (208 ms), growth of the memory pool. Later forwards run as CUDA graphs (the MoE matrices
+no longer sync with the host), so the 3-repetition profile traces only the first one. Steady state is ≈ 2 % idle.
+
+Where pp2048 (`-ub 2048`, final patch, one forward 2.56 s) goes: `k_hp_mm_ids` 48 %, `gated_delta_net_cuda` 19 %
+(15.9 ms per layer), cuBLAS GEMMs of the dense matrices 7 %, F32→BF16 conversions 5 %, `rms_norm` 5 %, SwiGLU 2 %,
+`ssm_conv` 1.3 %, dense dequant 1.1 %, conv-state concat 0.9 %, idle 2 %.
+
+### Cost for decode
+
+Decode pays 0.5 % for the chunk-major gate/up layout. Node-level nsys of `tg64 -r 3` on both trees (193 tokens): the
+total GPU time differs by +0.47 %, all of it in the gate/up GEMV, 82.1 µs per call chunk-major vs 79.8 µs row-major
+(+2.9 %); every other kernel matches within ±1.4 ms over the run. Keeping both layouts would double the expert memory,
+so the trade stays: +47–68 % prefill for −0.5 % decode.
+
+Getting there took four attempts. The first chunk-major GEMV, with 8 rows unrolled in its loop body, cost 3.2–3.8 % of
+decode speed; nsys in real decode showed 97 vs 84 µs per gate/up call while an isolated microbenchmark (the same 8
+experts every repetition, partly L2-resident) showed the opposite, and the SASS had the same instruction count per
+weight but a loop body twice as large. A 4-row body with rotating accumulators fits the instruction cache (measured
+with dynamic clocks as parity, 30.32 / 30.30 vs 30.38 / 30.37 with the row-major format; pinned clocks resolve the
+remaining 0.5 %). Prefetch registers pushed it past the 64-register cap (spills, −8 %); a plane prefetch ring that
+continues across chunk boundaries (64 registers, no spills) did not help.
+
+Measurement note: with dynamic clocks the GPU governor (`nvhost_podgov`, 306–1300 MHz) ramps up only under sustained
+load, so kernel microbenchmarks need a warm-up; without one, two runs of the same kernel differed by 1.5×.
+`bench/moe_prefill.cpp` warms the GPU for 2 s.
 
 ## KV-cache compressibility (measured, not implemented)
 
@@ -228,3 +274,6 @@ compressed bytes.
   with a 64-row slab (same caveat).
 * Prefetching activations and planes more deeply in the chunk-major GEMV: register spills at the 64-register cap, −8 %
   decode.
+* A plane prefetch ring in the chunk-major GEMV that runs on across chunk boundaries (64 registers, no spills):
+  tg64 30.46 vs 30.54 for the ring that restarts per chunk, within noise.
+* The tiled conv-state concat for one token (decode): −0.85 % decode; it is now used only from 32 × 32 up.
