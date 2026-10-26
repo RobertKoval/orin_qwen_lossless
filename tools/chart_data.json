@@ -140,5 +140,58 @@
       35
     ],
     "y_unit": "tokens / s"
+  },
+  "prefill": {
+    "title": "Prefill speed, 8192-token prompt",
+    "subtitle": "tokens per second by micro-batch size: dequant + cuBLAS per expert vs the batched MoE kernel",
+    "unit": "tokens / s",
+    "axis_max": 900,
+    "ticks": [
+      0,
+      100,
+      200,
+      300,
+      400,
+      500,
+      600,
+      700,
+      800,
+      900
+    ],
+    "rows": [
+      {
+        "label": "-ub 512, dequant + cuBLAS",
+        "value": 265.5,
+        "value_label": "266"
+      },
+      {
+        "label": "-ub 512, batched MoE kernel",
+        "value": 495.4,
+        "value_label": "495",
+        "highlight": true
+      },
+      {
+        "label": "-ub 2048, dequant + cuBLAS",
+        "value": 435.8,
+        "value_label": "436"
+      },
+      {
+        "label": "-ub 2048, batched MoE kernel",
+        "value": 767.6,
+        "value_label": "768",
+        "highlight": true
+      },
+      {
+        "label": "-ub 4096, dequant + cuBLAS",
+        "value": 505.0,
+        "value_label": "505"
+      },
+      {
+        "label": "-ub 4096, batched MoE kernel",
+        "value": 810.2,
+        "value_label": "810",
+        "highlight": true
+      }
+    ]
   }
 }

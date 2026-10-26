@@ -35,8 +35,8 @@ Final A/B in alternating processes (three quiet rounds): without the warm start 
 30.91 / 30.83 / 30.91 tok/s (+1.5 % in every pair). The same final patch on a clean upstream tree measured 29.76 / 29.84 in a
 single noisier run.
 
-Prefill (pp512 / pp2048): **307 / 305–311 tok/s** (exact dequantisation + stock BF16 cuBLAS GEMM), i.e. ≈ 6.7 s for a
-2048-token prompt.
+Prefill with the first published patch (pp512 / pp2048): 307 / 305–311 tok/s (exact dequantisation + stock BF16 cuBLAS
+GEMM per expert). The batched MoE kernel below replaced that path.
 
 The patch was also verified on a clean upstream checkout (`git archive b29c606` + `patch -p1`, built with
 `scripts/build_llama.sh` flags): it applies without fuzz, builds, passes all 472 round-trip checks and decodes at
@@ -84,12 +84,69 @@ A least-squares line through the sweep gives `t ≈ 33.5 ms + 0.138 µs × depth
 the cache traffic is larger than the weight traffic. At 262,144 tokens the run fit, but the kernel's `MemAvailable` fell
 below 100 MiB (desktop running, `-ub 512`).
 
-Prefill of an 8192-token prompt against the micro-batch size (`-p 8192 -n 0 -b 8192 -ub <n>`, one process per pair of
-values; MoE prefill dequantises the used experts once per micro-batch):
+Prefill of an 8192-token prompt against the micro-batch size with the first published patch (`-p 8192 -n 0 -b 8192
+-ub <n>`, one process per pair of values; MoE prefill dequantised the used experts once per micro-batch):
 
 | `-ub` | 512 | 1024 | 2048 | 4096 |
 |---|---:|---:|---:|---:|
 | pp8192, tok/s | 265.4 | 351.8 | 433.5 | 501.8 |
+
+## Prefill: batched MoE kernel
+
+**Before.** nsys of pp2048 with the published patch: at `-ub 2048` the GPU was idle 45 % of the time while the host looped
+over 256 experts for each of the 120 MoE matrices (ids copied to the host, two stream syncs per matrix, a dequant, a
+conversion and a cuBLAS GEMM per expert); `k_hp_dequant` took 20 % of the GPU time, experts with ≤ 8 tokens went through
+the GEMV (36 % at `-ub 512`).
+
+**Now.** One launch per `MUL_MAT_ID`: `ggml_cuda_launch_mm_ids_helper` sorts the tokens by expert on the GPU, the
+activations are converted to BF16 once, and `k_hp_mm_ids` decodes each expert's weights once per block into a shared slab
+and multiplies them on the tensor cores with all tokens routed to that expert (`mma.m16n8k16`, FP32 accumulation). This
+needed chunk-major lane streams for the gate/up experts (a K-slab of many rows must be decodable at once); the format,
+size and the bit-exact round-trip are otherwise unchanged ([FORMAT.md](FORMAT.md)).
+
+Per matrix, real `blk.20` weights, 8 of 256 experts per token drawn uniformly, GPU warmed for 2 s
+([`bench/moe_prefill.cpp`](../bench/moe_prefill.cpp); ms per `MUL_MAT_ID`):
+
+| tokens | gate (K 2048, N 512): old → new | down (K 512, N 2048): old → new |
+|---:|---:|---:|
+| 512 | 23.6 → **6.3** | 16.5 → **10.1** |
+| 2048 | 35.5 → **9.2** | 33.5 → **13.4** |
+| 4096 | 53.8 → **15.1** | 47.7 → **23.6** |
+
+Every result is checked against a CPU reference (exact BF16 weights, BF16-rounded activations, double accumulation):
+max |error| / Σ|w·x| ≤ 4.1e-7 for 9 to 4096 tokens, also with skewed routing; the GEMV path (≤ 8 tokens, F32
+activations) ≤ 1.1e-7.
+
+End to end, alternating processes, caches dropped before each (`llama-bench -p 2048,8192 -n 0 -b 8192`, tok/s, two runs
+each):
+
+| | published patch | batched MoE kernel |
+|---|---:|---:|
+| pp2048, `-ub 512` | 271.7 / 272.3 | **507.4 / 506.2** |
+| pp2048, `-ub 2048` | 429.6 / 437.9 | **767.2 / 765.8** |
+| pp8192, `-ub 512` | 264.6 / 266.5 | **495.5 / 495.4** |
+| pp8192, `-ub 2048` | 435.9 / 435.7 | **768.5 / 766.7** |
+| pp8192, `-ub 4096` | 505.2 / 504.8 | **811.0 / 809.5** |
+
+Decode is unchanged: tg64 @ 2048 30.32 / 30.30 tok/s with chunk-major gate/up vs 30.38 / 30.37 with the row-major format
+(same build, `GGML_BF16N_NO_CM`, alternating). Getting there took three attempts: the first chunk-major GEMV, with 8 rows
+unrolled in its loop body, cost 3.2–3.8 % of decode speed; nsys in real decode showed 97 vs 84 µs per gate/up call while
+an isolated microbenchmark (the same 8 experts every repetition, partly L2-resident) showed the opposite, and the SASS
+had the same instruction count per weight but a loop body twice as large. A 4-row body with rotating accumulators fits
+the instruction cache and restores parity. Adding prefetch registers instead pushed it past the 64-register cap (spills,
+−8 %).
+
+Model-level check (`scripts/run_prompts.sh`, now with a ~1500-token prompt, greedy, against `GGML_BF16N_REFERENCE=1`):
+the batched path is text-identical on the three short prompts and first differs at token 64 of the long one; the
+published prefill path differs on one short prompt (token 47) and at the same token 64 of the long one. Median top-1
+|Δlogprob| 3.9e-5 vs 3.6e-5: both are summation-order differences at near-ties.
+
+Where pp2048 (`-ub 2048`, one forward ≈ 2.7 s) goes now: `k_hp_mm_ids` 46 %, `gated_delta_net_cuda` 18 % (16.8 ms per
+layer), `concat_non_cont` of the conv state 8 %, cuBLAS GEMMs of the dense matrices 7 %, `rms_norm` + conversions 9 %,
+GPU idle 12 %.
+
+Measurement note: the GPU clock governor (`nvhost_podgov`, 306–1300 MHz) ramps up only under sustained load, so kernel
+microbenchmarks need a warm-up; without one, two runs of the same kernel differed by 1.5×.
 
 ## KV-cache compressibility (measured, not implemented)
 
@@ -164,3 +221,10 @@ compressed bytes.
 * Fusing gate+up+SWIGLU for HUFPAIR: −0.6 tok/s (two 16 KiB LUTs per block).
 * HUFPAIR for every dense tensor (incl. 32–512-row matrices): 25.1 vs 28.7 tok/s.
 * Host threads (`-t 1/2/8`), polling, embedding placement: no effect on decode.
+* Batched MoE kernel on the row-major format: a warp can only produce one row at a time, so a block needs 32 lockstep
+  steps per unit and re-reads the activations once per row; 20 vs 12 ms for the final kernel (gate, 2048 tokens; both
+  measured before the clock warm-up was added, so ±1.5×).
+* A 128-row shared slab: leaves 28 KB of L1 for the lane streams (64 KB needed); decode per warp was ≈ 4.6× slower than
+  with a 64-row slab (same caveat).
+* Prefetching activations and planes more deeply in the chunk-major GEMV: register spills at the 64-register cap, −8 %
+  decode.

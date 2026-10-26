@@ -162,6 +162,7 @@ if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
     bar_chart("decode", DATA["decode"])
     bar_chart("memory", DATA["memory"])
+    bar_chart("prefill", DATA["prefill"])
     if "context" in DATA:
         line_chart("context", DATA["context"])
     format_diagram("format")

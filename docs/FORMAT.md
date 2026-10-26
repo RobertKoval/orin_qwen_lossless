@@ -1,7 +1,8 @@
 # BF16N: lossless resident BF16 weights
 
 `GGML_TYPE_BF16N` (ggml type id 43) stores BF16 weights so that every original bit pattern is reconstructed exactly, while the
-GEMV kernels decode them in registers on the fly. It is a runtime representation: tensors are converted while llama.cpp loads
+GEMV kernels decode them in registers on the fly and the batched (prefill) MoE kernel decodes them into shared memory once
+per block. It is a runtime representation: tensors are converted while llama.cpp loads
 an ordinary BF16 GGUF and are never written to a GGUF file.
 
 A BF16 weight is `sign(1) | exponent(8) | mantissa(7)`. Sign and mantissa are close to incompressible (measured entropy of
@@ -18,7 +19,11 @@ so that a warp loads it with one coalesced 16-byte load per lane: lane `l ∈ [0
     p(l, s) = 128·j + 4·l + t,   s = 4·j + t,   j, t ∈ [0,4)
 
 stored at byte `16·l + s`. The same `(l, s)` ownership is used by every exponent format and by the activation reads
-(`float4` at `128·j + 4·l`, bank-conflict free), so all formats sum the products in the same order.
+(`float4` at `128·j + 4·l`, bank-conflict free), so row-major units sum the products in the same order in every format.
+
+Rows are stored one after another (`row · K`), except inside a chunk-major HUFPAIR unit (below), whose `R` rows are stored
+chunk by chunk: chunk `c` of row `r` at byte `(c · R + r) · 512` of the unit. Units never straddle an expert, so expert views
+keep their offsets.
 
 ## Exponent formats (device "aux" buffer per tensor)
 
@@ -43,6 +48,9 @@ tensor) find it by address. It starts with a 256-byte header (`magic "B16N"`, fo
 * Rows are grouped into units of `R` rows (`R ∈ {1,2,4,8,16}`, `R` divides the rows of one expert). One warp decodes one
   unit; every lane has its own MSB-first bitstream with the symbols of its slots in order rows → chunks → pairs.
   Per unit: `u32` stream base + `u16[32]` lane offsets.
+* **Chunk-major units** (header `flags` bit 0) order the streams chunks → rows → pairs instead, and store the plane chunk-major
+  (see above). Used for 3-D expert tensors with `K > 512` (gate and up), so the batched kernel can decode a 512-column slab of
+  many rows at a time; for `K = 512` (down) the two orders coincide. Same size; the GEMV adds per-chunk partial sums.
 * Chosen whenever the tensor has ≤ 4096 distinct exponent pairs (true for every tensor of Qwen3.6-35B-A3B); otherwise the
   single-symbol variant 2 (`HUFFMAN`, max code length 10, 1024-entry LUT) is used.
 
@@ -50,7 +58,7 @@ tensor) find it by address. It starts with a 256-byte header (`magic "B16N"`, fo
 
 | tensor | format |
 |---|---|
-| routed experts (`*_exps`) | HUFPAIR, `R = 16` if ≥ 2048 rows per expert else 8 |
+| routed experts (`*_exps`) | HUFPAIR, `R = 16` if ≥ 2048 rows per expert else 8; chunk-major units when `K > 512` |
 | dense with ≥ 8M weights (lm_head, embedding, qkv, gates, out projections) | HUFPAIR, largest `R` with ≥ 512 units |
 | smaller dense (k/v, shared expert, α/β) | NIBBLE |
 | F32 router `ffn_gate_inp` | NIBBLE, after checking every value is exactly BF16 |
@@ -65,6 +73,14 @@ tensor) find it by address. It starts with a 256-byte header (`magic "B16N"`, fo
 * Bit buffer is one 64-bit register pair; the refill check runs every 2 pairs (4 weights), inserts a prefetched word with a
   multiply and keeps a 4-word prefetch queue.
 * INT32 and IMAD share one datapath on GA10B; the decoder is designed to minimise non-FFMA instructions per weight.
+* The chunk-major GEMV keeps a 4-row loop body (accumulators rotated by 4): the fully unrolled 8-row body did not fit the
+  instruction cache next to 31 other warps and cost 3–4 % of decode speed.
+* Batched MUL_MAT_ID (more than 8 tokens): routing via `ggml_cuda_launch_mm_ids_helper` on the GPU, activations converted to
+  BF16 once, one kernel per matrix. A block owns 16 units of one expert (8 for down) and up to 128 of its tokens; per step
+  every warp decodes a 512-column chunk of a slice of its unit's rows into a 64-row shared slab (small enough to leave L1 to
+  the lane streams), and the warps of that slice multiply it on the tensor cores (`mma.m16n8k16` BF16, FP32 accumulation;
+  the k order inside each 32-column group is permuted identically for weights and activations). Warps without tokens
+  split K instead.
 
 ## Verification at load
 

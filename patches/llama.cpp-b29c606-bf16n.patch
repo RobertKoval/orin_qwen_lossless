@@ -1,6 +1,8 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 85a1ae7..071c910 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -430,7 +430,8 @@
+@@ -430,7 +430,8 @@ extern "C" {
          GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
          GGML_TYPE_Q1_0    = 41,
          GGML_TYPE_Q2_0    = 42,
@@ -10,364 +12,12 @@
      };
  
      // [TAG_GGML_PREC]
---- a/ggml/src/ggml.c
-+++ b/ggml/src/ggml.c
-@@ -883,6 +883,14 @@
-         .type_size                = sizeof(block_q8_K),
-         .is_quantized             = true,
-     },
-+    [GGML_TYPE_BF16N] = {
-+        .type_name                = "bf16n",
-+        .blck_size                = 512,
-+        .type_size                = 512,
-+        .is_quantized             = true,
-+        .to_float                 = NULL,
-+        .from_float_ref           = NULL,
-+    },
-     [GGML_TYPE_BF16] = {
-         .type_name                = "bf16",
-         .blck_size                = 1,
---- a/ggml/src/ggml-cuda/ggml-cuda.cu
-+++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3,6 +3,7 @@
- #include "ggml-backend-impl.h"
- 
- #include "ggml-cuda/allreduce.cuh"
-+#include "ggml-cuda/bf16n.cuh"
- #include "ggml-cuda/common.cuh"
- #include "ggml-cuda/acc.cuh"
- #include "ggml-cuda/add-id.cuh"
-@@ -90,6 +91,8 @@
- #include <cstdlib>
- #include <string>
- #include <vector>
-+#include <unordered_set>
-+#include <unordered_map>
- 
- static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
- 
-@@ -1796,6 +1799,10 @@
-     ggml_tensor *       src1 = tensor->src[1];
-     const ggml_tensor * dst  = tensor;
- 
-+    if (src0->type == GGML_TYPE_BF16N) {
-+        return false;
-+    }
-+
-     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
-                                    src0->view_src;
-@@ -1828,6 +1835,25 @@
-         return;
-     }
- 
-+    if (src0->type == GGML_TYPE_BF16N) {
-+        if (!ggml_cuda_bf16n_reference() && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne11 <= 8 && ne12 == 1 && ne13 == 1) {
-+            ggml_cuda_bf16n_mul_mat_vec(ctx, src0, src1, nullptr, dst);
-+            return;
-+        }
-+        // batched: exact BF16 reconstruction, then the regular BF16 cuBLAS path
-+        ggml_cuda_pool_alloc<nv_bfloat16> w(ctx.pool(), ggml_nelements(src0));
-+        ggml_cuda_bf16n_dequant_bf16(ctx, src0, w.get());
-+        ggml_tensor w_bf16 = *src0;
-+        w_bf16.type  = GGML_TYPE_BF16;
-+        w_bf16.nb[0] = sizeof(nv_bfloat16);
-+        w_bf16.nb[1] = w_bf16.nb[0]*w_bf16.ne[0];
-+        w_bf16.nb[2] = w_bf16.nb[1]*w_bf16.ne[1];
-+        w_bf16.nb[3] = w_bf16.nb[2]*w_bf16.ne[2];
-+        w_bf16.data  = w.get();
-+        ggml_cuda_mul_mat_cublas(ctx, &w_bf16, src1, dst);
-+        return;
-+    }
-+
-     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
-     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
-     // Therefore, in such cases use cuBLAS.
-@@ -1882,6 +1908,10 @@
-     const ggml_tensor * src0 = dst->src[0];
-     const ggml_tensor * src1 = dst->src[1];
- 
-+    if (src0->type == GGML_TYPE_BF16N) {
-+        return ggml_cuda_bf16n_reference() || dst->ne[2] > 8;
-+    }
-+
-     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-         return true;
-     }
-@@ -1919,10 +1949,15 @@
- 
-     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
- 
-+    if (src0->type == GGML_TYPE_BF16N && ne2 <= 8 && !ggml_cuda_bf16n_reference()) {
-+        ggml_cuda_bf16n_mul_mat_vec(ctx, src0, src1, ids, dst);
-+        return;
-+    }
-+
-     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
--        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-+        if (ne2 <= MMVQ_MAX_BATCH_SIZE && src0->type != GGML_TYPE_BF16N) {
-             if (ggml_is_quantized(src0->type)) {
-                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                 if (ne2 <= mmvq_mmid_max) {
-@@ -2079,7 +2114,11 @@
-             ggml_cuda_op_repeat_back(ctx, dst);
-             break;
-         case GGML_OP_GET_ROWS:
--            ggml_cuda_op_get_rows(ctx, dst);
-+            if (dst->src[0]->type == GGML_TYPE_BF16N) {
-+                ggml_cuda_bf16n_get_rows(ctx, dst);
-+            } else {
-+                ggml_cuda_op_get_rows(ctx, dst);
-+            }
-             break;
-         case GGML_OP_GET_ROWS_BACK:
-             ggml_cuda_op_get_rows_back(ctx, dst);
-@@ -3950,6 +3989,14 @@
-             const ggml_tensor * src1 = up->src[1];
-             const ggml_tensor * ids  = up->src[2];
- 
-+            if (src0->type == GGML_TYPE_BF16N && !ggml_cuda_bf16n_reference() && gate->src[1] == src1 && gate->src[2] == ids &&
-+                    ggml_cuda_bf16n_can_fuse_glu(gate->src[0], src0, src1, ids, glu)) {
-+                ggml_cuda_bf16n_mul_mat_vec_glu(*cuda_ctx, gate->src[0], src0, src1, ids, glu);
-+                fused_mul_mat_vec = true;
-+                fused_node_count  = 3;
-+                break;
-+            }
-+
-             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
-                 ggml_cuda_mm_fusion_args_host fusion_data{};
-                 fusion_data.gate      = gate->src[0];
-@@ -4280,6 +4327,44 @@
-                 stream_ctx.concurrent_events.clear();
-             }
- 
-+            // GET_ROWS gathers of recurrent states read in place by their GDN (see ggml_cuda_gdn_state_rows)
-+            std::unordered_set<const ggml_tensor *> skip_state_rows;
-+            {
-+                std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> chains; // (gdn, get_rows)
-+                std::unordered_map<const ggml_tensor *, int> uses;
-+                for (int i = 0; i < cgraph->n_nodes; i++) {
-+                    if (const ggml_tensor * rows = ggml_cuda_gdn_state_rows(cgraph->nodes[i])) {
-+                        chains.emplace_back(cgraph->nodes[i], rows);
-+                        for (const ggml_tensor * t = cgraph->nodes[i]->src[5]; t != rows; t = t->src[0]) {
-+                            uses[t] = 0;
-+                        }
-+                        uses[rows] = 0;
-+                    }
-+                }
-+                if (!chains.empty()) {
-+                    for (int i = 0; i < cgraph->n_nodes; i++) {
-+                        for (int j = 0; j < GGML_MAX_SRC; j++) {
-+                            auto it = uses.find(cgraph->nodes[i]->src[j]);
-+                            if (it != uses.end()) {
-+                                it->second++;
-+                            }
-+                        }
-+                    }
-+                    for (const auto & [gdn, rows] : chains) {
-+                        bool only_gdn = (rows->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
-+                        for (const ggml_tensor * t = gdn->src[5]; only_gdn; t = t->src[0]) {
-+                            only_gdn = uses[t] == 1 && (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
-+                            if (t == rows) {
-+                                break;
-+                            }
-+                        }
-+                        if (only_gdn) {
-+                            skip_state_rows.insert(rows);
-+                        }
-+                    }
-+                }
-+            }
-+
-             for (int i = 0; i < cgraph->n_nodes; i++) {
-                 ggml_tensor * node = cgraph->nodes[i];
-                 if (is_concurrent_event_active) {
-@@ -4314,7 +4399,7 @@
- 
-                 prev_i = i;
- 
--                if (ggml_cuda_is_view_or_noop(node)) {
-+                if (ggml_cuda_is_view_or_noop(node) || skip_state_rows.count(node)) {
-                     continue;
-                 }
- 
-@@ -5173,6 +5258,8 @@
-                     case GGML_TYPE_IQ4_XS:
-                     case GGML_TYPE_BF16:
-                         return true;
-+                    case GGML_TYPE_BF16N:
-+                        return b->type == GGML_TYPE_F32;
-                     default:
-                         return false;
-                 }
-@@ -5212,6 +5299,8 @@
-                         // 32-value sub-blocks, the row size does not guarantee
-                         // the QK_K super-blocks the get_rows kernel iterates on
-                         return op->src[0]->ne[0] % QK_K == 0;
-+                    case GGML_TYPE_BF16N:
-+                        return op->type == GGML_TYPE_F32 && op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 1;
-                     default:
-                         return false;
-                 }
-@@ -5695,6 +5784,9 @@
-     if (strcmp(name, "ggml_backend_get_features") == 0) {
-         return (void *)ggml_backend_cuda_get_features;
-     }
-+    if (strcmp(name, "ggml_backend_cuda_bf16n_convert") == 0) {
-+        return (void *)ggml_backend_cuda_bf16n_convert;
-+    }
-     return nullptr;
- }
- 
---- a/ggml/src/ggml-cuda/gated_delta_net.cu
-+++ b/ggml/src/ggml-cuda/gated_delta_net.cu
-@@ -9,6 +9,8 @@
-                                      const float * g,
-                                      const float * beta,
-                                      const float * curr_state,
-+                                     const int32_t * state_ids,
-+                                     int64_t       state_row_stride,
-                                      float *       dst,
-                                      float *       state,
-                                      int64_t       H,
-@@ -41,7 +43,8 @@
- 
-     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
-     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
--    const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
-+    // state_ids: the state rows are read straight from the cache (fused GET_ROWS), else from the gathered copy
-+    const int64_t state_in_offset      = (state_ids ? (int64_t) state_ids[sequence] * state_row_stride : (int64_t) sequence * H * S_v * S_v) + h_idx * S_v * S_v;
-     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
-     state += state_out_offset;
-     curr_state += state_in_offset + col * S_v;
-@@ -170,6 +173,7 @@
- static void launch_gated_delta_net(
-         const float * q_d, const float * k_d, const float * v_d,
-         const float * g_d, const float * b_d, const float * s_d,
-+        const int32_t * ids_d, int64_t state_row_stride,
-         float * dst_d, float * state_d,
-         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
-         int64_t sq1,   int64_t sq2, int64_t sq3,
-@@ -190,26 +194,26 @@
-     switch (S_v) {
-         case 16:
-             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
--                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-+                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
-                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-             break;
-         case 32:
-             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
--                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-+                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
-                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-             break;
-         case 64: {
-             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
--                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-+                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
-                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-             break;
-         }
-         case 128: {
-             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
--                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-+                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
-                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-             break;
-@@ -258,6 +262,14 @@
-     const float * s_d   = (const float *) src_state->data;
-     float *       dst_d = (float *) dst->data;
- 
-+    const int32_t * ids_d            = nullptr;
-+    int64_t         state_row_stride = 0;
-+    if (const ggml_tensor * rows = ggml_cuda_gdn_state_rows(dst)) {
-+        s_d              = (const float *) rows->src[0]->data;
-+        ids_d            = (const int32_t *) rows->src[1]->data;
-+        state_row_stride = rows->src[0]->nb[1] / sizeof(float);
-+    }
-+
-     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
-     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
-     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
-@@ -296,27 +308,52 @@
- 
-     if (kda) {
-         if (keep_rs) {
--            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-+            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
-                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-         } else {
--            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-+            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
-                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-         }
-     } else {
-         if (keep_rs) {
--            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-+            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
-                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-         } else {
--            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-+            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
-                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-         }
-     }
- }
- 
-+// GDN whose state input is reshape(GET_ROWS(states, ids)) for a single sequence: return the GET_ROWS node so the
-+// kernel can read the rows in place. Single sequence only: the state row may be the one the kernel writes back,
-+// which is safe because every thread reads its slice before writing it.
-+const ggml_tensor * ggml_cuda_gdn_state_rows(const ggml_tensor * gdn) {
-+    static const bool off = getenv("GGML_CUDA_NO_GDN_ROWS") != nullptr;
-+    if (off || gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[2]->ne[3] != 1) {
-+        return nullptr;
-+    }
-+    const ggml_tensor * st = gdn->src[5];
-+    const ggml_tensor * t  = st;
-+    while (t != nullptr && (t->op == GGML_OP_RESHAPE || (t->op == GGML_OP_VIEW && t->view_offs == 0))) {
-+        t = t->src[0];
-+    }
-+    if (t == nullptr || t->op != GGML_OP_GET_ROWS || t->type != GGML_TYPE_F32) {
-+        return nullptr;
-+    }
-+    const ggml_tensor * src = t->src[0];
-+    const ggml_tensor * ids = t->src[1];
-+    if (src->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || src->nb[0] != sizeof(float) ||
-+        t->ne[1] != 1 || ggml_nelements(t) != ggml_nelements(st) || src->ne[0] != t->ne[0] || !ggml_is_contiguous(t)) {
-+        return nullptr;
-+    }
-+    return t;
-+}
-+
- void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
- }
---- a/ggml/src/ggml-cuda/gated_delta_net.cuh
-+++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
-@@ -9,6 +9,9 @@
- 
- void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
- 
-+// GET_ROWS node feeding this GDN's state that the kernel can read in place (nullptr if not applicable)
-+const ggml_tensor * ggml_cuda_gdn_state_rows(const ggml_tensor * gdn);
-+
- // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
- void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
-                                               ggml_cuda_gated_delta_net_fused_cache cache);
---- a/ggml/src/ggml-cuda/bf16n.cu
+diff --git a/ggml/src/ggml-cuda/bf16n.cu b/ggml/src/ggml-cuda/bf16n.cu
+new file mode 100644
+index 0000000..47ad85e
+--- /dev/null
 +++ b/ggml/src/ggml-cuda/bf16n.cu
-@@ -0,0 +1,1472 @@
+@@ -0,0 +1,1925 @@
 +// GGML_TYPE_BF16N: lossless BF16 weights resident in compressed form.
 +//
 +// The ggml tensor holds the sign|mantissa byte plane (1 B/weight, 512-weight chunks, lane-major:
@@ -376,10 +26,15 @@
 +//   NIBBLE : 4-bit code per weight into a per-row 16-entry exponent LUT (entry 0 = exponent 0);
 +//            weights whose exponent is not in the LUT decode to +0 and are added back from an escape list.
 +//   HUFFMAN: per-tensor length-limited canonical Huffman code; each warp owns R consecutive rows and
-+//            each lane decodes its own bitstream (lane offsets per unit). No escapes.
-+// Every BF16 bit pattern is reconstructed exactly; products are FP32 FMAs of the exact weights.
++//            each lane decodes its own bitstream (lane offsets per unit). No escapes. Expert matrices with
++//            K > 512 use chunk-major units (lane streams and plane), see encode_huffpair.
++// Every BF16 bit pattern is reconstructed exactly. GEMV products are FP32 FMAs of the exact weights; the batched
++// MUL_MAT_ID (prefill) multiplies the exact weights with BF16-rounded activations on the tensor cores in FP32, as the
++// stock BF16 cuBLAS path does.
 +
 +#include "bf16n.cuh"
++#include "convert.cuh"
++#include "mmid.cuh"
 +#include "unary.cuh"
 +
 +#include <algorithm>
@@ -404,6 +59,7 @@
 +    uint64_t rows;
 +    uint64_t off_a, off_b, off_c, off_d; // format specific array offsets (bytes from aux start)
 +    uint64_t n_a, n_b;                   // escapes (nibble) / units, stream words (huffman)
++    uint32_t flags, pad_;                // HUFPAIR: bit 0 = chunk-major lane streams (see encode_huffpair)
 +};
 +
 +struct entry {
@@ -425,6 +81,7 @@
 +    const uint32_t * stream   = nullptr;
 +    // huffman pairs
 +    const uint16_t * lane_rel = nullptr; // with lane_off = per-unit base
++    bool             cm = false;         // chunk-major lane streams
 +};
 +
 +std::mutex         g_mutex;
@@ -709,7 +366,10 @@
 +
 +// Huffman over exponent PAIRS (positions t,t+1 of a lane slot group): adjacent exponents are strongly
 +// correlated (pair entropy ~2.05 vs ~2.53 bit/weight). Returns empty if the tensor has > 2^HP_LP distinct pairs.
-+std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K, int R) {
++// Lane streams of a unit (R rows) are row-major (row 0 over all K, then row 1, ...) or, with cm, chunk-major (512-column
++// chunk 0 of rows 0..R-1, then chunk 1, ...). Chunk-major lets a batched kernel decode a K-slab of many rows at a time;
++// such units also keep their sign|mantissa plane chunk-major (see ggml_backend_cuda_bf16n_convert).
++std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K, int R, bool cm) {
 +    const int64_t C = K / 512;
 +    const int64_t units = rows / R;
 +    auto ex = [&](int64_t i) { return (w[i] >> 7) & 0xFF; };
@@ -765,8 +425,9 @@
 +            rel32[u * 32 + l] = (uint32_t) out.size();
 +            uint64_t acc = 0;
 +            int nb = 0;
-+            for (int64_t r = u * R; r < (u + 1) * R; r++) {
-+                for (int64_t c = 0; c < C; c++) {
++            for (int64_t o = 0; o < R * C; o++) {
++                const int64_t r = u * R + (cm ? o % R : o / C), c = cm ? o / R : o % C;
++                {
 +                    for (int s = 0; s < 16; s += 2) {
 +                        const int64_t i = r * K + c * 512 + pos_of(l, s);
 +                        const int sym = ex(i) | ex(i + 1) << 8;
@@ -803,7 +464,7 @@
 +    h.off_b = h.off_a + lut.size() * 4;               // unit base (u32)
 +    h.off_c = h.off_b + unit_base.size() * 4;         // lane offsets relative to unit base (u16)
 +    h.off_d = (h.off_c + lane_rel.size() * 2 + 15) & ~15ull; // stream
-+    h.n_a = units; h.n_b = n_words;
++    h.n_a = units; h.n_b = n_words; h.flags = cm ? 1 : 0;
 +    std::vector<uint8_t> aux(h.off_d + (n_words + 16) * 4, 0); // +16 words: prefetch lookahead
 +    memcpy(aux.data(), &h, sizeof(h));
 +    memcpy(aux.data() + h.off_a, lut.data(), lut.size() * 4);
@@ -1502,6 +1163,357 @@
 +    }
 +}
 +
++// ---------------------------------------------------------------- chunk-major units (expert matrices with K > 512)
++
++// decode the 8 exponent pairs of one 512-column chunk of one row into EX (this lane's 16 weights)
++#define HP_PAIRS(EX)                                                                                 \
++    _Pragma("unroll") for (int q_ = 0; q_ < 8; q_++) {                                               \
++        if (q_ % 2 == 0) {                                                                           \
++            v = v - pa - pb;                                                                         \
++            const uint32_t m_ = __funnelshift_r(0u, 1u, v);                                          \
++            if (!(v & 32u)) {                                                                        \
++                buf += (uint64_t) wq[0] * m_;                                                        \
++                _Pragma("unroll") for (int i_ = 0; i_ + 1 < HP_PF; i_++) { wq[i_] = wq[i_ + 1]; }    \
++                wq[HP_PF - 1] = __ldg(lst + idx);                                                    \
++                idx++;                                                                               \
++            }                                                                                        \
++            v |= 32u;                                                                                \
++        }                                                                                            \
++        const uint32_t ent_ = lut[(uint32_t) (buf >> 32) >> (32 - HP_LP)];                           \
++        buf = shl64w(buf, ent_);                                                                     \
++        (EX)[q_] = ent_;                                                                             \
++        if (q_ % 2 == 0) { pa = ent_; } else { pb = ent_; }                                          \
++    }
++
++// y = W x with chunk-major units: x chunk c is read once per unit and reused for its R rows
++template <int C, int R>
++__global__ void __launch_bounds__(HP_NT) k_hp_mmv_cm(const hp_ptrs w, cols_t p) {
++    constexpr int K = C * 512;
++    extern __shared__ float shm[];
++    float * xs = shm;
++    uint32_t * lut = (uint32_t *) (shm + K);
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int wpb = blockDim.x >> 5;
++    const int t = threadIdx.x;
++    // warm start (as k_hp_mmv): every independent prologue load is in flight before the first use
++    const bool one_pass = blockDim.x * 4 >= (1 << HP_LP) && blockDim.x * 4 >= K;
++    uint4 l4 = make_uint4(0, 0, 0, 0);
++    if (one_pass && t < (1 << HP_LP) / 4) {
++        l4 = __ldg((const uint4 *) w.lut + t);
++    }
++    const float * xg; float * out; int64_t rbase;
++    col_setup(p, blockIdx.y, xg, out, rbase);
++    float4 x4 = make_float4(0.f, 0.f, 0.f, 0.f);
++    if (one_pass && t < K / 4) {
++        x4 = __ldg((const float4 *) xg + t);
++    }
++    const int64_t units = p.nrows / R;
++    const int64_t u0 = blockIdx.x * wpb + warp;
++    HP_UNIT_BEGIN(w, rbase / R + (u0 < units ? u0 : 0))
++    if (one_pass) {
++        if (t < (1 << HP_LP) / 4) {
++            ((uint4 *) lut)[t] = l4;
++        }
++        if (t < K / 4) {
++            ((float4 *) xs)[t] = x4;
++        }
++    } else {
++        HP_STAGE(xg, w.lut, lut)
++    }
++    __syncthreads();
++    for (int64_t u = u0; u < units; u += gridDim.x * wpb) {
++        const int64_t gu = rbase / R + u;
++        const uint8_t * up = w.sm + gu * R * K; // chunk-major plane: chunk c of row r at (c * R + r) * 512
++        if (u != u0) {
++            HP_UNIT_RESET(w, gu)
++        }
++        float acc[R];
++#pragma unroll
++        for (int rr = 0; rr < R; rr++) { acc[rr] = 0.f; }
++        // loop body = 4 rows (the code of 8 unrolled rows does not fit the instruction cache next to 31 other warps):
++        // acc[0..3] always holds the current 4 rows, the array is rotated by 4 after each group
++#pragma unroll 1
++        for (int c = 0; c < C; c++) {
++            const uint8_t * pc = up + c * R * 512;
++            uint4 smv[2]; // plane rows two ahead
++#pragma unroll
++            for (int i = 0; i < 2; i++) { smv[i] = ld_plane((const uint4 *) (pc + i * 512) + lane); }
++#pragma unroll 1
++            for (int r0 = 0; r0 < R; r0 += 4) {
++#pragma unroll
++                for (int i = 0; i < 4; i++) {
++                    const uint4 cur = smv[i % 2];
++                    if (r0 + i + 2 < R) { smv[i % 2] = ld_plane((const uint4 *) (pc + (r0 + i + 2) * 512) + lane); }
++                    const uint32_t smw[4] = {cur.x, cur.y, cur.z, cur.w};
++                    uint32_t ex[8];
++                    HP_PAIRS(ex)
++                    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
++#pragma unroll
++                    for (int j = 0; j < 4; j++) {
++                        const float4 xv = *(const float4 *) (xs + c * 512 + 128 * j + 4 * lane);
++                        const uint32_t w0 = sel_bits(prmt(smw[j], 0, 0x9180u), ex[2 * j]);
++                        const uint32_t w1 = sel_bits(prmt(smw[j], 0, 0xB3A2u), ex[2 * j + 1]);
++                        a0 = fmaf(__uint_as_float(w0 << 16), xv.x, a0);
++                        a1 = fmaf(__uint_as_float(w0 & 0xFFFF0000u), xv.y, a1);
++                        a2 = fmaf(__uint_as_float(w1 << 16), xv.z, a2);
++                        a3 = fmaf(__uint_as_float(w1 & 0xFFFF0000u), xv.w, a3);
++                    }
++                    acc[i] += (a0 + a1) + (a2 + a3);
++                }
++                float t4[4];
++#pragma unroll
++                for (int i = 0; i < 4; i++) { t4[i] = acc[i]; }
++#pragma unroll
++                for (int i = 0; i + 4 < R; i++) { acc[i] = acc[i + 4]; }
++#pragma unroll
++                for (int i = 0; i < 4; i++) { acc[R - 4 + i] = t4[i]; }
++            }
++        }
++#pragma unroll
++        for (int rr = 0; rr < R; rr++) {
++            const float sum = warp_sum(acc[rr]);
++            if (lane == 0) {
++                out[u * R + rr] = sum;
++            }
++        }
++    }
++}
++
++template <int C, int R>
++__global__ void __launch_bounds__(256) k_hp_dequant_cm(const hp_ptrs w, int64_t row0, int64_t nrows, uint16_t * __restrict__ out) {
++    constexpr int K = C * 512;
++    __shared__ uint32_t lut[1 << HP_LP];
++    for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut[i_] = w.lut[i_]; }
++    __syncthreads();
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    for (int64_t u = blockIdx.x * 8 + warp; u < nrows / R; u += gridDim.x * 8) {
++        const int64_t gu = row0 / R + u;
++        HP_UNIT_BEGIN(w, gu)
++        for (int c = 0; c < C; c++) {
++            for (int rr = 0; rr < R; rr++) {
++                const int64_t gr = gu * R + rr;
++                const uint4 smv = ld_plane((const uint4 *) (w.sm + gu * R * K + (c * R + rr) * 512) + lane); // chunk-major plane
++                const uint32_t smw[4] = {smv.x, smv.y, smv.z, smv.w};
++                uint32_t ex[8];
++                HP_PAIRS(ex)
++                uint16_t * o = out + (gr - row0) * K + c * 512;
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    const uint32_t w0 = sel_bits(prmt(smw[j], 0, 0x9180u), ex[2 * j]);
++                    const uint32_t w1 = sel_bits(prmt(smw[j], 0, 0xB3A2u), ex[2 * j + 1]);
++                    *(uint2 *) (o + 128 * j + 4 * lane) = make_uint2(w0, w1);
++                }
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------- batched MUL_MAT_ID (prefill)
++//
++// One launch per MUL_MAT_ID; routing comes from ggml_cuda_launch_mm_ids_helper on the GPU (no host sync). A block owns
++// NW consecutive units of one expert and up to TP of the tokens routed to it. Per step (a 512-column chunk of a slice of
++// the units' rows; chunk-major streams make this the decode order) every warp decodes its rows into a 64-row shared
++// slab, then the warps of that slice multiply the slab with the tokens' BF16 activations on the tensor cores (FP32
++// accumulation). Every weight is decoded once per block; the slab stays small enough to leave L1 to the lane streams.
++// Within each group of 32 columns the k order is permuted identically for the slab and the activations, so a thread loads
++// 16 bytes of activations for two mma steps and the slab is read with ldmatrix.
++
++constexpr int HPM_LD = 512 + 8; // slab row stride (bf16): 16-byte row skew, conflict-free ldmatrix
++
++struct hpm_args {
++    const nv_bfloat16 * x; int64_t x_row;  // activations as BF16 rows of K
++    const int32_t * ids_src1; const int32_t * ids_dst; const int32_t * bounds; // from ggml_cuda_launch_mm_ids_helper
++    float * dst; int64_t dst_col;          // dst column stride (elements)
++    int64_t rows;                          // rows per expert
++};
++
++__device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], const void * p) {
++    const uint32_t s = (uint32_t) __cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(s));
++}
++
++// NW warps each own one unit (R rows) and decode RS = R / H of its rows per step (step = 512-column chunk x row slice),
++// so NW * RS = 64 slab rows hold slice h of all NW units. Warp group h (NW / H warps) multiplies slice h: 2 row groups of
++// 32 x token groups of WT*8 tokens; TP tokens per block. Token groups without tokens split K instead.
++template <int C, int R, int NW, int H, int WT>
++__global__ void __launch_bounds__(NW * 32, 1) k_hp_mm_ids(const hp_ptrs w, hpm_args a) {
++    constexpr int K = C * 512;
++    constexpr int RS = R / H;             // rows per warp per step
++    constexpr int BR = NW * RS;           // slab rows
++    static_assert(BR == 64 && RS % 4 == 0 && NW % H == 0, "bad block shape");
++    constexpr int GW = NW / H;            // warps per slice group
++    constexpr int TG = GW / 2;            // token groups per slice group
++    constexpr int TP = TG * WT * 8;       // tokens per block
++    const int e = blockIdx.y;
++    const int j1 = a.bounds[e + 1];
++    const int jb = a.bounds[e] + blockIdx.z * TP;
++    if (jb >= j1) {
++        return;
++    }
++    extern __shared__ uint32_t hpm_shm[];
++    uint32_t * lut = hpm_shm;
++    uint16_t * slab = (uint16_t *) (hpm_shm + (1 << HP_LP));
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int g = lane >> 2, q = lane & 3;
++    const int64_t units = a.rows / R;
++    const int64_t ub = (int64_t) blockIdx.x * NW;
++    const bool has_unit = ub + warp < units;
++    const int64_t gu = (int64_t) e * units + (has_unit ? ub + warp : ub);
++
++#pragma unroll
++    for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += NW * 32) {
++        ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i);
++    }
++    const int sg = warp / GW;             // slice this warp multiplies
++    const int rg = warp % 2, tg = (warp % GW) / 2;
++    const int nlt = (min(TP, j1 - jb) + WT * 8 - 1) / (WT * 8);
++    const int nks = TG / nlt;
++    const int tge = tg % nlt, ks = tg / nlt;
++    const bool live = ks < nks;
++    const nv_bfloat16 * xr[WT];
++    int dc[WT][2];
++#pragma unroll
++    for (int i = 0; i < WT; i++) {
++        const int t0 = jb + (tge * WT + i) * 8;
++        xr[i] = a.x + (int64_t) a.ids_src1[min(t0 + g, j1 - 1)] * a.x_row + 8 * q;
++        dc[i][0] = t0 + 2 * q < j1 ? a.ids_dst[t0 + 2 * q] : -1;
++        dc[i][1] = t0 + 2 * q + 1 < j1 ? a.ids_dst[t0 + 2 * q + 1] : -1;
++    }
++    HP_UNIT_BEGIN(w, gu)
++    const uint8_t * up = w.sm + gu * R * K;
++    uint4 smv[4];
++#pragma unroll
++    for (int i = 0; i < 4; i++) { smv[i] = ld_plane((const uint4 *) (up + i * 512) + lane); }
++    __syncthreads();
++
++    float acc[2][WT][4];
++#pragma unroll
++    for (int m = 0; m < 2; m++) {
++#pragma unroll
++        for (int i = 0; i < WT; i++) { acc[m][i][0] = acc[m][i][1] = acc[m][i][2] = acc[m][i][3] = 0.f; }
++    }
++    const int scol = 32 * (lane >> 3) + 16 * (lane & 1) + 2 * ((lane >> 1) & 3);
++    const uint16_t * ar = slab + (rg * 32 + (lane & 15)) * HPM_LD + (lane >> 4) * 8;
++#pragma unroll 1
++    for (int s = 0; s < C * H; s++) {
++        const int c = s / H, h = s % H;
++        if (has_unit) {
++#pragma unroll
++            for (int rr = 0; rr < RS; rr++) {
++                const uint4 cur = smv[rr % 4];
++                const int nr = h * RS + rr + 4; // stream position of the plane row to prefetch (may be the next step)
++                if (rr + 4 < RS) {
++                    smv[rr % 4] = ld_plane((const uint4 *) (up + (c * R + nr) * 512) + lane);
++                } else if (s + 1 < C * H) {
++                    const int s1 = s + 1;
++                    smv[rr % 4] = ld_plane((const uint4 *) (up + ((s1 / H) * R + (s1 % H) * RS + rr + 4 - RS) * 512) + lane);
++                }
++                const uint32_t smw[4] = {cur.x, cur.y, cur.z, cur.w};
++                uint32_t ex[8];
++                HP_PAIRS(ex)
++                uint32_t * srow = (uint32_t *) (slab + (warp * RS + rr) * HPM_LD + scol);
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    srow[64 * j]     = sel_bits(prmt(smw[j], 0, 0x9180u), ex[2 * j]);     // columns +0, +1
++                    srow[64 * j + 4] = sel_bits(prmt(smw[j], 0, 0xB3A2u), ex[2 * j + 1]); // columns +8, +9
++                }
++            }
++        }
++        __syncthreads();
++        if (live && sg == h) {
++            uint4 b0[WT], b1[WT];
++#pragma unroll
++            for (int i = 0; i < WT; i++) {
++                b0[i] = __ldg((const uint4 *) (xr[i] + c * 512 + 32 * ks));
++                b1[i] = ks + nks < 16 ? __ldg((const uint4 *) (xr[i] + c * 512 + 32 * (ks + nks))) : make_uint4(0, 0, 0, 0);
++            }
++#define HPM_GROUP(B, KG)                                                                                     \
++            _Pragma("unroll") for (int st = 0; st < 2; st++) {                                               \
++                uint32_t af[2][4];                                                                           \
++                ldmatrix_x4(af[0], ar + 32 * (KG) + 16 * st);                                                \
++                ldmatrix_x4(af[1], ar + 16 * HPM_LD + 32 * (KG) + 16 * st);                                  \
++                _Pragma("unroll") for (int i = 0; i < WT; i++) {                                             \
++                    const uint32_t x0 = st ? (B)[i].z : (B)[i].x, x1 = st ? (B)[i].w : (B)[i].y;             \
++                    mma_bf16(acc[0][i], af[0], x0, x1);                                                      \
++                    mma_bf16(acc[1][i], af[1], x0, x1);                                                      \
++                }                                                                                            \
++            }
++            for (int kg = ks; kg < 16; kg += 2 * nks) {
++                HPM_GROUP(b0, kg)
++                if (kg + 2 * nks < 16) {
++#pragma unroll
++                    for (int i = 0; i < WT; i++) { b0[i] = __ldg((const uint4 *) (xr[i] + c * 512 + 32 * (kg + 2 * nks))); }
++                }
++                if (kg + nks < 16) {
++                    HPM_GROUP(b1, kg + nks)
++                    if (kg + 3 * nks < 16) {
++#pragma unroll
++                        for (int i = 0; i < WT; i++) { b1[i] = __ldg((const uint4 *) (xr[i] + c * 512 + 32 * (kg + 3 * nks))); }
++                    }
++                }
++            }
++#undef HPM_GROUP
++        }
++        __syncthreads();
++    }
++    if (nks > 1) { // add the K-split partial sums through the (now free) slab
++        float * red = (float *) slab;
++        if (live && ks > 0) {
++#pragma unroll
++            for (int m = 0; m < 2; m++) {
++#pragma unroll
++                for (int i = 0; i < WT; i++) {
++#pragma unroll
++                    for (int v = 0; v < 4; v++) { red[((warp * 2 + m) * WT * 4 + i * 4 + v) * 32 + lane] = acc[m][i][v]; }
++                }
++            }
++        }
++        __syncthreads();
++        if (live && ks == 0) {
++            for (int k2 = 1; k2 < nks; k2++) {
++                const int w2 = sg * GW + rg + 2 * (tge + nlt * k2);
++#pragma unroll
++                for (int m = 0; m < 2; m++) {
++#pragma unroll
++                    for (int i = 0; i < WT; i++) {
++#pragma unroll
++                        for (int v = 0; v < 4; v++) { acc[m][i][v] += red[((w2 * 2 + m) * WT * 4 + i * 4 + v) * 32 + lane]; }
++                    }
++                }
++            }
++        }
++    }
++    if (!live || ks > 0) {
++        return;
++    }
++#pragma unroll
++    for (int m = 0; m < 2; m++) {
++#pragma unroll
++        for (int hh = 0; hh < 2; hh++) {
++            const int rho = rg * 32 + m * 16 + g + 8 * hh;                    // slab row
++            const int64_t row = (ub + rho / RS) * R + sg * RS + rho % RS;     // row within the expert
++            if (ub + rho / RS >= units) {
++                continue;
++            }
++#pragma unroll
++            for (int i = 0; i < WT; i++) {
++#pragma unroll
++                for (int t = 0; t < 2; t++) {
++                    if (dc[i][t] >= 0) {
++                        a.dst[(int64_t) dc[i][t] * a.dst_col + row] = acc[m][i][2 * hh + t];
++                    }
++                }
++            }
++        }
++    }
++}
++
 +nib_ptrs nibp(const entry & e) { return {e.base, e.nib, e.lut_row, e.esc_off, e.esc}; }
 +huf_ptrs hufp(const entry & e) { return {e.base, e.hlut, e.lane_off, e.stream}; }
 +hp_ptrs hpp(const entry & e) { return {e.base, e.hlut, e.lane_off, e.lane_rel, e.stream}; }
@@ -1529,9 +1541,19 @@
 +        dim3 g2; int nt;
 +        hp_launch_dims(e, p.nrows, ncols, g2, nt);
 +        const size_t shm = K * sizeof(float) + (4u << HP_LP);
++        if (e.cm) {
++#define CM_CASE(CC, RR) case CC * 100 + RR: k_hp_mmv_cm<CC, RR><<<g2, nt, shm, stream>>>(hpp(e), p); break;
++            switch (K / 512 * 100 + e.R) {
++                CM_CASE(2, 4) CM_CASE(2, 8) CM_CASE(2, 16) CM_CASE(4, 4) CM_CASE(4, 8) CM_CASE(4, 16)
++                CM_CASE(8, 4) CM_CASE(8, 8) CM_CASE(8, 16)
++                default: GGML_ABORT("bf16n: unsupported chunk-major K/R");
++            }
++#undef CM_CASE
++        } else {
 +#define HP_CASE(CC) case CC: k_hp_mmv<CC><<<g2, nt, shm, stream>>>(hpp(e), e.R, p); break;
-+        switch (K / 512) { HP_CASE(1) HP_CASE(2) HP_CASE(4) HP_CASE(8) default: GGML_ABORT("bf16n: unsupported K"); }
++            switch (K / 512) { HP_CASE(1) HP_CASE(2) HP_CASE(4) HP_CASE(8) default: GGML_ABORT("bf16n: unsupported K"); }
 +#undef HP_CASE
++        }
 +    } else if (e.format == GGML_BF16N_NIBBLE) {
 +#define NIB_CASE(CC) case CC: k_nibble_mmv<CC><<<grid, 256, 0, stream>>>(nibp(e), p); break;
 +        switch (K / 512) { NIB_CASE(1) NIB_CASE(2) NIB_CASE(4) NIB_CASE(8) default: GGML_ABORT("bf16n: unsupported K"); }
@@ -1587,6 +1609,13 @@
 +    case CC:                                                                                                           \
 +        if (e.format == GGML_BF16N_NIBBLE) {                                                                           \
 +            k_nibble_dequant<CC><<<gx, 256, 0, stream>>>(e.base, e.nib, e.lut_row, e.esc_off, e.esc, row0, nrows, out); \
++        } else if (e.format == GGML_BF16N_HUFPAIR && e.cm) {                                                           \
++            switch (e.R) {                                                                                             \
++                case 4: k_hp_dequant_cm<CC, 4><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out); break;              \
++                case 8: k_hp_dequant_cm<CC, 8><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out); break;              \
++                case 16: k_hp_dequant_cm<CC, 16><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out); break;            \
++                default: GGML_ABORT("bf16n: unsupported chunk-major R");                                              \
++            }                                                                                                          \
 +        } else if (e.format == GGML_BF16N_HUFPAIR) {                                                                   \
 +            k_hp_dequant<CC><<<gx, 256, 0, stream>>>(hpp(e), e.R, row0, nrows, out);                                    \
 +        } else {                                                                                                       \
@@ -1595,6 +1624,32 @@
 +        break;
 +    switch (e.K / 512) { DQ(1) DQ(2) DQ(4) DQ(8) default: GGML_ABORT("bf16n: unsupported K"); }
 +#undef DQ
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// (chunks per row, rows per unit) pairs with a batched kernel instance: slab of 64 rows, 128 tokens per block
++bool hpm_config(int C, int R) { return (C == 4 && R == 8) || (C == 1 && R == 16); }
++
++void launch_mm_ids(const entry & e, const hpm_args & a, int n_experts, int n_tok, cudaStream_t stream) {
++    const int64_t units = a.rows / e.R;
++#define MM(CC, RR, NW, HH, WT)                                                                                         \
++    case CC * 100 + RR: {                                                                                              \
++        constexpr int TP = NW / HH / 2 * WT * 8;                                                                       \
++        constexpr size_t shm = (4u << HP_LP) + 64 * HPM_LD * 2;                                                        \
++        static bool attr = false;                                                                                      \
++        if (!attr) {                                                                                                   \
++            CUDA_CHECK(cudaFuncSetAttribute(k_hp_mm_ids<CC, RR, NW, HH, WT>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm)); \
++            attr = true;                                                                                               \
++        }                                                                                                              \
++        const dim3 grid((unsigned) ((units + NW - 1) / NW), (unsigned) n_experts, (unsigned) ((n_tok + TP - 1) / TP)); \
++        k_hp_mm_ids<CC, RR, NW, HH, WT><<<grid, NW * 32, shm, stream>>>(hpp(e), a);                                     \
++    } break;
++    switch (e.K / 512 * 100 + e.R) {
++        MM(4, 8, 16, 2, 4)
++        MM(1, 16, 8, 2, 8)
++        default: GGML_ABORT("bf16n: no batched kernel for this K/R");
++    }
++#undef MM
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
@@ -1663,7 +1718,7 @@
 +    int64_t rg, ru;
 +    const entry * g = lookup(gate_w->data, rg);
 +    const entry * u = lookup(up_w->data, ru);
-+    if (!g || !u || g->format != u->format || g->K != u->K || rg != 0 || ru != 0) {
++    if (!g || !u || g->format != u->format || g->K != u->K || rg != 0 || ru != 0 || g->cm || u->cm) {
 +        return false;
 +    }
 +    if (g->format == GGML_BF16N_NIBBLE) {
@@ -1690,6 +1745,37 @@
 +    launch_mmv_glu(*g, *u, p, ncols, ctx.stream());
 +}
 +
++bool ggml_cuda_bf16n_mul_mat_id_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
++        const ggml_tensor * dst) {
++    static const bool off = getenv("GGML_BF16N_NO_MMA") != nullptr;
++    if (off || ggml_cuda_bf16n_reference()) {
++        return false;
++    }
++    int64_t row0 = 0;
++    const entry * e = lookup(src0->data, row0);
++    return e && e->format == GGML_BF16N_HUFPAIR && (e->cm || e->K == 512) && hpm_config((int) (e->K / 512), e->R) &&
++        row0 == 0 && e->rows == src0->ne[1] * src0->ne[2] &&
++        src0->ne[1] % e->R == 0 && src0->ne[3] == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t);
++}
++
++void ggml_cuda_bf16n_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++        const ggml_tensor * ids, ggml_tensor * dst) {
++    int64_t row0 = 0;
++    const entry * e = lookup(src0->data, row0);
++    cudaStream_t stream = ctx.stream();
++    const int n_used = (int) ids->ne[0], n_tok = (int) ids->ne[1], n_experts = (int) src0->ne[2];
++    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), (size_t) n_used * n_tok);
++    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), (size_t) n_used * n_tok);
++    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1);
++    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), n_experts, n_tok,
++        n_used, (int) src1->ne[1], (int) (ids->nb[1] / sizeof(int32_t)), (int) (src1->nb[2] / src1->nb[1]), false, stream);
++    ggml_cuda_pool_alloc<nv_bfloat16> x(ctx.pool(), ggml_nelements(src1));
++    ggml_get_to_bf16_cuda(GGML_TYPE_F32)(src1->data, x.get(), ggml_nelements(src1), stream);
++    const hpm_args a = { x.get(), src1->ne[0], ids_src1.get(), ids_dst.get(), bounds.get(), (float *) dst->data, dst->ne[0], src0->ne[1] };
++    launch_mm_ids(*e, a, n_experts, n_tok, stream);
++}
++
 +void ggml_cuda_bf16n_dequant_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, void * out) {
 +    int64_t row0 = 0;
 +    const entry * e = lookup(src0->data, row0);
@@ -1705,6 +1791,7 @@
 +    int64_t row0 = 0;
 +    const entry * e = lookup(src0->data, row0);
 +    GGML_ASSERT(e && "BF16N tensor without registered aux data");
++    GGML_ASSERT(!e->cm && "GET_ROWS of a chunk-major (expert) tensor");
 +    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && dst->nb[0] == sizeof(float));
 +    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1);
 +    const int64_t n = src1->ne[0];
@@ -1761,7 +1848,8 @@
 +                }
 +            }
 +        }
-+        aux = encode_huffpair(w, rows, K, R);
++        // expert matrices with K > 512 get chunk-major streams for the batched (prefill) MUL_MAT_ID kernel
++        aux = encode_huffpair(w, rows, K, R, tensor->ne[2] > 1 && K > 512);
 +        if (!aux.empty()) {
 +            format = GGML_BF16N_HUFPAIR;
 +        } else {
@@ -1782,6 +1870,20 @@
 +            }
 +        }
 +    }
++    if (format == GGML_BF16N_HUFPAIR && (((const aux_header *) aux.data())->flags & 1)) {
++        // chunk-major units also store their plane chunk-major ([chunk][row][512 B] inside each unit), so a kernel
++        // walking chunk c over the unit's rows reads one contiguous block
++        std::vector<uint8_t> tmp(R * K);
++        for (int64_t u = 0; u < rows / R; u++) {
++            uint8_t * ub = sm.data() + u * R * K;
++            memcpy(tmp.data(), ub, R * K);
++            for (int r = 0; r < R; r++) {
++                for (int64_t c = 0; c < K / 512; c++) {
++                    memcpy(ub + (c * R + r) * 512, tmp.data() + r * K + c * 512, 512);
++                }
++            }
++        }
++    }
 +    CUDA_CHECK(cudaMemcpy(tensor->data, sm.data(), sm.size(), cudaMemcpyHostToDevice));
 +    void * aux_dev = nullptr;
 +    CUDA_CHECK(cudaMalloc(&aux_dev, aux.size()));
@@ -1790,6 +1892,7 @@
 +    entry e;
 +    e.base = (const uint8_t *) tensor->data; e.nbytes = sm.size(); e.format = format; e.K = K; e.rows = rows; e.R = R;
 +    e.aux = aux_dev; e.aux_bytes = aux.size();
++    e.cm = format == GGML_BF16N_HUFPAIR && (((const aux_header *) aux.data())->flags & 1);
 +    const aux_header * h = (const aux_header *) aux.data();
 +    const uint8_t * a = (const uint8_t *) aux_dev;
 +    if (format == GGML_BF16N_HUFPAIR) {
@@ -1840,9 +1943,12 @@
 +        format == GGML_BF16N_HUFPAIR ? "hufpair" : format == GGML_BF16N_HUFFMAN ? "huffman" : "nibble ", (long long) K, (long long) rows, R, ratio, ok ? "OK" : "FAIL");
 +    return ok;
 +}
---- a/ggml/src/ggml-cuda/bf16n.cuh
+diff --git a/ggml/src/ggml-cuda/bf16n.cuh b/ggml/src/ggml-cuda/bf16n.cuh
+new file mode 100644
+index 0000000..cda847b
+--- /dev/null
 +++ b/ggml/src/ggml-cuda/bf16n.cuh
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,38 @@
 +#pragma once
 +
 +#include "common.cuh"
@@ -1868,6 +1974,12 @@
 +void ggml_cuda_bf16n_mul_mat_vec_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
 +                                     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
 +
++// MUL_MAT_ID with more than 8 tokens (prefill): decode in shared memory + BF16 tensor cores, routing on the GPU (no sync)
++bool ggml_cuda_bf16n_mul_mat_id_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
++                                          const ggml_tensor * dst);
++void ggml_cuda_bf16n_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                                const ggml_tensor * ids, ggml_tensor * dst);
++
 +// GET_ROWS with a BF16N source (token embedding), F32 destination
 +void ggml_cuda_bf16n_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +
@@ -1875,9 +1987,379 @@
 +void ggml_cuda_bf16n_dequant_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, void * out);
 +
 +extern "C" bool ggml_backend_cuda_bf16n_convert(struct ggml_tensor * tensor, const void * bf16_host, int format);
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 1b431a7..e8ad83e 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -9,6 +9,8 @@ gated_delta_net_cuda(const float * q,
+                                      const float * g,
+                                      const float * beta,
+                                      const float * curr_state,
++                                     const int32_t * state_ids,
++                                     int64_t       state_row_stride,
+                                      float *       dst,
+                                      float *       state,
+                                      int64_t       H,
+@@ -41,7 +43,8 @@ gated_delta_net_cuda(const float * q,
+ 
+     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
+     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
+-    const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
++    // state_ids: the state rows are read straight from the cache (fused GET_ROWS), else from the gathered copy
++    const int64_t state_in_offset      = (state_ids ? (int64_t) state_ids[sequence] * state_row_stride : (int64_t) sequence * H * S_v * S_v) + h_idx * S_v * S_v;
+     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+     state += state_out_offset;
+     curr_state += state_in_offset + col * S_v;
+@@ -170,6 +173,7 @@ template <bool KDA, bool keep_rs_t>
+ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d, const float * s_d,
++        const int32_t * ids_d, int64_t state_row_stride,
+         float * dst_d, float * state_d,
+         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+         int64_t sq1,   int64_t sq2, int64_t sq3,
+@@ -190,26 +194,26 @@ static void launch_gated_delta_net(
+     switch (S_v) {
+         case 16:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         case 32:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         case 64: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         }
+         case 128: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+@@ -258,6 +262,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     const float * s_d   = (const float *) src_state->data;
+     float *       dst_d = (float *) dst->data;
+ 
++    const int32_t * ids_d            = nullptr;
++    int64_t         state_row_stride = 0;
++    if (const ggml_tensor * rows = ggml_cuda_gdn_state_rows(dst)) {
++        s_d              = (const float *) rows->src[0]->data;
++        ids_d            = (const int32_t *) rows->src[1]->data;
++        state_row_stride = rows->src[0]->nb[1] / sizeof(float);
++    }
++
+     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
+     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
+     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
+@@ -296,27 +308,52 @@ static void ggml_cuda_op_gated_delta_net_impl(
+ 
+     if (kda) {
+         if (keep_rs) {
+-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+     } else {
+         if (keep_rs) {
+-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+     }
+ }
+ 
++// GDN whose state input is reshape(GET_ROWS(states, ids)) for a single sequence: return the GET_ROWS node so the
++// kernel can read the rows in place. Single sequence only: the state row may be the one the kernel writes back,
++// which is safe because every thread reads its slice before writing it.
++const ggml_tensor * ggml_cuda_gdn_state_rows(const ggml_tensor * gdn) {
++    static const bool off = getenv("GGML_CUDA_NO_GDN_ROWS") != nullptr;
++    if (off || gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[2]->ne[3] != 1) {
++        return nullptr;
++    }
++    const ggml_tensor * st = gdn->src[5];
++    const ggml_tensor * t  = st;
++    while (t != nullptr && (t->op == GGML_OP_RESHAPE || (t->op == GGML_OP_VIEW && t->view_offs == 0))) {
++        t = t->src[0];
++    }
++    if (t == nullptr || t->op != GGML_OP_GET_ROWS || t->type != GGML_TYPE_F32) {
++        return nullptr;
++    }
++    const ggml_tensor * src = t->src[0];
++    const ggml_tensor * ids = t->src[1];
++    if (src->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || src->nb[0] != sizeof(float) ||
++        t->ne[1] != 1 || ggml_nelements(t) != ggml_nelements(st) || src->ne[0] != t->ne[0] || !ggml_is_contiguous(t)) {
++        return nullptr;
++    }
++    return t;
++}
++
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
+ }
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index f9bf437..ee17876 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -9,6 +9,9 @@ struct ggml_cuda_gated_delta_net_fused_cache {
+ 
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// GET_ROWS node feeding this GDN's state that the kernel can read in place (nullptr if not applicable)
++const ggml_tensor * ggml_cuda_gdn_state_rows(const ggml_tensor * gdn);
++
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                               ggml_cuda_gated_delta_net_fused_cache cache);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7905538..4da0278 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3,6 +3,7 @@
+ #include "ggml-backend-impl.h"
+ 
+ #include "ggml-cuda/allreduce.cuh"
++#include "ggml-cuda/bf16n.cuh"
+ #include "ggml-cuda/common.cuh"
+ #include "ggml-cuda/acc.cuh"
+ #include "ggml-cuda/add-id.cuh"
+@@ -90,6 +91,8 @@
+ #include <cstdlib>
+ #include <string>
+ #include <vector>
++#include <unordered_set>
++#include <unordered_map>
+ 
+ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+ 
+@@ -1796,6 +1799,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+ 
++    if (src0->type == GGML_TYPE_BF16N) {
++        return false;
++    }
++
+     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                    src0->view_src;
+@@ -1828,6 +1835,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         return;
+     }
+ 
++    if (src0->type == GGML_TYPE_BF16N) {
++        if (!ggml_cuda_bf16n_reference() && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne11 <= 8 && ne12 == 1 && ne13 == 1) {
++            ggml_cuda_bf16n_mul_mat_vec(ctx, src0, src1, nullptr, dst);
++            return;
++        }
++        // batched: exact BF16 reconstruction, then the regular BF16 cuBLAS path
++        ggml_cuda_pool_alloc<nv_bfloat16> w(ctx.pool(), ggml_nelements(src0));
++        ggml_cuda_bf16n_dequant_bf16(ctx, src0, w.get());
++        ggml_tensor w_bf16 = *src0;
++        w_bf16.type  = GGML_TYPE_BF16;
++        w_bf16.nb[0] = sizeof(nv_bfloat16);
++        w_bf16.nb[1] = w_bf16.nb[0]*w_bf16.ne[0];
++        w_bf16.nb[2] = w_bf16.nb[1]*w_bf16.ne[1];
++        w_bf16.nb[3] = w_bf16.nb[2]*w_bf16.ne[2];
++        w_bf16.data  = w.get();
++        ggml_cuda_mul_mat_cublas(ctx, &w_bf16, src1, dst);
++        return;
++    }
++
+     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
+     // Therefore, in such cases use cuBLAS.
+@@ -1882,6 +1908,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
++    if (src0->type == GGML_TYPE_BF16N) {
++        return ggml_cuda_bf16n_reference() ||
++            (dst->ne[2] > 8 && !ggml_cuda_bf16n_mul_mat_id_supported(src0, src1, dst->src[2], dst));
++    }
++
+     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+         return true;
+     }
+@@ -1919,10 +1950,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
++    if (src0->type == GGML_TYPE_BF16N && ne2 <= 8 && !ggml_cuda_bf16n_reference()) {
++        ggml_cuda_bf16n_mul_mat_vec(ctx, src0, src1, ids, dst);
++        return;
++    }
++    if (src0->type == GGML_TYPE_BF16N && ggml_cuda_bf16n_mul_mat_id_supported(src0, src1, ids, dst)) {
++        ggml_cuda_bf16n_mul_mat_id(ctx, src0, src1, ids, dst);
++        return;
++    }
++
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
++        if (ne2 <= MMVQ_MAX_BATCH_SIZE && src0->type != GGML_TYPE_BF16N) {
+             if (ggml_is_quantized(src0->type)) {
+                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                 if (ne2 <= mmvq_mmid_max) {
+@@ -2079,7 +2119,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+             ggml_cuda_op_repeat_back(ctx, dst);
+             break;
+         case GGML_OP_GET_ROWS:
+-            ggml_cuda_op_get_rows(ctx, dst);
++            if (dst->src[0]->type == GGML_TYPE_BF16N) {
++                ggml_cuda_bf16n_get_rows(ctx, dst);
++            } else {
++                ggml_cuda_op_get_rows(ctx, dst);
++            }
+             break;
+         case GGML_OP_GET_ROWS_BACK:
+             ggml_cuda_op_get_rows_back(ctx, dst);
+@@ -3950,6 +3994,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const ggml_tensor * src1 = up->src[1];
+             const ggml_tensor * ids  = up->src[2];
+ 
++            if (src0->type == GGML_TYPE_BF16N && !ggml_cuda_bf16n_reference() && gate->src[1] == src1 && gate->src[2] == ids &&
++                    ggml_cuda_bf16n_can_fuse_glu(gate->src[0], src0, src1, ids, glu)) {
++                ggml_cuda_bf16n_mul_mat_vec_glu(*cuda_ctx, gate->src[0], src0, src1, ids, glu);
++                fused_mul_mat_vec = true;
++                fused_node_count  = 3;
++                break;
++            }
++
+             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate->src[0];
+@@ -4280,6 +4332,44 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 stream_ctx.concurrent_events.clear();
+             }
+ 
++            // GET_ROWS gathers of recurrent states read in place by their GDN (see ggml_cuda_gdn_state_rows)
++            std::unordered_set<const ggml_tensor *> skip_state_rows;
++            {
++                std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> chains; // (gdn, get_rows)
++                std::unordered_map<const ggml_tensor *, int> uses;
++                for (int i = 0; i < cgraph->n_nodes; i++) {
++                    if (const ggml_tensor * rows = ggml_cuda_gdn_state_rows(cgraph->nodes[i])) {
++                        chains.emplace_back(cgraph->nodes[i], rows);
++                        for (const ggml_tensor * t = cgraph->nodes[i]->src[5]; t != rows; t = t->src[0]) {
++                            uses[t] = 0;
++                        }
++                        uses[rows] = 0;
++                    }
++                }
++                if (!chains.empty()) {
++                    for (int i = 0; i < cgraph->n_nodes; i++) {
++                        for (int j = 0; j < GGML_MAX_SRC; j++) {
++                            auto it = uses.find(cgraph->nodes[i]->src[j]);
++                            if (it != uses.end()) {
++                                it->second++;
++                            }
++                        }
++                    }
++                    for (const auto & [gdn, rows] : chains) {
++                        bool only_gdn = (rows->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
++                        for (const ggml_tensor * t = gdn->src[5]; only_gdn; t = t->src[0]) {
++                            only_gdn = uses[t] == 1 && (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
++                            if (t == rows) {
++                                break;
++                            }
++                        }
++                        if (only_gdn) {
++                            skip_state_rows.insert(rows);
++                        }
++                    }
++                }
++            }
++
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+                 if (is_concurrent_event_active) {
+@@ -4314,7 +4404,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+                 prev_i = i;
+ 
+-                if (ggml_cuda_is_view_or_noop(node)) {
++                if (ggml_cuda_is_view_or_noop(node) || skip_state_rows.count(node)) {
+                     continue;
+                 }
+ 
+@@ -5173,6 +5263,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ4_XS:
+                     case GGML_TYPE_BF16:
+                         return true;
++                    case GGML_TYPE_BF16N:
++                        return b->type == GGML_TYPE_F32;
+                     default:
+                         return false;
+                 }
+@@ -5212,6 +5304,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                         // 32-value sub-blocks, the row size does not guarantee
+                         // the QK_K super-blocks the get_rows kernel iterates on
+                         return op->src[0]->ne[0] % QK_K == 0;
++                    case GGML_TYPE_BF16N:
++                        return op->type == GGML_TYPE_F32 && op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 1;
+                     default:
+                         return false;
+                 }
+@@ -5695,6 +5789,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++    if (strcmp(name, "ggml_backend_cuda_bf16n_convert") == 0) {
++        return (void *)ggml_backend_cuda_bf16n_convert;
++    }
+     return nullptr;
+ }
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 5ef03e1..c44fa11 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -883,6 +883,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .type_size                = sizeof(block_q8_K),
+         .is_quantized             = true,
+     },
++    [GGML_TYPE_BF16N] = {
++        .type_name                = "bf16n",
++        .blck_size                = 512,
++        .type_size                = 512,
++        .is_quantized             = true,
++        .to_float                 = NULL,
++        .from_float_ref           = NULL,
++    },
+     [GGML_TYPE_BF16] = {
+         .type_name                = "bf16",
+         .blck_size                = 1,
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 91bb5e7..eb3591d 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -1106,6 +1106,34 @@
+@@ -1106,6 +1106,34 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
      return true;
  }
  
@@ -1912,7 +2394,7 @@
  struct ggml_tensor * llama_model_loader::create_tensor(
          const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
          const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-@@ -1370,6 +1398,16 @@
+@@ -1370,6 +1398,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
  
      const bool duplicated = flags & TENSOR_DUPLICATED;
  
@@ -1929,7 +2411,7 @@
      struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
      ggml_set_name(tensor, ggml_get_name(&t_meta));
  
-@@ -1628,6 +1666,44 @@
+@@ -1628,6 +1666,44 @@ bool llama_model_loader::load_all_data(
              }
          }
  
@@ -1974,9 +2456,11 @@
          size_t n_size = ggml_nbytes(cur);
  
          const bool from_mapping = use_mmap || lazy.has(cur);
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 9e51d0c..913667f 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
-@@ -75,6 +75,9 @@
+@@ -75,6 +75,9 @@ struct llama_model_loader {
      int n_tensors = 0;
      int n_created = 0;
  
@@ -1986,9 +2470,11 @@
      uint64_t n_elements = 0;
      size_t   n_bytes    = 0;
  
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 3b25362..74a353a 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1510,6 +1510,10 @@
+@@ -1510,6 +1510,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      // assign the input layer
      // there is very little benefit to offloading the input layer, so always keep it on the CPU
      pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };

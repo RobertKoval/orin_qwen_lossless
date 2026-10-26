@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="388" viewBox="0 0 760 388" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="Prefill speed, 8192-token prompt">
+<title>Prefill speed, 8192-token prompt</title>
+<rect x="0.5" y="0.5" width="759" height="387" rx="12" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<text x="24" y="36" font-size="17" font-weight="600" fill="#0b0b0b">Prefill speed, 8192-token prompt</text>
+<text x="24" y="58" font-size="13" fill="#52514e">tokens per second by micro-batch size: dequant + cuBLAS per expert vs the batched MoE kernel</text>
+<line x1="263.8" y1="86" x2="263.8" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="263.8" y="354" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="309.0" y1="86" x2="309.0" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="309.0" y="354" font-size="11" fill="#898781" text-anchor="middle">100</text>
+<line x1="354.1" y1="86" x2="354.1" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="354.1" y="354" font-size="11" fill="#898781" text-anchor="middle">200</text>
+<line x1="399.2" y1="86" x2="399.2" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="399.2" y="354" font-size="11" fill="#898781" text-anchor="middle">300</text>
+<line x1="444.4" y1="86" x2="444.4" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="444.4" y="354" font-size="11" fill="#898781" text-anchor="middle">400</text>
+<line x1="489.5" y1="86" x2="489.5" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="489.5" y="354" font-size="11" fill="#898781" text-anchor="middle">500</text>
+<line x1="534.6" y1="86" x2="534.6" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="534.6" y="354" font-size="11" fill="#898781" text-anchor="middle">600</text>
+<line x1="579.7" y1="86" x2="579.7" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="579.7" y="354" font-size="11" fill="#898781" text-anchor="middle">700</text>
+<line x1="624.9" y1="86" x2="624.9" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="624.9" y="354" font-size="11" fill="#898781" text-anchor="middle">800</text>
+<line x1="670.0" y1="86" x2="670.0" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="670.0" y="354" font-size="11" fill="#898781" text-anchor="middle">900</text>
+<line x1="263.84000000000003" y1="86" x2="263.84000000000003" y2="336" stroke="#c3c2b7" stroke-width="1"/>
+<text x="670" y="374" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
+<g fill="#86b6ef"><path d="M263.84000000000003,101.0 H379.65720000000005 Q383.65720000000005,101.0 383.65720000000005,105.0 V119.0 Q383.65720000000005,123.0 379.65720000000005,123.0 H263.84000000000003 Z"/></g>
+<text x="251.84000000000003" y="116.5" font-size="13" fill="#52514e" text-anchor="end">-ub 512, dequant + cuBLAS</text>
+<rect x="386.7" y="101.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="391.7" y="116.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">266</text>
+<g fill="#2a78d6"><path d="M263.84000000000003,141.0 H483.40851555555554 Q487.40851555555554,141.0 487.40851555555554,145.0 V159.0 Q487.40851555555554,163.0 483.40851555555554,163.0 H263.84000000000003 Z"/></g>
+<text x="251.84000000000003" y="156.5" font-size="13" fill="#52514e" text-anchor="end">-ub 512, batched MoE kernel</text>
+<rect x="490.4" y="141.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="495.4" y="156.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">495</text>
+<g fill="#86b6ef"><path d="M263.84000000000003,181.0 H456.51169777777784 Q460.51169777777784,181.0 460.51169777777784,185.0 V199.0 Q460.51169777777784,203.0 456.51169777777784,203.0 H263.84000000000003 Z"/></g>
+<text x="251.84000000000003" y="196.5" font-size="13" fill="#52514e" text-anchor="end">-ub 2048, dequant + cuBLAS</text>
+<rect x="463.5" y="181.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="468.5" y="196.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">436</text>
+<g fill="#2a78d6"><path d="M263.84000000000003,221.0 H606.2493511111111 Q610.2493511111111,221.0 610.2493511111111,225.0 V239.0 Q610.2493511111111,243.0 606.2493511111111,243.0 H263.84000000000003 Z"/></g>
+<text x="251.84000000000003" y="236.5" font-size="13" fill="#52514e" text-anchor="end">-ub 2048, batched MoE kernel</text>
+<rect x="613.2" y="221.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="618.2" y="236.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">768</text>
+<g fill="#86b6ef"><path d="M263.84000000000003,261.0 H487.7408888888889 Q491.7408888888889,261.0 491.7408888888889,265.0 V279.0 Q491.7408888888889,283.0 487.7408888888889,283.0 H263.84000000000003 Z"/></g>
+<text x="251.84000000000003" y="276.5" font-size="13" fill="#52514e" text-anchor="end">-ub 4096, dequant + cuBLAS</text>
+<rect x="494.7" y="261.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="499.7" y="276.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">505</text>
+<g fill="#2a78d6"><path d="M263.84000000000003,301.0 H625.4742577777778 Q629.4742577777778,301.0 629.4742577777778,305.0 V319.0 Q629.4742577777778,323.0 625.4742577777778,323.0 H263.84000000000003 Z"/></g>
+<text x="251.84000000000003" y="316.5" font-size="13" fill="#52514e" text-anchor="end">-ub 4096, batched MoE kernel</text>
+<rect x="632.5" y="301.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="637.5" y="316.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">810</text>
+</svg>

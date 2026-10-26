@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Start llama-server with the given environment, run fixed greedy prompts (96 tokens, top-5 logprobs), stop it.
+# Start llama-server with the given environment, run fixed greedy prompts (three short, one of ~1500 tokens;
+# 96 generated tokens, top-5 logprobs), stop it.
 #   MODEL=... scripts/run_prompts.sh <tag> [VAR=value ...]   -> out/prompts-<tag>.json
 # Compare two runs with: python3 scripts/compare_outputs.py out/prompts-a.json out/prompts-b.json
 #
@@ -24,13 +25,15 @@ for _ in $(seq 1 120); do
     kill -0 $pid 2>/dev/null || { echo "server exited, see out/server-$tag.log"; exit 1; }
 done
 
-python3 - "$tag" "$PORT" <<'PY'
+python3 - "$tag" "$PORT" "$(dirname "$0")/../docs/FORMAT.md" <<'PY'
 import json, sys, urllib.request
-tag, port = sys.argv[1], sys.argv[2]
+tag, port, doc = sys.argv[1], sys.argv[2], open(sys.argv[3]).read()
 prompts = [
     "<|im_start|>user\nWrite a Python function that checks whether a number is prime, then explain its complexity in two sentences.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     "<|im_start|>user\nПоясни коротко, чому небо блакитне.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     "<|im_start|>user\nA train leaves at 14:35 and arrives at 18:10. How long is the trip in minutes? Answer with reasoning.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    # ~1500 tokens: exercises the batched (prefill) kernels with full micro-batches
+    "<|im_start|>user\nSummarize this document in three sentences.\n\n" + doc + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
 ]
 out = []
 for p in prompts:

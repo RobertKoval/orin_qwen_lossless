@@ -1,0 +1,148 @@
+// Correctness and speed of a BF16N MUL_MAT_ID (MoE expert matrices) on real weights, through the ggml CUDA backend.
+// The reference is computed on the CPU from the exact BF16 weights, accumulated in double; for more than 8 tokens the
+// activations are rounded to BF16 first, as both batched (prefill) paths feed BF16 tensor cores, while the GEMV path
+// (up to 8 tokens) multiplies the F32 activations.
+//
+//   moe_prefill <model.gguf> <tensor> <tokens> [reps=10] [skew=0] [check_cols=64]
+//
+// tensor: e.g. blk.20.ffn_gate_exps.weight (K x N x E). Each token picks 8 distinct experts; skew > 0 draws them with
+// probability ~ (rank + 1)^-skew over a random expert order (0: uniform). GGML_BF16N_NO_MMA=1 selects the old path.
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
+#include "gguf.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <random>
+#include <unistd.h>
+#include <vector>
+
+static float bf16_to_f32(uint16_t h) { uint32_t u = (uint32_t) h << 16; float f; memcpy(&f, &u, 4); return f; }
+static float round_bf16(float f) { // round to nearest even, as __float2bfloat16
+    uint32_t u; memcpy(&u, &f, 4);
+    u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000u;
+    memcpy(&f, &u, 4); return f;
+}
+
+int main(int argc, char ** argv) {
+    if (argc < 4) { fprintf(stderr, "usage: %s model.gguf tensor tokens [reps] [skew] [check_cols]\n", argv[0]); return 1; }
+    const char * path = argv[1]; const char * name = argv[2];
+    const int T = atoi(argv[3]);
+    const int reps = argc > 4 ? atoi(argv[4]) : 10;
+    const double skew = argc > 5 ? atof(argv[5]) : 0.0;
+    const int check_cols = argc > 6 ? atoi(argv[6]) : 64;
+    const int n_used = 8;
+
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = { /*no_alloc*/ true, &meta };
+    gguf_context * g = gguf_init_from_file(path, gp);
+    if (!g) { fprintf(stderr, "cannot read %s\n", path); return 1; }
+    const int64_t tid = gguf_find_tensor(g, name);
+    if (tid < 0) { fprintf(stderr, "no tensor %s\n", name); return 1; }
+    const ggml_tensor * tm = ggml_get_tensor(meta, name);
+    if (tm->type != GGML_TYPE_BF16 || ggml_n_dims(tm) != 3) { fprintf(stderr, "%s: need a 3-D BF16 tensor\n", name); return 1; }
+    const int64_t K = tm->ne[0], N = tm->ne[1], E = tm->ne[2];
+    std::vector<uint16_t> w(K * N * E);
+    {
+        const int fd = open(path, O_RDONLY);
+        const size_t off = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, tid);
+        size_t done = 0, total = w.size() * 2;
+        while (done < total) {
+            const ssize_t r = pread(fd, (char *) w.data() + done, total - done, off + done);
+            if (r <= 0) { perror("pread"); return 1; }
+            done += r;
+        }
+        close(fd);
+    }
+    const bool down = strstr(name, "down") != nullptr; // down: one input row per (token, slot)
+    const int64_t ne11 = down ? n_used : 1;
+    printf("%s: K=%lld N=%lld E=%lld, tokens %d, skew %.2f\n", name, (long long) K, (long long) N, (long long) E, T, skew);
+
+    ggml_backend_t be = ggml_backend_cuda_init(0);
+    ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, /*no_alloc*/ true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * W = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16N, K, N, E);
+    ggml_tensor * X = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, ne11, T);
+    ggml_tensor * I = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, T);
+    ggml_tensor * Y = ggml_mul_mat_id(ctx, W, X, I);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    auto convert = (bool (*)(ggml_tensor *, const void *, int)) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(be)), "ggml_backend_cuda_bf16n_convert");
+    if (!convert || !convert(W, w.data(), 2 /* GGML_BF16N_HUFFMAN: pair code when it fits */)) { fprintf(stderr, "convert failed\n"); return 1; }
+
+    std::mt19937_64 rng(1234);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x(K * ne11 * T);
+    for (auto & v : x) { v = nd(rng); }
+    std::vector<int> order(E);
+    for (int i = 0; i < E; i++) { order[i] = i; }
+    std::shuffle(order.begin(), order.end(), rng);
+    std::vector<double> cdf(E);
+    double acc = 0;
+    for (int i = 0; i < E; i++) { acc += std::pow(i + 1.0, -skew); cdf[i] = acc; }
+    std::uniform_real_distribution<double> ud(0, acc);
+    std::vector<int32_t> ids(n_used * T);
+    std::vector<int> tok_per_e(E, 0);
+    for (int t = 0; t < T; t++) {
+        for (int s = 0; s < n_used; s++) {
+            int e;
+            do { e = order[std::lower_bound(cdf.begin(), cdf.end(), ud(rng)) - cdf.begin()]; }
+            while (std::find(&ids[t * n_used], &ids[t * n_used] + s, e) != &ids[t * n_used] + s);
+            ids[t * n_used + s] = e; tok_per_e[e]++;
+        }
+    }
+    printf("tokens per expert: max %d, mean %.1f, experts used %lld\n", *std::max_element(tok_per_e.begin(), tok_per_e.end()),
+           (double) T * n_used / E, (long long) std::count_if(tok_per_e.begin(), tok_per_e.end(), [](int c) { return c > 0; }));
+    ggml_backend_tensor_set(X, x.data(), 0, ggml_nbytes(X));
+    ggml_backend_tensor_set(I, ids.data(), 0, ggml_nbytes(I));
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, Y);
+    // warm-up for 2 s: the GPU clock governor (nvhost_podgov) ramps up only under sustained load
+    for (const auto tw = std::chrono::steady_clock::now(); std::chrono::steady_clock::now() - tw < std::chrono::seconds(2);) {
+        ggml_backend_graph_compute(be, gf);
+        ggml_backend_synchronize(be);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int r = 0; r < reps; r++) { ggml_backend_graph_compute(be, gf); }
+    ggml_backend_synchronize(be);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+    const double flop = 2.0 * N * K * n_used * T;
+    printf("time %.3f ms  (%.2f TFLOPS, %.1f G weights/s over the %lld used experts)\n", ms, flop / ms * 1e-9,
+           (double) N * K * std::count_if(tok_per_e.begin(), tok_per_e.end(), [](int c) { return c > 0; }) / ms * 1e-6,
+           (long long) std::count_if(tok_per_e.begin(), tok_per_e.end(), [](int c) { return c > 0; }));
+
+    std::vector<float> y(N * n_used * T);
+    ggml_backend_tensor_get(Y, y.data(), 0, ggml_nbytes(Y));
+    double max_rel = 0, max_abs = 0; int bad = 0;
+    std::uniform_int_distribution<int> cd(0, n_used * T - 1);
+    for (int c = 0; c < check_cols; c++) {
+        const int col = c == 0 ? 0 : cd(rng), t = col / n_used, s = col % n_used, e = ids[col];
+        const float * xc = &x[((int64_t) t * ne11 + (down ? s : 0)) * K];
+        for (int64_t n = 0; n < N; n++) {
+            const uint16_t * wr = &w[((int64_t) e * N + n) * K];
+            double ref = 0, mag = 0;
+            for (int64_t k = 0; k < K; k++) {
+                const double p = (double) bf16_to_f32(wr[k]) * (T > 8 ? round_bf16(xc[k]) : xc[k]);
+                ref += p; mag += std::fabs(p);
+            }
+            const double d = std::fabs(y[(int64_t) col * N + n] - ref);
+            max_abs = std::max(max_abs, d);
+            max_rel = std::max(max_rel, d / (mag + 1e-30));
+            bad += !(d <= 1e-5 * mag + 1e-6) || std::isnan(y[(int64_t) col * N + n]);
+        }
+    }
+    printf("check %d columns x %lld rows: max |err| %.3g, max |err| / sum|w x| %.3g, %d outside 1e-5 -> %s\n", check_cols,
+           (long long) N, max_abs, max_rel, bad, bad ? "FAIL" : "OK");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(be);
+    gguf_free(g);
+    return bad ? 2 : 0;
+}
