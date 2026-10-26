@@ -34,7 +34,7 @@ Platform findings (bandwidth, EMC, gpu-unlock, accelerators): [docs/ORIN_NOTES.m
 ## Quick start (on the Orin)
 
 ```bash
-git clone https://github.com/<you>/orin_qwen_lossless && cd orin_qwen_lossless
+git clone https://github.com/RobertKoval/orin_qwen_lossless && cd orin_qwen_lossless
 scripts/build_llama.sh                 # clones llama.cpp b29c606, applies the patch, builds for SM87
 
 # BF16 GGUF of Qwen/Qwen3.6-35B-A3B (llama.cpp convert_hf_to_gguf.py --outtype bf16)
