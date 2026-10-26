@@ -1,0 +1,1949 @@
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -430,7 +430,8 @@
+         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
+         GGML_TYPE_Q1_0    = 41,
+         GGML_TYPE_Q2_0    = 42,
+-        GGML_TYPE_COUNT   = 43,
++        GGML_TYPE_BF16N   = 43, // lossless BF16: sign|mantissa byte + 4-bit exponent code, per-row LUT/escapes in device-side aux (runtime-only, never in GGUF)
++        GGML_TYPE_COUNT   = 44,
+     };
+ 
+     // [TAG_GGML_PREC]
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -883,6 +883,14 @@
+         .type_size                = sizeof(block_q8_K),
+         .is_quantized             = true,
+     },
++    [GGML_TYPE_BF16N] = {
++        .type_name                = "bf16n",
++        .blck_size                = 512,
++        .type_size                = 512,
++        .is_quantized             = true,
++        .to_float                 = NULL,
++        .from_float_ref           = NULL,
++    },
+     [GGML_TYPE_BF16] = {
+         .type_name                = "bf16",
+         .blck_size                = 1,
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3,6 +3,7 @@
+ #include "ggml-backend-impl.h"
+ 
+ #include "ggml-cuda/allreduce.cuh"
++#include "ggml-cuda/bf16n.cuh"
+ #include "ggml-cuda/common.cuh"
+ #include "ggml-cuda/acc.cuh"
+ #include "ggml-cuda/add-id.cuh"
+@@ -90,6 +91,8 @@
+ #include <cstdlib>
+ #include <string>
+ #include <vector>
++#include <unordered_set>
++#include <unordered_map>
+ 
+ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+ 
+@@ -1796,6 +1799,10 @@
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+ 
++    if (src0->type == GGML_TYPE_BF16N) {
++        return false;
++    }
++
+     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                    src0->view_src;
+@@ -1828,6 +1835,25 @@
+         return;
+     }
+ 
++    if (src0->type == GGML_TYPE_BF16N) {
++        if (!ggml_cuda_bf16n_reference() && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne11 <= 8 && ne12 == 1 && ne13 == 1) {
++            ggml_cuda_bf16n_mul_mat_vec(ctx, src0, src1, nullptr, dst);
++            return;
++        }
++        // batched: exact BF16 reconstruction, then the regular BF16 cuBLAS path
++        ggml_cuda_pool_alloc<nv_bfloat16> w(ctx.pool(), ggml_nelements(src0));
++        ggml_cuda_bf16n_dequant_bf16(ctx, src0, w.get());
++        ggml_tensor w_bf16 = *src0;
++        w_bf16.type  = GGML_TYPE_BF16;
++        w_bf16.nb[0] = sizeof(nv_bfloat16);
++        w_bf16.nb[1] = w_bf16.nb[0]*w_bf16.ne[0];
++        w_bf16.nb[2] = w_bf16.nb[1]*w_bf16.ne[1];
++        w_bf16.nb[3] = w_bf16.nb[2]*w_bf16.ne[2];
++        w_bf16.data  = w.get();
++        ggml_cuda_mul_mat_cublas(ctx, &w_bf16, src1, dst);
++        return;
++    }
++
+     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
+     // Therefore, in such cases use cuBLAS.
+@@ -1882,6 +1908,10 @@
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
++    if (src0->type == GGML_TYPE_BF16N) {
++        return ggml_cuda_bf16n_reference() || dst->ne[2] > 8;
++    }
++
+     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+         return true;
+     }
+@@ -1919,10 +1949,15 @@
+ 
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
++    if (src0->type == GGML_TYPE_BF16N && ne2 <= 8 && !ggml_cuda_bf16n_reference()) {
++        ggml_cuda_bf16n_mul_mat_vec(ctx, src0, src1, ids, dst);
++        return;
++    }
++
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
++        if (ne2 <= MMVQ_MAX_BATCH_SIZE && src0->type != GGML_TYPE_BF16N) {
+             if (ggml_is_quantized(src0->type)) {
+                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                 if (ne2 <= mmvq_mmid_max) {
+@@ -2079,7 +2114,11 @@
+             ggml_cuda_op_repeat_back(ctx, dst);
+             break;
+         case GGML_OP_GET_ROWS:
+-            ggml_cuda_op_get_rows(ctx, dst);
++            if (dst->src[0]->type == GGML_TYPE_BF16N) {
++                ggml_cuda_bf16n_get_rows(ctx, dst);
++            } else {
++                ggml_cuda_op_get_rows(ctx, dst);
++            }
+             break;
+         case GGML_OP_GET_ROWS_BACK:
+             ggml_cuda_op_get_rows_back(ctx, dst);
+@@ -3950,6 +3989,14 @@
+             const ggml_tensor * src1 = up->src[1];
+             const ggml_tensor * ids  = up->src[2];
+ 
++            if (src0->type == GGML_TYPE_BF16N && !ggml_cuda_bf16n_reference() && gate->src[1] == src1 && gate->src[2] == ids &&
++                    ggml_cuda_bf16n_can_fuse_glu(gate->src[0], src0, src1, ids, glu)) {
++                ggml_cuda_bf16n_mul_mat_vec_glu(*cuda_ctx, gate->src[0], src0, src1, ids, glu);
++                fused_mul_mat_vec = true;
++                fused_node_count  = 3;
++                break;
++            }
++
+             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate->src[0];
+@@ -4280,6 +4327,44 @@
+                 stream_ctx.concurrent_events.clear();
+             }
+ 
++            // GET_ROWS gathers of recurrent states read in place by their GDN (see ggml_cuda_gdn_state_rows)
++            std::unordered_set<const ggml_tensor *> skip_state_rows;
++            {
++                std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> chains; // (gdn, get_rows)
++                std::unordered_map<const ggml_tensor *, int> uses;
++                for (int i = 0; i < cgraph->n_nodes; i++) {
++                    if (const ggml_tensor * rows = ggml_cuda_gdn_state_rows(cgraph->nodes[i])) {
++                        chains.emplace_back(cgraph->nodes[i], rows);
++                        for (const ggml_tensor * t = cgraph->nodes[i]->src[5]; t != rows; t = t->src[0]) {
++                            uses[t] = 0;
++                        }
++                        uses[rows] = 0;
++                    }
++                }
++                if (!chains.empty()) {
++                    for (int i = 0; i < cgraph->n_nodes; i++) {
++                        for (int j = 0; j < GGML_MAX_SRC; j++) {
++                            auto it = uses.find(cgraph->nodes[i]->src[j]);
++                            if (it != uses.end()) {
++                                it->second++;
++                            }
++                        }
++                    }
++                    for (const auto & [gdn, rows] : chains) {
++                        bool only_gdn = (rows->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
++                        for (const ggml_tensor * t = gdn->src[5]; only_gdn; t = t->src[0]) {
++                            only_gdn = uses[t] == 1 && (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
++                            if (t == rows) {
++                                break;
++                            }
++                        }
++                        if (only_gdn) {
++                            skip_state_rows.insert(rows);
++                        }
++                    }
++                }
++            }
++
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+                 if (is_concurrent_event_active) {
+@@ -4314,7 +4399,7 @@
+ 
+                 prev_i = i;
+ 
+-                if (ggml_cuda_is_view_or_noop(node)) {
++                if (ggml_cuda_is_view_or_noop(node) || skip_state_rows.count(node)) {
+                     continue;
+                 }
+ 
+@@ -5173,6 +5258,8 @@
+                     case GGML_TYPE_IQ4_XS:
+                     case GGML_TYPE_BF16:
+                         return true;
++                    case GGML_TYPE_BF16N:
++                        return b->type == GGML_TYPE_F32;
+                     default:
+                         return false;
+                 }
+@@ -5212,6 +5299,8 @@
+                         // 32-value sub-blocks, the row size does not guarantee
+                         // the QK_K super-blocks the get_rows kernel iterates on
+                         return op->src[0]->ne[0] % QK_K == 0;
++                    case GGML_TYPE_BF16N:
++                        return op->type == GGML_TYPE_F32 && op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 1;
+                     default:
+                         return false;
+                 }
+@@ -5695,6 +5784,9 @@
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++    if (strcmp(name, "ggml_backend_cuda_bf16n_convert") == 0) {
++        return (void *)ggml_backend_cuda_bf16n_convert;
++    }
+     return nullptr;
+ }
+ 
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -9,6 +9,8 @@
+                                      const float * g,
+                                      const float * beta,
+                                      const float * curr_state,
++                                     const int32_t * state_ids,
++                                     int64_t       state_row_stride,
+                                      float *       dst,
+                                      float *       state,
+                                      int64_t       H,
+@@ -41,7 +43,8 @@
+ 
+     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
+     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
+-    const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
++    // state_ids: the state rows are read straight from the cache (fused GET_ROWS), else from the gathered copy
++    const int64_t state_in_offset      = (state_ids ? (int64_t) state_ids[sequence] * state_row_stride : (int64_t) sequence * H * S_v * S_v) + h_idx * S_v * S_v;
+     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+     state += state_out_offset;
+     curr_state += state_in_offset + col * S_v;
+@@ -170,6 +173,7 @@
+ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d, const float * s_d,
++        const int32_t * ids_d, int64_t state_row_stride,
+         float * dst_d, float * state_d,
+         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+         int64_t sq1,   int64_t sq2, int64_t sq3,
+@@ -190,26 +194,26 @@
+     switch (S_v) {
+         case 16:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         case 32:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         case 64: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         }
+         case 128: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+@@ -258,6 +262,14 @@
+     const float * s_d   = (const float *) src_state->data;
+     float *       dst_d = (float *) dst->data;
+ 
++    const int32_t * ids_d            = nullptr;
++    int64_t         state_row_stride = 0;
++    if (const ggml_tensor * rows = ggml_cuda_gdn_state_rows(dst)) {
++        s_d              = (const float *) rows->src[0]->data;
++        ids_d            = (const int32_t *) rows->src[1]->data;
++        state_row_stride = rows->src[0]->nb[1] / sizeof(float);
++    }
++
+     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
+     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
+     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
+@@ -296,27 +308,52 @@
+ 
+     if (kda) {
+         if (keep_rs) {
+-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+     } else {
+         if (keep_rs) {
+-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, ids_d, state_row_stride, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+     }
+ }
+ 
++// GDN whose state input is reshape(GET_ROWS(states, ids)) for a single sequence: return the GET_ROWS node so the
++// kernel can read the rows in place. Single sequence only: the state row may be the one the kernel writes back,
++// which is safe because every thread reads its slice before writing it.
++const ggml_tensor * ggml_cuda_gdn_state_rows(const ggml_tensor * gdn) {
++    static const bool off = getenv("GGML_CUDA_NO_GDN_ROWS") != nullptr;
++    if (off || gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[2]->ne[3] != 1) {
++        return nullptr;
++    }
++    const ggml_tensor * st = gdn->src[5];
++    const ggml_tensor * t  = st;
++    while (t != nullptr && (t->op == GGML_OP_RESHAPE || (t->op == GGML_OP_VIEW && t->view_offs == 0))) {
++        t = t->src[0];
++    }
++    if (t == nullptr || t->op != GGML_OP_GET_ROWS || t->type != GGML_TYPE_F32) {
++        return nullptr;
++    }
++    const ggml_tensor * src = t->src[0];
++    const ggml_tensor * ids = t->src[1];
++    if (src->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || src->nb[0] != sizeof(float) ||
++        t->ne[1] != 1 || ggml_nelements(t) != ggml_nelements(st) || src->ne[0] != t->ne[0] || !ggml_is_contiguous(t)) {
++        return nullptr;
++    }
++    return t;
++}
++
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
+ }
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -9,6 +9,9 @@
+ 
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// GET_ROWS node feeding this GDN's state that the kernel can read in place (nullptr if not applicable)
++const ggml_tensor * ggml_cuda_gdn_state_rows(const ggml_tensor * gdn);
++
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                               ggml_cuda_gated_delta_net_fused_cache cache);
+--- a/ggml/src/ggml-cuda/bf16n.cu
++++ b/ggml/src/ggml-cuda/bf16n.cu
+@@ -0,0 +1,1420 @@
++// GGML_TYPE_BF16N: lossless BF16 weights resident in compressed form.
++//
++// The ggml tensor holds the sign|mantissa byte plane (1 B/weight, 512-weight chunks, lane-major:
++// lane l owns positions 128*j + 4*l + t, stored at bytes 16*l + 4*j + t of the chunk).
++// The exponent lives in a device-side aux buffer registered per tensor, in one of two formats:
++//   NIBBLE : 4-bit code per weight into a per-row 16-entry exponent LUT (entry 0 = exponent 0);
++//            weights whose exponent is not in the LUT decode to +0 and are added back from an escape list.
++//   HUFFMAN: per-tensor length-limited canonical Huffman code; each warp owns R consecutive rows and
++//            each lane decodes its own bitstream (lane offsets per unit). No escapes.
++// Every BF16 bit pattern is reconstructed exactly; products are FP32 FMAs of the exact weights.
++
++#include "bf16n.cuh"
++#include "unary.cuh"
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstring>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace {
++
++constexpr uint32_t BF16N_MAGIC = 0x4e363142; // "B16N"
++constexpr int HUF_LMAX  = 10;
++constexpr int HUF_GROUP = 32 / HUF_LMAX;
++constexpr int HP_LP     = 12;   // exponent-pair code length limit: two pair codes fit the guaranteed 32-bit window
++constexpr int HP_PF     = 4;    // per-lane stream prefetch depth (words)
++constexpr int HP_NT     = 1024; // one block per SM: one LUT copy, the rest of L1 for the lane streams
++
++struct aux_header {
++    uint32_t magic, format, K, R;
++    uint64_t rows;
++    uint64_t off_a, off_b, off_c, off_d; // format specific array offsets (bytes from aux start)
++    uint64_t n_a, n_b;                   // escapes (nibble) / units, stream words (huffman)
++};
++
++struct entry {
++    const uint8_t * base = nullptr;
++    size_t          nbytes = 0;
++    int             format = 0;
++    int64_t         K = 0, rows = 0;
++    int             R = 0;
++    void *          aux = nullptr;
++    size_t          aux_bytes = 0;
++    // nibble
++    const uint8_t  * nib     = nullptr;
++    const uint4    * lut_row = nullptr;
++    const uint32_t * esc_off = nullptr;
++    const uint32_t * esc     = nullptr;
++    // huffman
++    const uint32_t * hlut     = nullptr;
++    const uint32_t * lane_off = nullptr;
++    const uint32_t * stream   = nullptr;
++    // huffman pairs
++    const uint16_t * lane_rel = nullptr; // with lane_off = per-unit base
++};
++
++std::mutex         g_mutex;
++std::vector<entry> g_entries; // sorted by base
++
++const entry * lookup(const void * p, int64_t & row0) {
++    const uint8_t * q = (const uint8_t *) p;
++    auto it = std::upper_bound(g_entries.begin(), g_entries.end(), q, [](const uint8_t * a, const entry & e) { return a < e.base; });
++    if (it == g_entries.begin()) {
++        return nullptr;
++    }
++    --it;
++    if (q >= it->base + it->nbytes) {
++        return nullptr;
++    }
++    const size_t off = q - it->base;
++    GGML_ASSERT(off % it->K == 0);
++    row0 = off / it->K;
++    return &*it;
++}
++
++inline int pos_of(int l, int s) { return 128 * (s >> 2) + 4 * l + (s & 3); }
++
++template <typename F>
++void parallel_for(int64_t n, F && f) {
++    const int nt = std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
++    std::atomic<int64_t> next{0};
++    std::vector<std::thread> th;
++    for (int t = 0; t < nt; t++) {
++        th.emplace_back([&]() {
++            for (;;) {
++                const int64_t i = next.fetch_add(1);
++                if (i >= n) {
++                    break;
++                }
++                f(i);
++            }
++        });
++    }
++    for (auto & t : th) {
++        t.join();
++    }
++}
++
++// ---------------------------------------------------------------- host encoders
++
++void encode_sm_plane(const uint16_t * w, int64_t rows, int64_t K, uint8_t * sm) {
++    const int64_t C = K / 512;
++    parallel_for(rows, [&](int64_t r) {
++        for (int64_t c = 0; c < C; c++) {
++            const uint16_t * src = w + r * K + c * 512;
++            uint8_t * dst = sm + r * K + c * 512;
++            for (int l = 0; l < 32; l++) {
++                for (int s = 0; s < 16; s++) {
++                    const uint16_t v = src[pos_of(l, s)];
++                    dst[16 * l + s] = (uint8_t) (((v >> 15) << 7) | (v & 0x7F));
++                }
++            }
++        }
++    });
++}
++
++std::vector<uint8_t> encode_nibble(const uint16_t * w, int64_t rows, int64_t K) {
++    const int64_t C = K / 512;
++    std::vector<uint8_t> nib(rows * K / 2);
++    std::vector<uint8_t> lut(rows * 16, 0);
++    constexpr int64_t BLK = 256;
++    const int64_t nblk = (rows + BLK - 1) / BLK;
++    std::vector<std::vector<uint32_t>> esc_blk(nblk);
++    std::vector<uint32_t> cnt(rows);
++    parallel_for(nblk, [&](int64_t b) {
++        for (int64_t r = b * BLK; r < std::min(rows, (b + 1) * BLK); r++) {
++            const uint16_t * row = w + r * K;
++            int hist[256] = {0};
++            for (int64_t k = 0; k < K; k++) {
++                hist[(row[k] >> 7) & 0xFF]++;
++            }
++            int idx[256];
++            for (int i = 0; i < 256; i++) {
++                idx[i] = i;
++            }
++            std::sort(idx, idx + 256, [&](int a, int c) { return hist[a] > hist[c] || (hist[a] == hist[c] && a < c); });
++            int code_of[256];
++            for (int i = 0; i < 256; i++) {
++                code_of[i] = -1;
++            }
++            code_of[0] = 0;
++            uint8_t * L = &lut[r * 16];
++            int n = 1;
++            for (int i = 0; i < 256 && n < 16; i++) {
++                const int x = idx[i];
++                if (hist[x] == 0) {
++                    break;
++                }
++                if (x == 0 || x >= 128) {
++                    continue; // msb-set exponents cannot go through the prmt LUT
++                }
++                L[n] = (uint8_t) x;
++                code_of[x] = n++;
++            }
++            uint32_t ne = 0;
++            for (int64_t c = 0; c < C; c++) {
++                uint8_t * nb = &nib[(r * C + c) * 256];
++                for (int l = 0; l < 32; l++) {
++                    uint32_t nw[2] = {0, 0};
++                    for (int s = 0; s < 16; s++) {
++                        const int col = (int) (c * 512 + pos_of(l, s));
++                        const uint16_t v = row[col];
++                        const int ex = (v >> 7) & 0xFF;
++                        int code = code_of[ex];
++                        if (code < 0) {
++                            const uint32_t smb = ((v >> 15) << 7) | (v & 0x7F);
++                            esc_blk[b].push_back((uint32_t) col | (smb << 12) | ((uint32_t) ex << 20));
++                            ne++;
++                            code = 0;
++                        }
++                        nw[s >> 3] |= (uint32_t) code << (4 * (s & 7));
++                    }
++                    memcpy(nb + 8 * l, nw, 8);
++                }
++            }
++            cnt[r] = ne;
++        }
++    });
++    // escape slots must also read as +0 in the sign|mantissa plane: done by the caller (zero_escapes)
++    std::vector<uint32_t> esc_off(rows + 1, 0);
++    for (int64_t r = 0; r < rows; r++) {
++        esc_off[r + 1] = esc_off[r] + cnt[r];
++    }
++    const uint64_t n_esc = esc_off[rows];
++    aux_header h = {};
++    h.magic = BF16N_MAGIC; h.format = GGML_BF16N_NIBBLE; h.K = (uint32_t) K; h.rows = rows;
++    h.off_a = 256;                                      // nibble plane
++    h.off_b = h.off_a + nib.size();                     // per-row LUT
++    h.off_c = h.off_b + lut.size();                     // esc_off
++    h.off_d = h.off_c + esc_off.size() * 4;             // escapes
++    h.n_a = n_esc;
++    std::vector<uint8_t> aux(h.off_d + std::max<uint64_t>(n_esc, 1) * 4, 0);
++    memcpy(aux.data(), &h, sizeof(h));
++    memcpy(aux.data() + h.off_a, nib.data(), nib.size());
++    memcpy(aux.data() + h.off_b, lut.data(), lut.size());
++    memcpy(aux.data() + h.off_c, esc_off.data(), esc_off.size() * 4);
++    uint8_t * e = aux.data() + h.off_d;
++    for (auto & v : esc_blk) {
++        memcpy(e, v.data(), v.size() * 4);
++        e += v.size() * 4;
++    }
++    return aux;
++}
++
++std::vector<int> limited_lengths(const std::vector<uint64_t> & freq, int L) {
++    std::vector<int> syms;
++    for (int i = 0; i < (int) freq.size(); i++) {
++        if (freq[i]) {
++            syms.push_back(i);
++        }
++    }
++    std::vector<int> len(freq.size(), 0);
++    if (syms.size() == 1) {
++        len[syms[0]] = 1;
++        return len;
++    }
++    struct item { uint64_t w; std::vector<int> s; };
++    std::vector<item> leaves;
++    for (int s : syms) {
++        leaves.push_back({freq[s], {s}});
++    }
++    std::sort(leaves.begin(), leaves.end(), [](const item & a, const item & b) { return a.w < b.w; });
++    std::vector<item> cur = leaves;
++    for (int d = 1; d < L; d++) {
++        std::vector<item> pk;
++        for (size_t i = 0; i + 1 < cur.size(); i += 2) {
++            item m{cur[i].w + cur[i + 1].w, cur[i].s};
++            m.s.insert(m.s.end(), cur[i + 1].s.begin(), cur[i + 1].s.end());
++            pk.push_back(std::move(m));
++        }
++        std::vector<item> mg;
++        std::merge(pk.begin(), pk.end(), leaves.begin(), leaves.end(), std::back_inserter(mg), [](const item & a, const item & b) { return a.w < b.w; });
++        cur = std::move(mg);
++    }
++    for (size_t i = 0; i < 2 * syms.size() - 2; i++) {
++        for (int s : cur[i].s) {
++            len[s]++;
++        }
++    }
++    return len;
++}
++
++std::vector<uint8_t> encode_huffman(const uint16_t * w, int64_t rows, int64_t K, int R) {
++    const int64_t C = K / 512;
++    const int64_t units = rows / R;
++    std::vector<uint64_t> freq(256, 0);
++    {
++        std::mutex m;
++        constexpr int64_t BLK = 1024;
++        parallel_for((rows + BLK - 1) / BLK, [&](int64_t b) {
++            uint64_t h[256] = {0};
++            for (int64_t i = b * BLK * K; i < std::min(rows, (b + 1) * BLK) * K; i++) {
++                h[(w[i] >> 7) & 0xFF]++;
++            }
++            std::lock_guard<std::mutex> lk(m);
++            for (int i = 0; i < 256; i++) {
++                freq[i] += h[i];
++            }
++        });
++    }
++    const std::vector<int> len = limited_lengths(freq, HUF_LMAX);
++    std::vector<uint32_t> code(256, 0);
++    {
++        uint32_t c = 0;
++        for (int l = 1; l <= HUF_LMAX; l++) {
++            for (int s = 0; s < 256; s++) {
++                if (len[s] == l) {
++                    code[s] = c++;
++                }
++            }
++            c <<= 1;
++        }
++    }
++    std::vector<uint32_t> lut(1 << HUF_LMAX, 0);
++    for (int s = 0; s < 256; s++) {
++        if (len[s]) {
++            const uint32_t lo = code[s] << (HUF_LMAX - len[s]), hi = (code[s] + 1) << (HUF_LMAX - len[s]);
++            for (uint32_t i = lo; i < hi; i++) {
++                lut[i] = (uint32_t) len[s] | ((uint32_t) s << 7);
++            }
++        }
++    }
++    std::vector<std::vector<uint32_t>> ustream(units);
++    std::vector<uint32_t> lane_rel(units * 32);
++    parallel_for(units, [&](int64_t u) {
++        auto & out = ustream[u];
++        for (int l = 0; l < 32; l++) {
++            lane_rel[u * 32 + l] = (uint32_t) out.size();
++            uint64_t acc = 0;
++            int nb = 0;
++            for (int64_t r = u * R; r < (u + 1) * R; r++) {
++                for (int64_t c = 0; c < C; c++) {
++                    for (int s = 0; s < 16; s++) {
++                        const int e = (w[r * K + c * 512 + pos_of(l, s)] >> 7) & 0xFF;
++                        acc = (acc << len[e]) | code[e];
++                        nb += len[e];
++                        if (nb >= 32) {
++                            out.push_back((uint32_t) (acc >> (nb - 32)));
++                            nb -= 32;
++                            acc &= nb ? ((1ull << nb) - 1) : 0;
++                        }
++                    }
++                }
++            }
++            if (nb) {
++                out.push_back((uint32_t) (acc << (32 - nb)));
++            }
++        }
++    });
++    std::vector<uint32_t> lane_off(units * 32);
++    uint64_t n_words = 0;
++    for (int64_t u = 0; u < units; u++) {
++        for (int l = 0; l < 32; l++) {
++            lane_off[u * 32 + l] = (uint32_t) (n_words + lane_rel[u * 32 + l]);
++        }
++        n_words += ustream[u].size();
++    }
++    GGML_ASSERT(n_words + 16 < (1ull << 32));
++    aux_header h = {};
++    h.magic = BF16N_MAGIC; h.format = GGML_BF16N_HUFFMAN; h.K = (uint32_t) K; h.R = (uint32_t) R; h.rows = rows;
++    h.off_a = 256;                                   // LUT
++    h.off_b = h.off_a + lut.size() * 4;              // lane offsets
++    h.off_c = h.off_b + lane_off.size() * 4;         // stream
++    h.n_a = units; h.n_b = n_words;
++    std::vector<uint8_t> aux(h.off_c + (n_words + 16) * 4, 0); // +16 words: decoder lookahead
++    memcpy(aux.data(), &h, sizeof(h));
++    memcpy(aux.data() + h.off_a, lut.data(), lut.size() * 4);
++    memcpy(aux.data() + h.off_b, lane_off.data(), lane_off.size() * 4);
++    uint8_t * p = aux.data() + h.off_c;
++    for (auto & v : ustream) {
++        memcpy(p, v.data(), v.size() * 4);
++        p += v.size() * 4;
++    }
++    return aux;
++}
++
++// Huffman over exponent PAIRS (positions t,t+1 of a lane slot group): adjacent exponents are strongly
++// correlated (pair entropy ~2.05 vs ~2.53 bit/weight). Returns empty if the tensor has > 2^HP_LP distinct pairs.
++std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K, int R) {
++    const int64_t C = K / 512;
++    const int64_t units = rows / R;
++    auto ex = [&](int64_t i) { return (w[i] >> 7) & 0xFF; };
++    std::vector<uint64_t> freq(65536, 0);
++    {
++        std::mutex m;
++        constexpr int64_t BLK = 1024;
++        parallel_for((rows + BLK - 1) / BLK, [&](int64_t b) {
++            std::vector<uint64_t> h(65536, 0);
++            for (int64_t i = b * BLK * K; i < std::min(rows, (b + 1) * BLK) * K; i += 2) {
++                h[ex(i) | ex(i + 1) << 8]++;
++            }
++            std::lock_guard<std::mutex> lk(m);
++            for (int i = 0; i < 65536; i++) {
++                freq[i] += h[i];
++            }
++        });
++    }
++    int nsym = 0;
++    for (auto f : freq) {
++        nsym += f != 0;
++    }
++    if (nsym > (1 << HP_LP)) {
++        return {};
++    }
++    const std::vector<int> len = limited_lengths(freq, HP_LP);
++    std::vector<uint32_t> code(65536, 0);
++    {
++        uint32_t c = 0;
++        for (int l = 1; l <= HP_LP; l++) {
++            for (int s = 0; s < 65536; s++) {
++                if (len[s] == l) {
++                    code[s] = c++;
++                }
++            }
++            c <<= 1;
++        }
++    }
++    std::vector<uint32_t> lut(1 << HP_LP, 0);
++    for (int s = 0; s < 65536; s++) {
++        if (len[s]) {
++            const uint32_t lo = code[s] << (HP_LP - len[s]), hi = (code[s] + 1) << (HP_LP - len[s]);
++            for (uint32_t i = lo; i < hi; i++) {
++                lut[i] = ((uint32_t) (s >> 8) << 23) | ((uint32_t) (s & 0xFF) << 7) | (uint32_t) len[s];
++            }
++        }
++    }
++    std::vector<std::vector<uint32_t>> ustream(units);
++    std::vector<uint32_t> rel32(units * 32);
++    parallel_for(units, [&](int64_t u) {
++        auto & out = ustream[u];
++        for (int l = 0; l < 32; l++) {
++            rel32[u * 32 + l] = (uint32_t) out.size();
++            uint64_t acc = 0;
++            int nb = 0;
++            for (int64_t r = u * R; r < (u + 1) * R; r++) {
++                for (int64_t c = 0; c < C; c++) {
++                    for (int s = 0; s < 16; s += 2) {
++                        const int64_t i = r * K + c * 512 + pos_of(l, s);
++                        const int sym = ex(i) | ex(i + 1) << 8;
++                        acc = (acc << len[sym]) | code[sym];
++                        nb += len[sym];
++                        if (nb >= 32) {
++                            out.push_back((uint32_t) (acc >> (nb - 32)));
++                            nb -= 32;
++                            acc &= nb ? ((1ull << nb) - 1) : 0;
++                        }
++                    }
++                }
++            }
++            if (nb) {
++                out.push_back((uint32_t) (acc << (32 - nb)));
++            }
++        }
++    });
++    std::vector<uint32_t> unit_base(units);
++    std::vector<uint16_t> lane_rel(units * 32);
++    uint64_t n_words = 0;
++    for (int64_t u = 0; u < units; u++) {
++        unit_base[u] = (uint32_t) n_words;
++        for (int l = 0; l < 32; l++) {
++            GGML_ASSERT(rel32[u * 32 + l] <= 0xFFFF);
++            lane_rel[u * 32 + l] = (uint16_t) rel32[u * 32 + l];
++        }
++        n_words += ustream[u].size();
++    }
++    GGML_ASSERT(n_words + 16 < (1ull << 32));
++    aux_header h = {};
++    h.magic = BF16N_MAGIC; h.format = GGML_BF16N_HUFPAIR; h.K = (uint32_t) K; h.R = (uint32_t) R; h.rows = rows;
++    h.off_a = 256;                                    // LUT
++    h.off_b = h.off_a + lut.size() * 4;               // unit base (u32)
++    h.off_c = h.off_b + unit_base.size() * 4;         // lane offsets relative to unit base (u16)
++    h.off_d = (h.off_c + lane_rel.size() * 2 + 15) & ~15ull; // stream
++    h.n_a = units; h.n_b = n_words;
++    std::vector<uint8_t> aux(h.off_d + (n_words + 16) * 4, 0); // +16 words: prefetch lookahead
++    memcpy(aux.data(), &h, sizeof(h));
++    memcpy(aux.data() + h.off_a, lut.data(), lut.size() * 4);
++    memcpy(aux.data() + h.off_b, unit_base.data(), unit_base.size() * 4);
++    memcpy(aux.data() + h.off_c, lane_rel.data(), lane_rel.size() * 2);
++    uint8_t * p = aux.data() + h.off_d;
++    for (auto & v : ustream) {
++        memcpy(p, v.data(), v.size() * 4);
++        p += v.size() * 4;
++    }
++    return aux;
++}
++
++// ---------------------------------------------------------------- device side
++
++__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
++    uint32_t d;
++    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(sel));
++    return d;
++}
++
++__device__ __forceinline__ uint32_t sel_bits(uint32_t a, uint32_t b) { // (a & 0x807F807F) | (b & ~0x807F807F)
++    uint32_t d;
++    asm("lop3.b32 %0, %1, %2, 0x807F807F, 0xE4;" : "=r"(d) : "r"(a), "r"(b));
++    return d;
++}
++
++// column = one output vector: (token) for MUL_MAT, (token, expert slot) for MUL_MAT_ID
++struct cols_t {
++    const char * x; char * dst;
++    int64_t x_tok, x_slot, dst_tok, dst_slot; // byte strides
++    const char * ids; int64_t ids_s0, ids_s1; int n_used, ne11;
++    int64_t rows_per_matrix, row0, nrows;
++};
++
++__device__ __forceinline__ void col_setup(const cols_t & p, int col, const float *& x, float *& dst, int64_t & rbase) {
++    if (p.ids) {
++        const int t = col / p.n_used, i = col % p.n_used;
++        const int e = *(const int32_t *) (p.ids + t * p.ids_s1 + i * p.ids_s0);
++        x = (const float *) (p.x + t * p.x_tok + (i % p.ne11) * p.x_slot);
++        dst = (float *) (p.dst + t * p.dst_tok + i * p.dst_slot);
++        rbase = p.row0 + (int64_t) e * p.rows_per_matrix;
++    } else {
++        x = (const float *) (p.x + col * p.x_tok);
++        dst = (float *) (p.dst + col * p.dst_tok);
++        rbase = p.row0;
++    }
++}
++
++__device__ __forceinline__ float warp_sum(float v) {
++#pragma unroll
++    for (int o = 16; o; o >>= 1) {
++        v += __shfl_xor_sync(0xffffffffu, v, o);
++    }
++    return v;
++}
++
++struct nib_ptrs { const uint8_t * sm; const uint8_t * nib; const uint4 * lut_row; const uint32_t * esc_off; const uint32_t * esc; };
++struct huf_ptrs { const uint8_t * sm; const uint32_t * lut; const uint32_t * lane_off; const uint32_t * stream; };
++
++// dot(row gr, x) for the nibble format; x read through L1 (no shared staging); result in every lane
++template <int C>
++__device__ __forceinline__ float nib_row_dot(const nib_ptrs & w, int64_t gr, const float * __restrict__ x, int lane) {
++    constexpr int K = C * 512;
++    const uint8_t * sp = w.sm + gr * K;
++    const uint8_t * np = w.nib + gr * (K / 2);
++    uint4 smv[C]; uint2 nbv[C];
++#pragma unroll
++    for (int c = 0; c < C; c++) {
++        smv[c] = __ldg((const uint4 *) (sp + c * 512) + lane);
++        nbv[c] = __ldg((const uint2 *) (np + c * 256) + lane);
++    }
++    const uint4 L = __ldg(w.lut_row + gr);
++    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
++#pragma unroll
++    for (int c = 0; c < C; c++) {
++        const uint32_t smw[4] = {smv[c].x, smv[c].y, smv[c].z, smv[c].w};
++        const uint32_t nw[2] = {nbv[c].x, nbv[c].y};
++#pragma unroll
++        for (int j = 0; j < 4; j++) {
++            const float4 xv = __ldg((const float4 *) (x + c * 512 + 128 * j + 4 * lane));
++            const uint32_t sel = (j & 1) ? (nw[j >> 1] >> 16) : nw[j >> 1];
++            const uint32_t E4 = prmt(L.x, L.y, sel) | prmt(L.z, L.w, sel ^ 0x8888u);
++            const uint32_t w0 = (prmt(smw[j], 0, 0x9180u) & 0x807F807Fu) | (prmt(E4, 0, 0x4140u) << 7);
++            const uint32_t w1 = (prmt(smw[j], 0, 0xB3A2u) & 0x807F807Fu) | (prmt(E4, 0, 0x4342u) << 7);
++            a0 = fmaf(__uint_as_float(w0 << 16), xv.x, a0);
++            a1 = fmaf(__uint_as_float(w0 & 0xFFFF0000u), xv.y, a1);
++            a2 = fmaf(__uint_as_float(w1 << 16), xv.z, a2);
++            a3 = fmaf(__uint_as_float(w1 & 0xFFFF0000u), xv.w, a3);
++        }
++    }
++    float acc = (a0 + a1) + (a2 + a3);
++    const uint32_t e_beg = w.esc_off[gr], e_end = w.esc_off[gr + 1];
++    for (uint32_t i = e_beg + lane; i < e_end; i += 32) {
++        const uint32_t rec = w.esc[i];
++        const uint32_t smb = (rec >> 12) & 0xFF, ex = rec >> 20;
++        const uint32_t bits = ((smb & 0x80) << 8) | (ex << 7) | (smb & 0x7F);
++        acc = fmaf(__uint_as_float(bits << 16), __ldg(x + (rec & 0xFFF)), acc);
++    }
++    return warp_sum(acc);
++}
++
++struct huf_state {
++    const uint32_t * sp;
++    uint32_t hi, lo, nw0, nw1, acc, acc_chk;
++    int nbits;
++};
++
++__device__ __forceinline__ void huf_init(huf_state & st, const huf_ptrs & w, int64_t gu, int lane) {
++    st.sp = w.stream + w.lane_off[gu * 32 + lane];
++    st.hi = __ldg(st.sp); st.lo = __ldg(st.sp + 1);
++    st.nw0 = __ldg(st.sp + 2); st.nw1 = __ldg(st.sp + 3);
++    st.sp += 4;
++    st.nbits = 64; st.acc = 0; st.acc_chk = 0;
++}
++
++// decode the next row of the warp's unit and return dot(row, x); x and lut in shared memory
++template <int C>
++__device__ __forceinline__ float huf_row_dot(huf_state & st, const uint8_t * __restrict__ sm, const uint32_t * lut,
++        int64_t gr, const float * xs, int lane) {
++    constexpr int K = C * 512;
++    const uint8_t * rp = sm + gr * K;
++    uint4 smv[C];
++#pragma unroll
++    for (int c = 0; c < C; c++) {
++        smv[c] = __ldg((const uint4 *) (rp + c * 512) + lane);
++    }
++    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
++#pragma unroll
++    for (int c = 0; c < C; c++) {
++        const uint32_t smw[4] = {smv[c].x, smv[c].y, smv[c].z, smv[c].w};
++        uint32_t ex[16];
++#pragma unroll
++        for (int s = 0; s < 16; s++) {
++            if (s % HUF_GROUP == 0) {
++                st.nbits -= (int) ((st.acc - st.acc_chk) & 127u);
++                st.acc_chk = st.acc;
++                if (st.nbits <= 32) {
++                    const uint32_t sh = 32 - st.nbits;
++                    st.hi |= __funnelshift_lc(st.nw0, 0u, sh);
++                    st.lo |= __funnelshift_lc(0u, st.nw0, sh);
++                    st.nbits += 32;
++                    st.nw0 = st.nw1;
++                    st.nw1 = __ldg(st.sp);
++                    st.sp++;
++                }
++            }
++            const uint32_t ent = lut[__umulhi(st.hi, 1u << HUF_LMAX)];
++            st.hi = __funnelshift_l(st.lo, st.hi, ent);
++            st.lo = __funnelshift_l(0u, st.lo, ent);
++            st.acc += ent;
++            ex[s] = ent;
++        }
++#pragma unroll
++        for (int j = 0; j < 4; j++) {
++            const float4 xv = *(const float4 *) (xs + c * 512 + 128 * j + 4 * lane);
++            const uint32_t w0 = sel_bits(prmt(smw[j], 0, 0x9180u), prmt(ex[4 * j], ex[4 * j + 1], 0x5410u));
++            const uint32_t w1 = sel_bits(prmt(smw[j], 0, 0xB3A2u), prmt(ex[4 * j + 2], ex[4 * j + 3], 0x5410u));
++            a0 = fmaf(__uint_as_float(w0 << 16), xv.x, a0);
++            a1 = fmaf(__uint_as_float(w0 & 0xFFFF0000u), xv.y, a1);
++            a2 = fmaf(__uint_as_float(w1 << 16), xv.z, a2);
++            a3 = fmaf(__uint_as_float(w1 & 0xFFFF0000u), xv.w, a3);
++        }
++    }
++    return warp_sum((a0 + a1) + (a2 + a3));
++}
++
++template <int C>
++__global__ void __launch_bounds__(256) k_nibble_mmv(const nib_ptrs w, cols_t p) {
++    const float * xg; float * out; int64_t rbase;
++    col_setup(p, blockIdx.y, xg, out, rbase);
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    for (int64_t r = blockIdx.x * 8 + warp; r < p.nrows; r += gridDim.x * 8) {
++        const float v = nib_row_dot<C>(w, rbase + r, xg, lane);
++        if (lane == 0) {
++            out[r] = v;
++        }
++    }
++}
++
++// out = up(x) * silu(gate(x)), bitwise the same as MUL_MAT, MUL_MAT, GLU(SWIGLU)
++template <int C>
++__global__ void __launch_bounds__(256) k_nibble_mmv_glu(const nib_ptrs g, const nib_ptrs u, cols_t p) {
++    const float * xg; float * out; int64_t rbase;
++    col_setup(p, blockIdx.y, xg, out, rbase);
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    for (int64_t r = blockIdx.x * 8 + warp; r < p.nrows; r += gridDim.x * 8) {
++        const float gv = nib_row_dot<C>(g, rbase + r, xg, lane);
++        const float uv = nib_row_dot<C>(u, rbase + r, xg, lane);
++        if (lane == 0) {
++            out[r] = uv * ggml_cuda_op_silu_single(gv);
++        }
++    }
++}
++
++template <int C>
++__device__ __forceinline__ void stage(float * xs, uint32_t * lut, const float * xg, const uint32_t * lut_g) {
++    for (int i = threadIdx.x; i < C * 512; i += blockDim.x) {
++        xs[i] = xg[i];
++    }
++    for (int i = threadIdx.x; i < (1 << HUF_LMAX); i += blockDim.x) {
++        lut[i] = lut_g[i];
++    }
++}
++
++template <int C>
++__global__ void __launch_bounds__(256) k_huffman_mmv(const huf_ptrs w, int R, cols_t p) {
++    constexpr int K = C * 512;
++    extern __shared__ float shm[];
++    float * xs = shm;
++    uint32_t * lut = (uint32_t *) (shm + K);
++    const float * xg; float * out; int64_t rbase;
++    col_setup(p, blockIdx.y, xg, out, rbase);
++    stage<C>(xs, lut, xg, w.lut);
++    __syncthreads();
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int64_t units = p.nrows / R;
++    for (int64_t u = blockIdx.x * 8 + warp; u < units; u += gridDim.x * 8) {
++        const int64_t gu = rbase / R + u;
++        huf_state st;
++        huf_init(st, w, gu, lane);
++        for (int rr = 0; rr < R; rr++) {
++            const float v = huf_row_dot<C>(st, w.sm, lut, gu * R + rr, xs, lane);
++            if (lane == 0) {
++                out[u * R + rr] = v;
++            }
++        }
++    }
++}
++
++template <int C, int R>
++__global__ void __launch_bounds__(256) k_huffman_mmv_glu(const huf_ptrs g, const huf_ptrs w_up, cols_t p) {
++    constexpr int K = C * 512;
++    extern __shared__ float shm[];
++    float * xs = shm;
++    uint32_t * lut_g = (uint32_t *) (shm + K);
++    uint32_t * lut_u = lut_g + (1 << HUF_LMAX);
++    const float * xg; float * out; int64_t rbase;
++    col_setup(p, blockIdx.y, xg, out, rbase);
++    stage<C>(xs, lut_g, xg, g.lut);
++    for (int i = threadIdx.x; i < (1 << HUF_LMAX); i += blockDim.x) {
++        lut_u[i] = w_up.lut[i];
++    }
++    __syncthreads();
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int64_t units = p.nrows / R;
++    for (int64_t u = blockIdx.x * 8 + warp; u < units; u += gridDim.x * 8) {
++        const int64_t gu = rbase / R + u;
++        float gv[R];
++        {
++            huf_state st;
++            huf_init(st, g, gu, lane);
++#pragma unroll
++            for (int rr = 0; rr < R; rr++) {
++                gv[rr] = huf_row_dot<C>(st, g.sm, lut_g, gu * R + rr, xs, lane);
++            }
++        }
++        huf_state st;
++        huf_init(st, w_up, gu, lane);
++#pragma unroll
++        for (int rr = 0; rr < R; rr++) {
++            const float uv = huf_row_dot<C>(st, w_up.sm, lut_u, gu * R + rr, xs, lane);
++            if (lane == 0) {
++                out[u * R + rr] = uv * ggml_cuda_op_silu_single(gv[rr]);
++            }
++        }
++    }
++}
++
++// exact reconstruction to BF16 (row-major, contiguous) for the batched cuBLAS path
++template <int C>
++__global__ void __launch_bounds__(256) k_nibble_dequant(const uint8_t * __restrict__ sm, const uint8_t * __restrict__ nib,
++        const uint4 * __restrict__ lut_row, const uint32_t * __restrict__ esc_off, const uint32_t * __restrict__ esc,
++        int64_t row0, int64_t nrows, uint16_t * __restrict__ out) {
++    constexpr int K = C * 512;
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    for (int64_t r = blockIdx.x * 8 + warp; r < nrows; r += gridDim.x * 8) {
++        const int64_t gr = row0 + r;
++        const uint4 L = __ldg(lut_row + gr);
++        uint16_t * o = out + r * K;
++        for (int c = 0; c < C; c++) {
++            const uint4 smv = __ldg((const uint4 *) (sm + gr * K + c * 512) + lane);
++            const uint2 nbv = __ldg((const uint2 *) (nib + gr * (K / 2) + c * 256) + lane);
++            const uint32_t smw[4] = {smv.x, smv.y, smv.z, smv.w};
++            const uint32_t nw[2] = {nbv.x, nbv.y};
++#pragma unroll
++            for (int j = 0; j < 4; j++) {
++                const uint32_t sel = (j & 1) ? (nw[j >> 1] >> 16) : nw[j >> 1];
++                const uint32_t E4 = prmt(L.x, L.y, sel) | prmt(L.z, L.w, sel ^ 0x8888u);
++                const uint32_t w0 = (prmt(smw[j], 0, 0x9180u) & 0x807F807Fu) | (prmt(E4, 0, 0x4140u) << 7);
++                const uint32_t w1 = (prmt(smw[j], 0, 0xB3A2u) & 0x807F807Fu) | (prmt(E4, 0, 0x4342u) << 7);
++                *(uint2 *) (o + c * 512 + 128 * j + 4 * lane) = make_uint2(w0, w1);
++            }
++        }
++        __syncwarp();
++        for (uint32_t i = esc_off[gr] + lane; i < esc_off[gr + 1]; i += 32) {
++            const uint32_t rec = esc[i];
++            const uint32_t smb = (rec >> 12) & 0xFF, ex = rec >> 20;
++            o[rec & 0xFFF] = (uint16_t) (((smb & 0x80) << 8) | (ex << 7) | (smb & 0x7F));
++        }
++    }
++}
++
++template <int C>
++__global__ void __launch_bounds__(256) k_huffman_dequant(const uint8_t * __restrict__ sm, const uint32_t * __restrict__ lut_g,
++        const uint32_t * __restrict__ lane_off, const uint32_t * __restrict__ stream, int R, int64_t row0, int64_t nrows,
++        uint16_t * __restrict__ out) {
++    constexpr int K = C * 512;
++    __shared__ uint32_t lut[1 << HUF_LMAX];
++    for (int i = threadIdx.x; i < (1 << HUF_LMAX); i += blockDim.x) {
++        lut[i] = lut_g[i];
++    }
++    __syncthreads();
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    for (int64_t u = blockIdx.x * 8 + warp; u < nrows / R; u += gridDim.x * 8) {
++        const int64_t gu = row0 / R + u;
++        const uint32_t * sp = stream + lane_off[gu * 32 + lane];
++        uint32_t hi = sp[0], lo = sp[1], nw0 = sp[2], nw1 = sp[3];
++        sp += 4;
++        int nbits = 64;
++        uint32_t acc = 0, acc_chk = 0;
++        for (int rr = 0; rr < R; rr++) {
++            const int64_t gr = gu * R + rr;
++            uint16_t * o = out + (gr - row0) * K;
++            for (int c = 0; c < C; c++) {
++                const uint4 smv = __ldg((const uint4 *) (sm + gr * K + c * 512) + lane);
++                const uint32_t smw[4] = {smv.x, smv.y, smv.z, smv.w};
++                uint32_t ex[16];
++#pragma unroll
++                for (int s = 0; s < 16; s++) {
++                    if (s % HUF_GROUP == 0) {
++                        nbits -= (int) ((acc - acc_chk) & 127u);
++                        acc_chk = acc;
++                        if (nbits <= 32) {
++                            const uint32_t sh = 32 - nbits;
++                            hi |= __funnelshift_lc(nw0, 0u, sh);
++                            lo |= __funnelshift_lc(0u, nw0, sh);
++                            nbits += 32; nw0 = nw1; nw1 = *sp++;
++                        }
++                    }
++                    const uint32_t ent = lut[__umulhi(hi, 1u << HUF_LMAX)];
++                    hi = __funnelshift_l(lo, hi, ent);
++                    lo = __funnelshift_l(0u, lo, ent);
++                    acc += ent;
++                    ex[s] = ent;
++                }
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    const uint32_t w0 = sel_bits(prmt(smw[j], 0, 0x9180u), prmt(ex[4 * j], ex[4 * j + 1], 0x5410u));
++                    const uint32_t w1 = sel_bits(prmt(smw[j], 0, 0xB3A2u), prmt(ex[4 * j + 2], ex[4 * j + 3], 0x5410u));
++                    *(uint2 *) (o + c * 512 + 128 * j + 4 * lane) = make_uint2(w0, w1);
++                }
++            }
++        }
++    }
++}
++
++int sm_count() {
++    static int n = 0;
++    if (!n) {
++        int dev;
++        CUDA_CHECK(cudaGetDevice(&dev));
++        CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
++    }
++    return n;
++}
++
++
++struct hp_ptrs { const uint8_t * sm; const uint32_t * lut; const uint32_t * ubase; const uint16_t * lrel; const uint32_t * stream; };
++
++__device__ __forceinline__ uint4 ld_plane(const uint4 * p) { // streamed once: keep it out of L1 (the lane streams live there)
++    uint4 v;
++    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
++    return v;
++}
++
++__device__ __forceinline__ uint64_t shl64w(uint64_t b, uint32_t n) { // {hi:lo} <<= (n & 31)
++    uint64_t d;
++    asm("{.reg .b32 l, h; mov.b64 {l, h}, %1; shf.l.wrap.b32 h, l, h, %2; shf.l.wrap.b32 l, 0, l, %2; mov.b64 %0, {l, h};}" : "=l"(d) : "l"(b), "r"(n));
++    return d;
++}
++
++// per-warp decoder state for one unit (bit buffer MSB-first; v = valid bits, exact in its low 7 bits)
++#define HP_UNIT_BEGIN(W, GU)                                                                         \
++    const uint32_t * lst = (W).stream;                                                               \
++    uint32_t idx = __ldg((W).ubase + (GU)) + __ldg((W).lrel + (GU) * 32 + lane);                      \
++    uint64_t buf = (uint64_t) __ldg(lst + idx) << 32;                                                \
++    uint32_t wq[HP_PF];                                                                              \
++    _Pragma("unroll") for (int i_ = 0; i_ < HP_PF; i_++) { wq[i_] = __ldg(lst + idx + 1 + i_); }    \
++    idx += 1 + HP_PF;                                                                                \
++    uint32_t v = 32, pa = 0, pb = 0;
++
++// decode one row (C chunks) and leave dot(row, x) summed over the warp in ACC
++#define HP_ROW(SM, GR, ACC)                                                                          \
++    {                                                                                                \
++        const uint8_t * rp_ = (SM) + (GR) * K;                                                       \
++        uint4 smv_[C];                                                                               \
++        _Pragma("unroll") for (int c_ = 0; c_ < C; c_++) { smv_[c_] = ld_plane((const uint4 *) (rp_ + c_ * 512) + lane); } \
++        float a0_ = 0.f, a1_ = 0.f, a2_ = 0.f, a3_ = 0.f;                                            \
++        _Pragma("unroll") for (int c_ = 0; c_ < C; c_++) {                                           \
++            const uint32_t smw_[4] = {smv_[c_].x, smv_[c_].y, smv_[c_].z, smv_[c_].w};               \
++            uint32_t ex_[8];                                                                         \
++            _Pragma("unroll") for (int q_ = 0; q_ < 8; q_++) {                                       \
++                if (q_ % 2 == 0) {                                                                   \
++                    v = v - pa - pb;                                                                 \
++                    const uint32_t m_ = __funnelshift_r(0u, 1u, v);                                  \
++                    if (!(v & 32u)) {                                                                \
++                        buf += (uint64_t) wq[0] * m_;                                                \
++                        _Pragma("unroll") for (int i_ = 0; i_ + 1 < HP_PF; i_++) { wq[i_] = wq[i_ + 1]; } \
++                        wq[HP_PF - 1] = __ldg(lst + idx);                                            \
++                        idx++;                                                                       \
++                    }                                                                                \
++                    v |= 32u;                                                                        \
++                }                                                                                    \
++                const uint32_t ent_ = lut[(uint32_t) (buf >> 32) >> (32 - HP_LP)];                   \
++                buf = shl64w(buf, ent_);                                                             \
++                ex_[q_] = ent_;                                                                      \
++                if (q_ % 2 == 0) { pa = ent_; } else { pb = ent_; }                                  \
++            }                                                                                        \
++            _Pragma("unroll") for (int j_ = 0; j_ < 4; j_++) {                                       \
++                const float4 xv_ = XREG_C1 ? xr[j_] : *(const float4 *) (xs + c_ * 512 + 128 * j_ + 4 * lane); \
++                const uint32_t w0_ = sel_bits(prmt(smw_[j_], 0, 0x9180u), ex_[2 * j_]);              \
++                const uint32_t w1_ = sel_bits(prmt(smw_[j_], 0, 0xB3A2u), ex_[2 * j_ + 1]);          \
++                a0_ = fmaf(__uint_as_float(w0_ << 16), xv_.x, a0_);                                  \
++                a1_ = fmaf(__uint_as_float(w0_ & 0xFFFF0000u), xv_.y, a1_);                          \
++                a2_ = fmaf(__uint_as_float(w1_ << 16), xv_.z, a2_);                                  \
++                a3_ = fmaf(__uint_as_float(w1_ & 0xFFFF0000u), xv_.w, a3_);                          \
++            }                                                                                        \
++        }                                                                                            \
++        ACC = warp_sum((a0_ + a1_) + (a2_ + a3_));                                                   \
++    }
++
++#define HP_STAGE(XG, LUT_SRC, LUT_DST)                                                               \
++    for (int i_ = threadIdx.x; i_ < K; i_ += blockDim.x) { xs[i_] = (XG)[i_]; }                     \
++    for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { (LUT_DST)[i_] = (LUT_SRC)[i_]; }
++
++#define HP_XREG                                                                                      \
++    constexpr bool XREG_C1 = C == 1; /* K=512: this lane's 16 activations stay in registers */      \
++    float4 xr[4];                                                                                    \
++    if (XREG_C1) { _Pragma("unroll") for (int j_ = 0; j_ < 4; j_++) { xr[j_] = *(const float4 *) (xs + 128 * j_ + 4 * lane); } }
++
++template <int C>
++__global__ void __launch_bounds__(HP_NT) k_hp_mmv(const hp_ptrs w, int R, cols_t p) {
++    constexpr int K = C * 512;
++    extern __shared__ float shm[];
++    float * xs = shm;
++    uint32_t * lut = (uint32_t *) (shm + K);
++    const float * xg; float * out; int64_t rbase;
++    col_setup(p, blockIdx.y, xg, out, rbase);
++    HP_STAGE(xg, w.lut, lut)
++    __syncthreads();
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    HP_XREG
++    const int64_t units = p.nrows / R;
++    const int wpb = blockDim.x >> 5;
++    for (int64_t u = blockIdx.x * wpb + warp; u < units; u += gridDim.x * wpb) {
++        const int64_t gu = rbase / R + u;
++        HP_UNIT_BEGIN(w, gu)
++        for (int rr = 0; rr < R; rr++) {
++            float acc;
++            HP_ROW(w.sm, gu * R + rr, acc)
++            if (lane == 0) {
++                out[u * R + rr] = acc;
++            }
++        }
++    }
++}
++
++template <int C, int R>
++__global__ void __launch_bounds__(HP_NT) k_hp_mmv_glu(const hp_ptrs g, const hp_ptrs wu, cols_t p) {
++    constexpr int K = C * 512;
++    extern __shared__ float shm[];
++    float * xs = shm;
++    uint32_t * lut_g = (uint32_t *) (shm + K);
++    uint32_t * lut_u = lut_g + (1 << HP_LP);
++    const float * xg; float * out; int64_t rbase;
++    col_setup(p, blockIdx.y, xg, out, rbase);
++    HP_STAGE(xg, g.lut, lut_g)
++    for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut_u[i_] = wu.lut[i_]; }
++    __syncthreads();
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    HP_XREG
++    const int64_t units = p.nrows / R;
++    const int wpb = blockDim.x >> 5;
++    for (int64_t u = blockIdx.x * wpb + warp; u < units; u += gridDim.x * wpb) {
++        const int64_t gu = rbase / R + u;
++        float gv[R];
++        {
++            const uint32_t * lut = lut_g;
++            HP_UNIT_BEGIN(g, gu)
++            _Pragma("unroll") for (int rr = 0; rr < R; rr++) {
++                HP_ROW(g.sm, gu * R + rr, gv[rr])
++            }
++        }
++        {
++            const uint32_t * lut = lut_u;
++            HP_UNIT_BEGIN(wu, gu)
++            _Pragma("unroll") for (int rr = 0; rr < R; rr++) {
++                float uv;
++                HP_ROW(wu.sm, gu * R + rr, uv)
++                if (lane == 0) {
++                    out[u * R + rr] = uv * ggml_cuda_op_silu_single(gv[rr]);
++                }
++            }
++        }
++    }
++}
++
++template <int C>
++__global__ void __launch_bounds__(256) k_hp_dequant(const hp_ptrs w, int R, int64_t row0, int64_t nrows, uint16_t * __restrict__ out) {
++    constexpr int K = C * 512;
++    __shared__ uint32_t lut[1 << HP_LP];
++    for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut[i_] = w.lut[i_]; }
++    __syncthreads();
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    for (int64_t u = blockIdx.x * 8 + warp; u < nrows / R; u += gridDim.x * 8) {
++        const int64_t gu = row0 / R + u;
++        HP_UNIT_BEGIN(w, gu)
++        for (int rr = 0; rr < R; rr++) {
++            const int64_t gr = gu * R + rr;
++            uint16_t * o = out + (gr - row0) * K;
++            for (int c = 0; c < C; c++) {
++                const uint4 smv = ld_plane((const uint4 *) (w.sm + gr * K + c * 512) + lane);
++                const uint32_t smw[4] = {smv.x, smv.y, smv.z, smv.w};
++                uint32_t ex[8];
++#pragma unroll
++                for (int q = 0; q < 8; q++) {
++                    if (q % 2 == 0) {
++                        v = v - pa - pb;
++                        const uint32_t m = __funnelshift_r(0u, 1u, v);
++                        if (!(v & 32u)) {
++                            buf += (uint64_t) wq[0] * m;
++#pragma unroll
++                            for (int i = 0; i + 1 < HP_PF; i++) { wq[i] = wq[i + 1]; }
++                            wq[HP_PF - 1] = __ldg(lst + idx);
++                            idx++;
++                        }
++                        v |= 32u;
++                    }
++                    const uint32_t ent = lut[(uint32_t) (buf >> 32) >> (32 - HP_LP)];
++                    buf = shl64w(buf, ent);
++                    ex[q] = ent;
++                    if (q % 2 == 0) { pa = ent; } else { pb = ent; }
++                }
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    const uint32_t w0 = sel_bits(prmt(smw[j], 0, 0x9180u), ex[2 * j]);
++                    const uint32_t w1 = sel_bits(prmt(smw[j], 0, 0xB3A2u), ex[2 * j + 1]);
++                    *(uint2 *) (o + c * 512 + 128 * j + 4 * lane) = make_uint2(w0, w1);
++                }
++            }
++        }
++    }
++}
++
++
++// GET_ROWS (token embedding): dst[:, i] = float(W[ids[i], :]); one warp per requested row
++template <int C>
++__global__ void __launch_bounds__(256) k_nibble_get_rows(const nib_ptrs w, const char * __restrict__ ids, int64_t ids_s0,
++        int64_t n, int64_t row0, float * __restrict__ dst, int64_t dst_s1) {
++    constexpr int K = C * 512;
++    const int lane = threadIdx.x & 31;
++    const int64_t i = blockIdx.x * (int64_t) (blockDim.x >> 5) + (threadIdx.x >> 5);
++    if (i >= n) {
++        return;
++    }
++    const int64_t gr = row0 + *(const int32_t *) (ids + i * ids_s0);
++    float * o = (float *) ((char *) dst + i * dst_s1);
++    const uint4 L = __ldg(w.lut_row + gr);
++    for (int c = 0; c < C; c++) {
++        const uint4 smv = __ldg((const uint4 *) (w.sm + gr * K + c * 512) + lane);
++        const uint2 nbv = __ldg((const uint2 *) (w.nib + gr * (K / 2) + c * 256) + lane);
++        const uint32_t smw[4] = {smv.x, smv.y, smv.z, smv.w};
++        const uint32_t nw[2] = {nbv.x, nbv.y};
++#pragma unroll
++        for (int j = 0; j < 4; j++) {
++            const uint32_t sel = (j & 1) ? (nw[j >> 1] >> 16) : nw[j >> 1];
++            const uint32_t E4 = prmt(L.x, L.y, sel) | prmt(L.z, L.w, sel ^ 0x8888u);
++            const uint32_t w0 = (prmt(smw[j], 0, 0x9180u) & 0x807F807Fu) | (prmt(E4, 0, 0x4140u) << 7);
++            const uint32_t w1 = (prmt(smw[j], 0, 0xB3A2u) & 0x807F807Fu) | (prmt(E4, 0, 0x4342u) << 7);
++            *(float4 *) (o + c * 512 + 128 * j + 4 * lane) = make_float4(
++                __uint_as_float(w0 << 16), __uint_as_float(w0 & 0xFFFF0000u), __uint_as_float(w1 << 16), __uint_as_float(w1 & 0xFFFF0000u));
++        }
++    }
++    __syncwarp();
++    for (uint32_t e = w.esc_off[gr] + lane; e < w.esc_off[gr + 1]; e += 32) {
++        const uint32_t rec = w.esc[e];
++        const uint32_t smb = (rec >> 12) & 0xFF, ex = rec >> 20;
++        o[rec & 0xFFF] = __uint_as_float((((smb & 0x80) << 8) | (ex << 7) | (smb & 0x7F)) << 16);
++    }
++}
++
++// the warp decodes its row's unit from the start and writes only the requested row
++template <int C>
++__global__ void __launch_bounds__(256) k_hp_get_rows(const hp_ptrs w, int R, const char * __restrict__ ids, int64_t ids_s0,
++        int64_t n, int64_t row0, float * __restrict__ dst, int64_t dst_s1) {
++    constexpr int K = C * 512;
++    __shared__ uint32_t lut[1 << HP_LP];
++    for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut[i_] = w.lut[i_]; }
++    __syncthreads();
++    const int lane = threadIdx.x & 31;
++    const int64_t i = blockIdx.x * (int64_t) (blockDim.x >> 5) + (threadIdx.x >> 5);
++    if (i >= n) {
++        return;
++    }
++    const int64_t gr = row0 + *(const int32_t *) (ids + i * ids_s0);
++    const int64_t gu = gr / R;
++    float * o = (float *) ((char *) dst + i * dst_s1);
++    HP_UNIT_BEGIN(w, gu)
++    for (int64_t r = gu * R; r <= gr; r++) {
++        for (int c = 0; c < C; c++) {
++            const uint4 smv = ld_plane((const uint4 *) (w.sm + r * K + c * 512) + lane);
++            const uint32_t smw[4] = {smv.x, smv.y, smv.z, smv.w};
++            uint32_t ex[8];
++#pragma unroll
++            for (int q = 0; q < 8; q++) {
++                if (q % 2 == 0) {
++                    v = v - pa - pb;
++                    const uint32_t m = __funnelshift_r(0u, 1u, v);
++                    if (!(v & 32u)) {
++                        buf += (uint64_t) wq[0] * m;
++#pragma unroll
++                        for (int k = 0; k + 1 < HP_PF; k++) { wq[k] = wq[k + 1]; }
++                        wq[HP_PF - 1] = __ldg(lst + idx);
++                        idx++;
++                    }
++                    v |= 32u;
++                }
++                const uint32_t ent = lut[(uint32_t) (buf >> 32) >> (32 - HP_LP)];
++                buf = shl64w(buf, ent);
++                ex[q] = ent;
++                if (q % 2 == 0) { pa = ent; } else { pb = ent; }
++            }
++            if (r == gr) {
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    const uint32_t w0 = sel_bits(prmt(smw[j], 0, 0x9180u), ex[2 * j]);
++                    const uint32_t w1 = sel_bits(prmt(smw[j], 0, 0xB3A2u), ex[2 * j + 1]);
++                    *(float4 *) (o + c * 512 + 128 * j + 4 * lane) = make_float4(
++                        __uint_as_float(w0 << 16), __uint_as_float(w0 & 0xFFFF0000u), __uint_as_float(w1 << 16), __uint_as_float(w1 & 0xFFFF0000u));
++                }
++            }
++        }
++    }
++}
++
++nib_ptrs nibp(const entry & e) { return {e.base, e.nib, e.lut_row, e.esc_off, e.esc}; }
++huf_ptrs hufp(const entry & e) { return {e.base, e.hlut, e.lane_off, e.stream}; }
++hp_ptrs hpp(const entry & e) { return {e.base, e.hlut, e.lane_off, e.lane_rel, e.stream}; }
++
++// pair kernels: ~one 1024-thread block per SM when there is enough work; smaller blocks spread few units over all SMs
++void hp_launch_dims(const entry & e, int64_t nrows, int ncols, dim3 & grid, int & nt) {
++    const int64_t units = nrows / e.R;
++    const int64_t sms = sm_count();
++    const int64_t per_col = std::max<int64_t>(1, sms / std::max(1, ncols));
++    const int64_t warps_per_block = std::clamp<int64_t>((units + per_col - 1) / per_col, 2, HP_NT / 32);
++    nt = (int) warps_per_block * 32;
++    grid = dim3((unsigned) std::max<int64_t>(1, std::min<int64_t>((units + warps_per_block - 1) / warps_per_block, per_col)), ncols);
++}
++
++dim3 mmv_grid(const entry & e, int64_t nrows, int ncols) {
++    const int64_t work = e.format == GGML_BF16N_NIBBLE ? nrows : nrows / e.R; // rows or units, one warp each
++    const int64_t cap = std::max<int64_t>(1, (int64_t) sm_count() * 4 / std::min(ncols, 4));
++    return dim3((unsigned) std::max<int64_t>(1, std::min<int64_t>((work + 7) / 8, cap)), ncols);
++}
++
++void launch_mmv(const entry & e, const cols_t & p, int ncols, cudaStream_t stream) {
++    const int64_t K = e.K;
++    const dim3 grid = mmv_grid(e, p.nrows, ncols);
++    if (e.format == GGML_BF16N_HUFPAIR) {
++        dim3 g2; int nt;
++        hp_launch_dims(e, p.nrows, ncols, g2, nt);
++        const size_t shm = K * sizeof(float) + (4u << HP_LP);
++#define HP_CASE(CC) case CC: k_hp_mmv<CC><<<g2, nt, shm, stream>>>(hpp(e), e.R, p); break;
++        switch (K / 512) { HP_CASE(1) HP_CASE(2) HP_CASE(4) HP_CASE(8) default: GGML_ABORT("bf16n: unsupported K"); }
++#undef HP_CASE
++    } else if (e.format == GGML_BF16N_NIBBLE) {
++#define NIB_CASE(CC) case CC: k_nibble_mmv<CC><<<grid, 256, 0, stream>>>(nibp(e), p); break;
++        switch (K / 512) { NIB_CASE(1) NIB_CASE(2) NIB_CASE(4) NIB_CASE(8) default: GGML_ABORT("bf16n: unsupported K"); }
++#undef NIB_CASE
++    } else {
++        const size_t shm = K * sizeof(float) + (4u << HUF_LMAX);
++#define HUF_CASE(CC) case CC: k_huffman_mmv<CC><<<grid, 256, shm, stream>>>(hufp(e), e.R, p); break;
++        switch (K / 512) { HUF_CASE(1) HUF_CASE(2) HUF_CASE(4) HUF_CASE(8) default: GGML_ABORT("bf16n: unsupported K"); }
++#undef HUF_CASE
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void launch_mmv_glu(const entry & g, const entry & u, const cols_t & p, int ncols, cudaStream_t stream) {
++    const int64_t K = g.K;
++    const dim3 grid = mmv_grid(g, p.nrows, ncols);
++    if (g.format == GGML_BF16N_HUFPAIR) {
++        dim3 g2; int nt;
++        hp_launch_dims(g, p.nrows, ncols, g2, nt);
++        const size_t shm = K * sizeof(float) + (8u << HP_LP);
++#define HP_CASE(CC, RR) case CC * 100 + RR: k_hp_mmv_glu<CC, RR><<<g2, nt, shm, stream>>>(hpp(g), hpp(u), p); break;
++#define HP_CASES(RR) HP_CASE(1, RR) HP_CASE(2, RR) HP_CASE(4, RR) HP_CASE(8, RR)
++        switch ((K / 512) * 100 + g.R) {
++            HP_CASES(1) HP_CASES(2) HP_CASES(4) HP_CASES(8) HP_CASES(16)
++            default: GGML_ABORT("bf16n: unsupported K/R for glu");
++        }
++#undef HP_CASES
++#undef HP_CASE
++    } else if (g.format == GGML_BF16N_NIBBLE) {
++#define NIB_CASE(CC) case CC: k_nibble_mmv_glu<CC><<<grid, 256, 0, stream>>>(nibp(g), nibp(u), p); break;
++        switch (K / 512) { NIB_CASE(1) NIB_CASE(2) NIB_CASE(4) NIB_CASE(8) default: GGML_ABORT("bf16n: unsupported K"); }
++#undef NIB_CASE
++    } else {
++        const size_t shm = K * sizeof(float) + (8u << HUF_LMAX);
++#define HUF_CASE(CC, RR) case CC * 100 + RR: k_huffman_mmv_glu<CC, RR><<<grid, 256, shm, stream>>>(hufp(g), hufp(u), p); break;
++        switch ((K / 512) * 100 + g.R) {
++            HUF_CASE(1, 8) HUF_CASE(2, 8) HUF_CASE(4, 8) HUF_CASE(8, 8)
++            HUF_CASE(1, 16) HUF_CASE(2, 16) HUF_CASE(4, 16) HUF_CASE(8, 16)
++            default: GGML_ABORT("bf16n: unsupported K/R for glu");
++        }
++#undef HUF_CASE
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void launch_dequant(const entry & e, int64_t row0, int64_t nrows, uint16_t * out, cudaStream_t stream) {
++    const int64_t work = e.format == GGML_BF16N_NIBBLE ? nrows : nrows / e.R;
++    const int gx = (int) std::max<int64_t>(1, std::min<int64_t>((work + 7) / 8, (int64_t) sm_count() * 16));
++    if (e.format != GGML_BF16N_NIBBLE) {
++        GGML_ASSERT(nrows % e.R == 0 && row0 % e.R == 0);
++    }
++#define DQ(CC)                                                                                                         \
++    case CC:                                                                                                           \
++        if (e.format == GGML_BF16N_NIBBLE) {                                                                           \
++            k_nibble_dequant<CC><<<gx, 256, 0, stream>>>(e.base, e.nib, e.lut_row, e.esc_off, e.esc, row0, nrows, out); \
++        } else if (e.format == GGML_BF16N_HUFPAIR) {                                                                   \
++            k_hp_dequant<CC><<<gx, 256, 0, stream>>>(hpp(e), e.R, row0, nrows, out);                                    \
++        } else {                                                                                                       \
++            k_huffman_dequant<CC><<<gx, 256, 0, stream>>>(e.base, e.hlut, e.lane_off, e.stream, e.R, row0, nrows, out); \
++        }                                                                                                              \
++        break;
++    switch (e.K / 512) { DQ(1) DQ(2) DQ(4) DQ(8) default: GGML_ABORT("bf16n: unsupported K"); }
++#undef DQ
++    CUDA_CHECK(cudaGetLastError());
++}
++
++cols_t make_cols(const ggml_tensor * src0, int64_t row0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst, int & ncols) {
++    cols_t p = {};
++    p.x = (const char *) src1->data;
++    p.dst = (char *) dst->data;
++    p.rows_per_matrix = src0->ne[1];
++    p.row0 = row0;
++    p.nrows = src0->ne[1];
++    if (ids) {
++        // src1: [K, ne11, ne12 tokens], ids: [n_used, tokens], dst: [N, n_used, tokens]
++        p.ids = (const char *) ids->data;
++        p.ids_s0 = ids->nb[0]; p.ids_s1 = ids->nb[1];
++        p.n_used = (int) ids->ne[0];
++        p.ne11 = (int) src1->ne[1];
++        p.x_slot = src1->nb[1]; p.x_tok = src1->nb[2];
++        p.dst_slot = dst->nb[1]; p.dst_tok = dst->nb[2];
++        ncols = (int) (ids->ne[0] * ids->ne[1]);
++    } else {
++        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
++        p.x_tok = src1->nb[1];
++        p.dst_tok = dst->nb[1];
++        ncols = (int) src1->ne[1];
++    }
++    return p;
++}
++
++} // namespace
++
++bool ggml_cuda_bf16n_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++        const ggml_tensor * ids, ggml_tensor * dst) {
++    int64_t row0 = 0;
++    const entry * e = lookup(src0->data, row0);
++    GGML_ASSERT(e && "BF16N tensor without registered aux data");
++    GGML_ASSERT(src0->ne[0] == e->K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src1->nb[0] == sizeof(float));
++    int ncols;
++    const cols_t p = make_cols(src0, row0, src1, ids, dst, ncols);
++    if (e->format != GGML_BF16N_NIBBLE) {
++        GGML_ASSERT(p.nrows % e->R == 0 && row0 % e->R == 0);
++    }
++    launch_mmv(*e, p, ncols, ctx.stream());
++    return true;
++}
++
++bool ggml_cuda_bf16n_can_fuse_glu(const ggml_tensor * gate_w, const ggml_tensor * up_w, const ggml_tensor * src1,
++        const ggml_tensor * ids, const ggml_tensor * glu) {
++    if (gate_w->type != GGML_TYPE_BF16N || up_w->type != GGML_TYPE_BF16N || src1->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
++        return false;
++    }
++    static const bool no_glu = getenv("GGML_BF16N_NO_GLU") != nullptr;
++    if (no_glu) {
++        return false;
++    }
++    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
++        return false;
++    }
++    if (!ggml_are_same_shape(gate_w, up_w) || src1->nb[0] != sizeof(float)) {
++        return false;
++    }
++    const int64_t ncols = ids ? ids->ne[0] * ids->ne[1] : src1->ne[1];
++    if ((ids ? ids->ne[1] : src1->ne[1]) > 8 || ncols > 64) {
++        return false;
++    }
++    int64_t rg, ru;
++    const entry * g = lookup(gate_w->data, rg);
++    const entry * u = lookup(up_w->data, ru);
++    if (!g || !u || g->format != u->format || g->K != u->K || rg != 0 || ru != 0) {
++        return false;
++    }
++    if (g->format == GGML_BF16N_NIBBLE) {
++        return true;
++    }
++    if (g->R != u->R) {
++        return false;
++    }
++    // two pair LUTs (32 KiB of shared memory) take the L1 the per-lane streams live in: separate launches measured faster
++    static const bool hp_glu = getenv("GGML_BF16N_HP_GLU") != nullptr;
++    if (g->format == GGML_BF16N_HUFPAIR && !hp_glu) {
++        return false;
++    }
++    return g->format == GGML_BF16N_HUFPAIR ? (g->R & (g->R - 1)) == 0 && g->R <= 16 : (g->R == 8 || g->R == 16);
++}
++
++void ggml_cuda_bf16n_mul_mat_vec_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
++        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu) {
++    int64_t rg, ru;
++    const entry * g = lookup(gate_w->data, rg);
++    const entry * u = lookup(up_w->data, ru);
++    int ncols;
++    const cols_t p = make_cols(up_w, 0, src1, ids, glu, ncols);
++    launch_mmv_glu(*g, *u, p, ncols, ctx.stream());
++}
++
++void ggml_cuda_bf16n_dequant_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, void * out) {
++    int64_t row0 = 0;
++    const entry * e = lookup(src0->data, row0);
++    GGML_ASSERT(e && "BF16N tensor without registered aux data");
++    GGML_ASSERT(ggml_is_contiguous(src0));
++    launch_dequant(*e, row0, ggml_nrows(src0), (uint16_t *) out, ctx.stream());
++}
++
++
++void ggml_cuda_bf16n_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    int64_t row0 = 0;
++    const entry * e = lookup(src0->data, row0);
++    GGML_ASSERT(e && "BF16N tensor without registered aux data");
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && dst->nb[0] == sizeof(float));
++    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1);
++    const int64_t n = src1->ne[0];
++    if (n == 0) {
++        return;
++    }
++    const dim3 grid((unsigned) ((n + 7) / 8));
++    cudaStream_t stream = ctx.stream();
++#define GR(CC)                                                                                                         \
++    case CC:                                                                                                           \
++        if (e->format == GGML_BF16N_NIBBLE) {                                                                          \
++            k_nibble_get_rows<CC><<<grid, 256, 0, stream>>>(nibp(*e), (const char *) src1->data, src1->nb[0], n, row0, (float *) dst->data, dst->nb[1]); \
++        } else if (e->format == GGML_BF16N_HUFPAIR) {                                                                  \
++            k_hp_get_rows<CC><<<grid, 256, 0, stream>>>(hpp(*e), e->R, (const char *) src1->data, src1->nb[0], n, row0, (float *) dst->data, dst->nb[1]); \
++        } else {                                                                                                       \
++            GGML_ABORT("bf16n: GET_ROWS not implemented for the single-symbol Huffman format");                       \
++        }                                                                                                              \
++        break;
++    switch (e->K / 512) { GR(1) GR(2) GR(4) GR(8) default: GGML_ABORT("bf16n: unsupported K"); }
++#undef GR
++    CUDA_CHECK(cudaGetLastError());
++}
++
++bool ggml_cuda_bf16n_is_registered(const ggml_tensor * t) {
++    int64_t row0;
++    return lookup(t->data, row0) != nullptr;
++}
++
++// Encode a host BF16 tensor into `tensor` (type BF16N, device memory) + registered aux, then verify by
++// decoding back on the GPU and comparing every bit with the source.
++extern "C" bool ggml_backend_cuda_bf16n_convert(struct ggml_tensor * tensor, const void * bf16_host, int format) {
++    GGML_ASSERT(tensor->type == GGML_TYPE_BF16N && ggml_is_contiguous(tensor));
++    const int64_t K = tensor->ne[0];
++    const int64_t rows = ggml_nrows(tensor);
++    GGML_ASSERT(K % 512 == 0 && K <= 4096);
++    const uint16_t * w = (const uint16_t *) bf16_host;
++
++    std::vector<uint8_t> sm(rows * K);
++    encode_sm_plane(w, rows, K, sm.data());
++    std::vector<uint8_t> aux;
++    int R = 0;
++    if (format == GGML_BF16N_HUFFMAN) {
++        const int64_t per = tensor->ne[1]; // rows per matrix (expert)
++        if (tensor->ne[2] > 1) {
++            // MoE: 8 experts per token share the GPU; the unit size only has to divide the expert
++            R = per % 16 == 0 && per >= 2048 ? 16 : per % 8 == 0 ? 8 : per % 4 == 0 ? 4 : 1;
++        } else {
++            // dense: largest unit that still gives every SM 32 warps of work (512 units)
++            R = 1;
++            for (int r = 16; r > 1; r >>= 1) {
++                if (per % r == 0 && per / r >= 512) {
++                    R = r;
++                    break;
++                }
++            }
++        }
++        aux = encode_huffpair(w, rows, K, R);
++        if (!aux.empty()) {
++            format = GGML_BF16N_HUFPAIR;
++        } else {
++            aux = encode_huffman(w, rows, K, R); // more distinct exponent pairs than the pair LUT holds
++        }
++    } else {
++        aux = encode_nibble(w, rows, K);
++        // escaped weights must read as +0 in the plane so the dense path adds exactly nothing for them
++        const aux_header * h = (const aux_header *) aux.data();
++        const uint32_t * esc = (const uint32_t *) (aux.data() + h->off_d);
++        const uint32_t * eo = (const uint32_t *) (aux.data() + h->off_c);
++        for (int64_t r = 0; r < rows; r++) {
++            for (uint32_t i = eo[r]; i < eo[r + 1]; i++) {
++                const int col = esc[i] & 0xFFF;
++                const int c = col / 512, p = col % 512;
++                const int j = p / 128, l = (p % 128) / 4, t = p % 4;
++                sm[r * K + c * 512 + 16 * l + 4 * j + t] = 0;
++            }
++        }
++    }
++    CUDA_CHECK(cudaMemcpy(tensor->data, sm.data(), sm.size(), cudaMemcpyHostToDevice));
++    void * aux_dev = nullptr;
++    CUDA_CHECK(cudaMalloc(&aux_dev, aux.size()));
++    CUDA_CHECK(cudaMemcpy(aux_dev, aux.data(), aux.size(), cudaMemcpyHostToDevice));
++
++    entry e;
++    e.base = (const uint8_t *) tensor->data; e.nbytes = sm.size(); e.format = format; e.K = K; e.rows = rows; e.R = R;
++    e.aux = aux_dev; e.aux_bytes = aux.size();
++    const aux_header * h = (const aux_header *) aux.data();
++    const uint8_t * a = (const uint8_t *) aux_dev;
++    if (format == GGML_BF16N_HUFPAIR) {
++        e.hlut = (const uint32_t *) (a + h->off_a);
++        e.lane_off = (const uint32_t *) (a + h->off_b);
++        e.lane_rel = (const uint16_t *) (a + h->off_c);
++        e.stream = (const uint32_t *) (a + h->off_d);
++    } else if (format == GGML_BF16N_HUFFMAN) {
++        e.hlut = (const uint32_t *) (a + h->off_a);
++        e.lane_off = (const uint32_t *) (a + h->off_b);
++        e.stream = (const uint32_t *) (a + h->off_c);
++    } else {
++        e.nib = a + h->off_a;
++        e.lut_row = (const uint4 *) (a + h->off_b);
++        e.esc_off = (const uint32_t *) (a + h->off_c);
++        e.esc = (const uint32_t *) (a + h->off_d);
++    }
++    {
++        std::lock_guard<std::mutex> lk(g_mutex);
++        auto it = std::upper_bound(g_entries.begin(), g_entries.end(), e.base, [](const uint8_t * b, const entry & x) { return b < x.base; });
++        g_entries.insert(it, e);
++    }
++
++    // bitwise round-trip check on the GPU, in chunks bounded to 64 MiB of BF16
++    bool ok = true;
++    {
++        const int64_t chunk_rows = std::max<int64_t>((64ll << 20) / (K * 2) / std::max(R, 1) * std::max(R, 1), std::max(R, 1));
++        uint16_t * d_out = nullptr;
++        CUDA_CHECK(cudaMalloc(&d_out, chunk_rows * K * 2));
++        std::vector<uint16_t> back(chunk_rows * K);
++        ggml_tensor view = *tensor;
++        for (int64_t r0 = 0; r0 < rows && ok; r0 += chunk_rows) {
++            const int64_t nr = std::min(chunk_rows, rows - r0);
++            view.data = (char *) tensor->data + r0 * K;
++            view.ne[1] = nr; view.ne[2] = 1; view.ne[3] = 1;
++            view.nb[2] = view.nb[1] * nr; view.nb[3] = view.nb[2];
++            int64_t vr0;
++            const entry * ve = lookup(view.data, vr0);
++            launch_dequant(*ve, vr0, nr, d_out, 0);
++            CUDA_CHECK(cudaGetLastError());
++            CUDA_CHECK(cudaMemcpy(back.data(), d_out, nr * K * 2, cudaMemcpyDeviceToHost));
++            ok = memcmp(back.data(), w + r0 * K, nr * K * 2) == 0;
++        }
++        CUDA_CHECK(cudaFree(d_out));
++    }
++    const double ratio = (double) (sm.size() + aux.size()) / (double) (rows * K * 2);
++    fprintf(stderr, "bf16n: %-32s %s K=%5lld rows=%7lld R=%2d ratio=%.4f roundtrip=%s\n", tensor->name,
++        format == GGML_BF16N_HUFPAIR ? "hufpair" : format == GGML_BF16N_HUFFMAN ? "huffman" : "nibble ", (long long) K, (long long) rows, R, ratio, ok ? "OK" : "FAIL");
++    return ok;
++}
+--- a/ggml/src/ggml-cuda/bf16n.cuh
++++ b/ggml/src/ggml-cuda/bf16n.cuh
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include "common.cuh"
++
++// aux formats of GGML_TYPE_BF16N tensors (see bf16n.cu)
++#define GGML_BF16N_NIBBLE  1
++#define GGML_BF16N_HUFFMAN 2
++#define GGML_BF16N_HUFPAIR 3 // Huffman over exponent pairs (chosen automatically when the pair alphabet fits)
++
++// GGML_BF16N_REFERENCE=1: route every BF16N product through exact dequant + the stock BF16 cuBLAS path
++static inline bool ggml_cuda_bf16n_reference() {
++    static const bool on = getenv("GGML_BF16N_REFERENCE") != nullptr;
++    return on;
++}
++
++// y = W x for up to 8 columns; ids != nullptr for MUL_MAT_ID
++bool ggml_cuda_bf16n_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                                 const ggml_tensor * ids, ggml_tensor * dst);
++
++// fused gate/up + SWIGLU (MUL_MAT, MUL_MAT, GLU or MUL_MAT_ID, MUL_MAT_ID, GLU)
++bool ggml_cuda_bf16n_can_fuse_glu(const ggml_tensor * gate_w, const ggml_tensor * up_w, const ggml_tensor * src1,
++                                  const ggml_tensor * ids, const ggml_tensor * glu);
++void ggml_cuda_bf16n_mul_mat_vec_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
++                                     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
++
++// GET_ROWS with a BF16N source (token embedding), F32 destination
++void ggml_cuda_bf16n_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// exact BF16 reconstruction of a (row-aligned, contiguous) BF16N tensor or view into `out`
++void ggml_cuda_bf16n_dequant_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, void * out);
++
++extern "C" bool ggml_backend_cuda_bf16n_convert(struct ggml_tensor * tensor, const void * bf16_host, int format);
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1106,6 +1106,34 @@
+     return true;
+ }
+ 
++// LLAMA_BF16N=hybrid|huffman|nibble: keep BF16 weights resident in lossless compressed form (GGML_TYPE_BF16N).
++// hybrid: routed experts use the Huffman exponent format (max compression), dense weights the nibble format (fast).
++static int llama_bf16n_format_for(const ggml_tensor & t, ggml_backend_buffer_type_t buft) {
++    static const char * mode = getenv("LLAMA_BF16N");
++    if (mode == nullptr || *mode == 0 || strcmp(mode, "0") == 0) {
++        return 0;
++    }
++    const std::string name = ggml_get_name(&t);
++    // the router is stored as F32 but holds BF16 values (exactness is checked at load)
++    const bool router = t.type == GGML_TYPE_F32 && name.size() > 19 && name.compare(name.size() - 19, 19, "ffn_gate_inp.weight") == 0;
++    if ((t.type != GGML_TYPE_BF16 && !router) || ggml_n_dims(&t) < 2 || t.ne[0] % 512 != 0 || t.ne[0] > 4096) {
++        return 0;
++    }
++    if (ggml_backend_buft_is_host(buft)) {
++        return 0;
++    }
++    if (strcmp(mode, "huffman") == 0) {
++        return 2;
++    }
++    if (strcmp(mode, "nibble") == 0) {
++        return 1;
++    }
++    // hybrid: entropy-coded where the matrices are big enough to keep every SM busy, fixed-width nibbles for the small ones
++    static const int64_t dense_min = getenv("LLAMA_BF16N_DENSE_MIN") ? atoll(getenv("LLAMA_BF16N_DENSE_MIN")) : (8ll << 20);
++    const bool expert = name.find("_exps") != std::string::npos;
++    return expert || ggml_nelements(&t) >= dense_min ? 2 : 1;
++}
++
+ struct ggml_tensor * llama_model_loader::create_tensor(
+         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+@@ -1370,6 +1398,16 @@
+ 
+     const bool duplicated = flags & TENSOR_DUPLICATED;
+ 
++    const int bf16n_fmt = duplicated || is_lazy ? 0 : llama_bf16n_format_for(t_meta, buft);
++    if (bf16n_fmt) {
++        t_meta.type  = GGML_TYPE_BF16N;
++        t_meta.nb[0] = ggml_type_size(GGML_TYPE_BF16N);
++        t_meta.nb[1] = ggml_row_size(GGML_TYPE_BF16N, t_meta.ne[0]);
++        t_meta.nb[2] = t_meta.nb[1]*t_meta.ne[1];
++        t_meta.nb[3] = t_meta.nb[2]*t_meta.ne[2];
++        bf16n_formats[tn.str()] = bf16n_fmt;
++    }
++
+     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+     ggml_set_name(tensor, ggml_get_name(&t_meta));
+ 
+@@ -1628,6 +1666,44 @@
+             }
+         }
+ 
++        if (cur->type == GGML_TYPE_BF16N) {
++            const size_t src_size = ggml_nbytes(weight->tensor);
++            std::vector<uint8_t> host;
++            const void * src;
++            if (use_mmap) {
++                src = (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs;
++            } else {
++                host.resize(src_size);
++                const auto & file = files.at(weight->idx);
++                file->seek(weight->offs, SEEK_SET);
++                file->read_raw(host.data(), src_size);
++                src = host.data();
++            }
++            std::vector<uint16_t> bf16;
++            if (weight->tensor->type == GGML_TYPE_F32) {
++                const uint32_t * f = (const uint32_t *) src;
++                bf16.resize(ggml_nelements(weight->tensor));
++                for (size_t i = 0; i < bf16.size(); i++) {
++                    if (f[i] & 0xFFFF) {
++                        throw std::runtime_error(format("BF16N: F32 tensor %s is not exactly representable in BF16", ggml_get_name(cur)));
++                    }
++                    bf16[i] = (uint16_t) (f[i] >> 16);
++                }
++                src = bf16.data();
++            }
++            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
++            using convert_t = bool (*)(ggml_tensor *, const void *, int);
++            auto convert = (convert_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_bf16n_convert");
++            if (convert == nullptr) {
++                throw std::runtime_error("LLAMA_BF16N requires the CUDA backend");
++            }
++            if (!convert(cur, src, bf16n_formats.at(ggml_get_name(cur)))) {
++                throw std::runtime_error(format("BF16N round-trip mismatch for tensor '%s'", ggml_get_name(cur)));
++            }
++            size_done += src_size;
++            continue;
++        }
++
+         size_t n_size = ggml_nbytes(cur);
+ 
+         const bool from_mapping = use_mmap || lazy.has(cur);
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -75,6 +75,9 @@
+     int n_tensors = 0;
+     int n_created = 0;
+ 
++    // tensors converted at load time to GGML_TYPE_BF16N (name -> aux format)
++    std::map<std::string, int> bf16n_formats;
++
+     uint64_t n_elements = 0;
+     size_t   n_bytes    = 0;
+ 
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1510,6 +1510,10 @@
+     // assign the input layer
+     // there is very little benefit to offloading the input layer, so always keep it on the CPU
+     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    // ... except with LLAMA_BF16N: the compressed embedding lives on the GPU with the rest of a fully offloaded model
++    if (getenv("LLAMA_BF16N") != nullptr && getenv("LLAMA_BF16N_INPUT_CPU") == nullptr && act_gpu_layers > n_layer_all) {
++        pimpl->dev_input = get_layer_buft_list(n_layer_all);
++    }
+ 
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);
