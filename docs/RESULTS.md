@@ -42,11 +42,54 @@ The patch was also verified on a clean upstream checkout (`git archive b29c606` 
 `scripts/build_llama.sh` flags): it applies without fuzz, builds, passes all 472 round-trip checks and decodes at
 28.6–29.6 tok/s depending on the run.
 
-Run-to-run spread between processes is ±2–3 % even on an idle system, so every comparison above was made with
-alternating runs of the two variants in separate processes. Desktop activity matters a lot on Orin because the compositor and remote
+Run-to-run spread between processes was ±2–3 % until the page cache was dropped and memory compacted before each run
+(`echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory`); with that it is ±0.3 %. Earlier comparisons
+above therefore use alternating runs of the two variants in separate processes.
+
+Desktop on vs off (gdm stopped), final patch on clean upstream, caches dropped and memory compacted before each run,
+three processes each:
+
+| | tg64 @ 0 | tg64 @ 2048 | bwprobe |
+|---|---|---|---|
+| desktop running | 29.71 / 29.87 / 29.77 | 30.49 / 30.53 / 30.44 | 179.2–179.7 GB/s |
+| desktop stopped | 29.91 / 29.83 / 29.86 | 30.69 / 30.70 / 30.66 | 179.7–179.8 GB/s |
+
+With no application windows open the desktop costs ≈ 0.5 %; the 13 % loss below came from one open window. Desktop activity matters a lot on Orin because the compositor and remote
 desktop share the GPU and DRAM: with the Ubuntu *Software Updater* window open, `bwprobe` medians dropped to 156–168 GB/s
-(from 180) and decode to **25.0 tok/s**; closing that single window restored 180 GB/s and 28.7 tok/s. A run with the GUI
-stopped (`systemctl isolate multi-user.target`) is still to be done.
+(from 180) and decode to **25.0 tok/s**; closing that single window restored 180 GB/s and 28.7 tok/s.
+
+## Long context
+
+Model geometry (from the GGUF): 40 layers, every 4th is full attention (10 layers, 2 KV heads × 256), the rest are Gated
+DeltaNet with a fixed-size state. The F16 KV cache therefore costs 10 × 2 × 2 × 256 × 2 B = **20 KiB per token**,
+5.0 GiB for the native 262,144-token window.
+
+`llama-bench -ngl 99 -fa 1 -p 0 -n 32 -d <depth>`, final patch on clean upstream, desktop running, caches dropped and
+memory compacted before the process. Depths 32K–256K are one repetition from a single sweep; 2K and 8K are `-r 3` from a
+second process (the sweep's first test right after loading read 26.4 tok/s at depth 0, a second process measured
+28.8 ± 1.7 there with one slow repetition, so the first test after load is not representative; the dedicated three-process
+runs above give 29.8).
+
+| depth | tok/s | ms / token | KV read per token |
+|---:|---:|---:|---:|
+| 2048 | 30.39 ± 0.43 | 32.9 | 0.04 GB |
+| 8192 | 29.69 ± 0.42 (sweep: 29.28) | 33.7 | 0.17 GB |
+| 32768 | 26.30 | 38.0 | 0.67 GB |
+| 65536 | 23.37 | 42.8 | 1.34 GB |
+| 131072 | 19.30 | 51.8 | 2.68 GB |
+| 262144 | 14.42 | 69.3 | 5.37 GB |
+
+A least-squares line through the sweep gives `t ≈ 33.5 ms + 0.138 µs × depth`, i.e. 20 KiB per token read at
+≈ 149 GB/s (83 % of the measured 180 GB/s read bandwidth); flash attention over the KV cache is near its floor, and at 256K
+the cache traffic is larger than the weight traffic. At 262,144 tokens the run fit, but the kernel's `MemAvailable` fell
+below 100 MiB (desktop running, `-ub 512`).
+
+Prefill of an 8192-token prompt against the micro-batch size (`-p 8192 -n 0 -b 8192 -ub <n>`, one process per pair of
+values; MoE prefill dequantises the used experts once per micro-batch):
+
+| `-ub` | 512 | 1024 | 2048 | 4096 |
+|---|---:|---:|---:|---:|
+| pp8192, tok/s | 265.4 | 351.8 | 433.5 | 501.8 |
 
 ## Where a decode step goes (nsys node-level trace; tracing adds ≈ 10 %, captured with the busy desktop)
 

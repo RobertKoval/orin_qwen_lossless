@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="228" viewBox="0 0 760 228" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="Resident weights vs. Orin memory">
+<title>Resident weights vs. Orin memory</title>
+<rect x="0.5" y="0.5" width="759" height="227" rx="12" fill="#1a1a19" stroke="rgba(255,255,255,0.10)"/>
+<text x="24" y="36" font-size="17" font-weight="600" fill="#f0efec">Resident weights vs. Orin memory</text>
+<text x="24" y="58" font-size="13" fill="#c3c2b7">all 472 weight tensors of the text model, bit-exact</text>
+<line x1="198.3" y1="86" x2="198.3" y2="176" stroke="#2c2c2a" stroke-width="1"/>
+<text x="198.3" y="194" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="265.7" y1="86" x2="265.7" y2="176" stroke="#2c2c2a" stroke-width="1"/>
+<text x="265.7" y="194" font-size="11" fill="#898781" text-anchor="middle">10</text>
+<line x1="333.1" y1="86" x2="333.1" y2="176" stroke="#2c2c2a" stroke-width="1"/>
+<text x="333.1" y="194" font-size="11" fill="#898781" text-anchor="middle">20</text>
+<line x1="400.5" y1="86" x2="400.5" y2="176" stroke="#2c2c2a" stroke-width="1"/>
+<text x="400.5" y="194" font-size="11" fill="#898781" text-anchor="middle">30</text>
+<line x1="467.9" y1="86" x2="467.9" y2="176" stroke="#2c2c2a" stroke-width="1"/>
+<text x="467.9" y="194" font-size="11" fill="#898781" text-anchor="middle">40</text>
+<line x1="535.2" y1="86" x2="535.2" y2="176" stroke="#2c2c2a" stroke-width="1"/>
+<text x="535.2" y="194" font-size="11" fill="#898781" text-anchor="middle">50</text>
+<line x1="602.6" y1="86" x2="602.6" y2="176" stroke="#2c2c2a" stroke-width="1"/>
+<text x="602.6" y="194" font-size="11" fill="#898781" text-anchor="middle">60</text>
+<line x1="670.0" y1="86" x2="670.0" y2="176" stroke="#2c2c2a" stroke-width="1"/>
+<text x="670.0" y="194" font-size="11" fill="#898781" text-anchor="middle">70</text>
+<line x1="198.32000000000002" y1="86" x2="198.32000000000002" y2="176" stroke="#383835" stroke-width="1"/>
+<text x="670" y="214" font-size="11" fill="#898781" text-anchor="end">GiB</text>
+<line x1="612.1" y1="82" x2="612.1" y2="176" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="606.1" y="78" font-size="12" fill="#c3c2b7" text-anchor="end">unified memory 61.4 GiB</text>
+<g fill="#184f95"><path d="M198.32000000000002,101.0 H629.613257142857 Q633.613257142857,101.0 633.613257142857,105.0 V119.0 Q633.613257142857,123.0 629.613257142857,123.0 H198.32000000000002 Z"/></g>
+<text x="186.32000000000002" y="116.5" font-size="13" fill="#c3c2b7" text-anchor="end">BF16 (does not fit)</text>
+<rect x="636.6" y="101.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="641.6" y="116.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">64.6</text>
+<g fill="#3987e5"><path d="M198.32000000000002,141.0 H486.0877714285714 Q490.0877714285714,141.0 490.0877714285714,145.0 V159.0 Q490.0877714285714,163.0 486.0877714285714,163.0 H198.32000000000002 Z"/></g>
+<text x="186.32000000000002" y="156.5" font-size="13" fill="#c3c2b7" text-anchor="end">BF16N, this repo</text>
+<rect x="493.1" y="141.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="498.1" y="156.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">43.3</text>
+</svg>

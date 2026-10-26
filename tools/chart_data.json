@@ -1,0 +1,144 @@
+{
+  "decode": {
+    "title": "Decode speed, Qwen3.6-35B-A3B on Jetson AGX Orin 64GB",
+    "subtitle": "single sequence, greedy, after a 2048-token context, tokens per second",
+    "unit": "tokens / s",
+    "axis_max": 35,
+    "ticks": [
+      0,
+      5,
+      10,
+      15,
+      20,
+      25,
+      30,
+      35
+    ],
+    "reference": {
+      "value": 30,
+      "label": "target 30"
+    },
+    "rows": [
+      {
+        "label": "PyTorch runtime, fused TCA format",
+        "value": 4.97,
+        "value_label": "5.0"
+      },
+      {
+        "label": "BF16N v1: nibble + Huffman, fused GLU",
+        "value": 23.55,
+        "value_label": "23.6"
+      },
+      {
+        "label": "+ exponent-pair Huffman",
+        "value": 28.4,
+        "value_label": "28.4"
+      },
+      {
+        "label": "+ Huffman for large dense tensors",
+        "value": 29.31,
+        "value_label": "29.3"
+      },
+      {
+        "label": "final: warm start, nothing on CPU",
+        "value": 30.5,
+        "value_label": "30.5",
+        "highlight": true
+      }
+    ]
+  },
+  "memory": {
+    "title": "Resident weights vs. Orin memory",
+    "subtitle": "all 472 weight tensors of the text model, bit-exact",
+    "unit": "GiB",
+    "axis_max": 70,
+    "ticks": [
+      0,
+      10,
+      20,
+      30,
+      40,
+      50,
+      60,
+      70
+    ],
+    "reference": {
+      "value": 61.4,
+      "label": "unified memory 61.4 GiB"
+    },
+    "rows": [
+      {
+        "label": "BF16 (does not fit)",
+        "value": 64.6,
+        "value_label": "64.6"
+      },
+      {
+        "label": "BF16N, this repo",
+        "value": 43.3,
+        "value_label": "43.3",
+        "highlight": true
+      }
+    ]
+  },
+  "context": {
+    "title": "Decode speed vs. context length",
+    "subtitle": "10 of the 40 layers are full attention and read the whole KV cache (20 KiB per token) every step",
+    "points": [
+      [
+        2048,
+        30.39
+      ],
+      [
+        8192,
+        29.69
+      ],
+      [
+        32768,
+        26.3
+      ],
+      [
+        65536,
+        23.37
+      ],
+      [
+        131072,
+        19.3
+      ],
+      [
+        262144,
+        14.42
+      ]
+    ],
+    "x_ticks": [
+      2048,
+      8192,
+      32768,
+      65536,
+      131072,
+      262144
+    ],
+    "x_tick_labels": [
+      "2K",
+      "8K",
+      "32K",
+      "64K",
+      "128K",
+      "256K"
+    ],
+    "x_floor": 2048,
+    "x_unit": "context, tokens (log scale)",
+    "y_min": 0,
+    "y_max": 35,
+    "y_ticks": [
+      0,
+      5,
+      10,
+      15,
+      20,
+      25,
+      30,
+      35
+    ],
+    "y_unit": "tokens / s"
+  }
+}
