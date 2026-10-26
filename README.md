@@ -139,7 +139,8 @@ python3 tools/make_charts.py                                            # regene
 
 Kernel microbenchmarks on real weights live in [`bench/`](bench): `bwprobe.cu` (DRAM read bandwidth), `nibble_gemv.cu` and
 `hufpair_gemv.cu` (format + kernel; each checks its output bit-for-bit against a raw-BF16 kernel with the same summation
-order), `locate_tensor.py`, `exponent_coverage.py`. Build with `nvcc -O3 -arch=sm_87 -std=c++17 -o X bench/X.cu -lcublas`.
+order), `locate_tensor.py`, `exponent_coverage.py`, and `kv_entropy.py` (lossless compressibility of a saved
+llama-server KV cache). Build with `nvcc -O3 -arch=sm_87 -std=c++17 -o X bench/X.cu -lcublas`.
 
 ## FAQ
 

@@ -40,9 +40,13 @@ at 256K decode is 14.4 tok/s.
 1. **Q8_0 KV cache** (`-ctk q8_0 -ctv q8_0`): ≈ 0.53× the traffic. Predicted 256K decode ≈ 19 tok/s (52.7 ms). This
    quantises activations, not weights, so it breaks bit-exactness of the outputs; measure it and its effect on logits as an
    explicit trade-off, never as a default.
-2. **Lossless KV compression**: entropy-code the F16 exponents of K and V the way BF16N codes weights. The F16 exponent
-   has only 5 bits, the cache is written one token at a time and read by flash attention, so the gain is uncertain:
-   measure the exponent entropy of a real 256K cache first (falsifier: < 10 % saving → drop it).
+2. **Lossless KV compression — measured on a real 32K cache** ([RESULTS.md](RESULTS.md#kv-cache-compressibility-measured-not-implemented)):
+   only the F16 exponent is redundant, ≈ −15 % with per-channel Huffman tables (static tables from the first 4K tokens
+   work), −17 % entropy bound. That clears the 10 % bar, but predicts only +8 % decode at 256K (+3 % at 64K) and 0.8 GiB
+   less memory at 262K. Cost: decoding inside the flash-attention kernel, block-wise encoding of the append-only cache.
+   Risk: at 256K a step must decode 2.7 G values at ≥ 88 G values/s to hide under the 30 ms compressed read, alongside
+   the attention math; the weight GEMV reaches ≈ 125 G values/s with the INT datapath to itself. Below prefill and MTP in priority; reconsider if memory at 256K becomes
+   the constraint.
 3. **Flash-attention efficiency**: at 83 % of the read bandwidth, ≤ 10 % at 256K is left in the kernel itself.
 
 ## Stage 3 — fewer, fatter kernels in the decode step (+10–20 %, medium–large)

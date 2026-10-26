@@ -91,6 +91,41 @@ values; MoE prefill dequantises the used experts once per micro-batch):
 |---|---:|---:|---:|---:|
 | pp8192, tok/s | 265.4 | 351.8 | 433.5 | 501.8 |
 
+## KV-cache compressibility (measured, not implemented)
+
+32,768 tokens of wikitext-2 (test split) prefilled through `llama-server` (`-fa on -ub 2048`, 402 tok/s), the slot saved
+with `POST /slots/0?action=save` and analysed with [`bench/kv_entropy.py`](../bench/kv_entropy.py): 10 attention layers ×
+K and V, each 32768 × 512 F16 values. Entropies are plug-in estimates (≥ 32K samples per channel); means over the 10 layers:
+
+| field (bits in F16) | K | V |
+|---|---:|---:|
+| sign (1): one table / per channel | 1.000 / 0.944 | 1.000 / 0.925 |
+| exponent (5): one table per tensor | 2.695 | 2.700 |
+| exponent: pairs of neighbouring channels, per tensor | 2.689 | 2.698 |
+| exponent: one table per channel | 2.499 | 2.513 |
+| exponent: per channel, given the previous token | 2.383 | 2.457 |
+| top 3 mantissa bits (3), given exponent and channel | 2.910 | 2.872 |
+| mantissa (10), per channel | 9.948 | 9.899 |
+
+| scheme, bits per value (ratio) | K | V |
+|---|---:|---:|
+| exponent Huffman per channel, real code lengths | 13.54 (0.846) | 13.58 (0.849) |
+| same, tables built on the first 4096 tokens only | 13.56 (0.847) | 13.53 (0.846) |
+| entropy bound: sign \| channel + exponent \| channel, previous token + mantissa \| channel | 13.28 (0.830) | 13.28 (0.830) |
+| `lzma -6` on byte planes (layer 4), for reference | 0.859 | 0.856 |
+
+* Only the exponent is redundant (≈ 2.5 of 5 bits); mantissa and sign are close to random. Lossless F16 KV compression
+  therefore tops out at ≈ −17 %, ≈ −15 % with a per-channel Huffman code, against −33 % for the BF16 weights (same ≈ 2.6
+  bits of exponent information, but out of 8).
+* Per-channel tables are worth ≈ 0.2 bit, the previous token another ≈ 0.1; neighbouring-channel pairs are worth nothing.
+  Rotated (RoPE) dimensions of K are slightly more compressible (2.2–2.45 bits) than the pass-through ones (2.54).
+* Tables built on the first 4096 tokens cost only 0.02–0.06 bit on the rest, so static per-channel tables fit an
+  append-only cache.
+* Outlier: V of the last attention layer (layer 39) needs only 1.93 exponent bits and 0.68 sign bits per channel.
+* With the long-context fit above, KV traffic × 0.85 predicts 15.6 instead of 14.4 tok/s at 256K (+8 %), ≈ +3 % at 64K,
+  and 0.8 GiB less memory at 262K. A lossy Q8_0 cache would predict ≈ 19 tok/s at 256K.
+* Single text domain (English Wikipedia prose); code or other languages may differ.
+
 ## Where a decode step goes (nsys node-level trace; tracing adds ≈ 10 %, captured with the busy desktop)
 
 | part | ms / token |
