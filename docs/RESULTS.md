@@ -261,6 +261,35 @@ batched MoE kernel changed the summation order, two of four `scripts/run_prompts
 two best tokens had 0.476 vs 0.457 and 0.200 vs 0.199). Perplexity does not move (±0.005).
 The weights stay bit-exact, and a given build with given settings is deterministic.
 
+## Prefill: norms and conversions (upstream kernels, ported)
+
+After the chunked gated delta net, conversions and norms were 14 % of a 2048-token forward and ran at 53–103 GB/s.
+By launch shape (nsys, pp2048 `-ub 2048`, ebf3f70): 349 F32→BF16 conversions of 2048 × 2048 activations at 245 µs
+(≈ 103 GB/s) — every BF16N matmul converts its input again, so the same normed activation is converted 8–9 times per
+layer; the gated delta net's q/k L2 norm as `rms_norm` + `scale` over 128-wide rows (631 + 267 µs, 53 GB/s); the hidden
+norms (2048 rows of 2048, 1024-thread blocks, 501 µs, 67 GB/s); the gated output norm (32 × 2048 rows of 128, 1276 µs).
+
+Upstream has rewritten all of these since `b29c606`; ported unchanged: #29155 (contiguous conversions four elements per
+thread), #29393 (RMS_NORM + SCALE fused into one kernel), #28175 (norm grid limits) and #29720 (float4 `rms_norm`, row
+kept in registers). `test-backend-ops` on CUDA: RMS_NORM 53/53, NORM 51/51, L2_NORM 21/21, ROPE 450/450, CPY 249/249,
+SCALE 4/4. Afterwards a conversion of 2048 × 2048 takes 136 µs (≈ 185 GB/s) and every norm shape runs at 150–178 GB/s:
+conversions 126 → 70 ms, norms + scale 140 → 48 ms per forward.
+
+Alternating ebf3f70 / this patch, two rounds (`-ub 4096`: base / new / new / base), same conditions as above, tok/s:
+
+| | ebf3f70 | this patch | change |
+|---|---:|---:|---:|
+| pp2048, `-ub 512` | 780.6 / 779.7 | **821.2 / 820.3** | +5.2 % |
+| pp8192, `-ub 512` | 759.6 / 759.8 | **800.1 / 799.7** | +5.3 % |
+| pp2048, `-ub 2048` | 1177.7 / 1177.8 | **1271.6 / 1261.1** | +7.5 % |
+| pp8192, `-ub 2048` | 1155.6 / 1155.4 | **1249.6 / 1248.6** | +8.1 % |
+| pp8192, `-ub 4096` | 1277.3 / 1282.4 | **1404.2 / 1401.9** | +9.6 % |
+| tg64 @ 0 / @ 2048 | 30.89 / 30.92, 30.85 / 30.86 | 31.08 / 31.11, 31.12 / 31.13 | +0.7 % |
+
+KL against ebf3f70 (`-ub 2048`, as above): PPL 4.7513 vs 4.7465, mean KLD 0.0025, same top-1 98.19 % — the same
+summation-order noise as in the table above. Converting each activation only once would save another ≈ 36 ms (≈ 2 %);
+not done.
+
 ## KV-cache compressibility (measured, not implemented)
 
 32,768 tokens of wikitext-2 (test split) prefilled through `llama-server` (`-fa on -ub 2048`, 402 tok/s), the slot saved
