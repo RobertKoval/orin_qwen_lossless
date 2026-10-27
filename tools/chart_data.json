@@ -171,7 +171,12 @@
       {
         "label": "-ub 512, + chunked GDN, faster norms",
         "value": 800.0,
-        "value_label": "800",
+        "value_label": "800"
+      },
+      {
+        "label": "-ub 512, + fused SwiGLU, lane-stream rings",
+        "value": 811.4,
+        "value_label": "811",
         "highlight": true
       },
       {
@@ -187,7 +192,12 @@
       {
         "label": "-ub 2048, + chunked GDN, faster norms",
         "value": 1249.1,
-        "value_label": "1249",
+        "value_label": "1249"
+      },
+      {
+        "label": "-ub 2048, + fused SwiGLU, lane-stream rings",
+        "value": 1279.3,
+        "value_label": "1279",
         "highlight": true
       },
       {
@@ -203,7 +213,12 @@
       {
         "label": "-ub 4096, + chunked GDN, faster norms",
         "value": 1403.1,
-        "value_label": "1403",
+        "value_label": "1403"
+      },
+      {
+        "label": "-ub 4096, + fused SwiGLU, lane-stream rings",
+        "value": 1429.0,
+        "value_label": "1429",
         "highlight": true
       }
     ]

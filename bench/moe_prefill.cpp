@@ -7,6 +7,9 @@
 //
 // tensor: e.g. blk.20.ffn_gate_exps.weight (K x N x E). Each token picks 8 distinct experts; skew > 0 draws them with
 // probability ~ (rank + 1)^-skew over a random expert order (0: uniform). GGML_BF16N_NO_MMA=1 selects the old path.
+// A name with "gate_up" (blk.20.ffn_gate_up_exps.weight) times gate, up and SWIGLU as one graph (fused when the backend
+// can; GGML_BF16N_NO_GLU=1 disables it), compares it bitwise with the same ops computed unfused on the GPU, and checks it
+// against silu(gate) * up from the CPU reference.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -20,6 +23,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <random>
+#include <string>
 #include <unistd.h>
 #include <vector>
 
@@ -44,38 +48,57 @@ int main(int argc, char ** argv) {
     gguf_init_params gp = { /*no_alloc*/ true, &meta };
     gguf_context * g = gguf_init_from_file(path, gp);
     if (!g) { fprintf(stderr, "cannot read %s\n", path); return 1; }
-    const int64_t tid = gguf_find_tensor(g, name);
-    if (tid < 0) { fprintf(stderr, "no tensor %s\n", name); return 1; }
-    const ggml_tensor * tm = ggml_get_tensor(meta, name);
-    if (tm->type != GGML_TYPE_BF16 || ggml_n_dims(tm) != 3) { fprintf(stderr, "%s: need a 3-D BF16 tensor\n", name); return 1; }
-    const int64_t K = tm->ne[0], N = tm->ne[1], E = tm->ne[2];
-    std::vector<uint16_t> w(K * N * E);
-    {
+    const std::string sname = name;
+    const size_t gu_at = sname.find("gate_up");
+    const bool glu = gu_at != std::string::npos;
+    int64_t K = 0, N = 0, E = 0;
+    auto read_tensor = [&](const std::string & tn, std::vector<uint16_t> & out) {
+        const int64_t tid = gguf_find_tensor(g, tn.c_str());
+        if (tid < 0) { fprintf(stderr, "no tensor %s\n", tn.c_str()); exit(1); }
+        const ggml_tensor * tm = ggml_get_tensor(meta, tn.c_str());
+        if (tm->type != GGML_TYPE_BF16 || ggml_n_dims(tm) != 3) { fprintf(stderr, "%s: need a 3-D BF16 tensor\n", tn.c_str()); exit(1); }
+        if (K && (tm->ne[0] != K || tm->ne[1] != N || tm->ne[2] != E)) { fprintf(stderr, "%s: shape differs\n", tn.c_str()); exit(1); }
+        K = tm->ne[0]; N = tm->ne[1]; E = tm->ne[2];
+        out.resize(K * N * E);
         const int fd = open(path, O_RDONLY);
         const size_t off = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, tid);
-        size_t done = 0, total = w.size() * 2;
+        size_t done = 0, total = out.size() * 2;
         while (done < total) {
-            const ssize_t r = pread(fd, (char *) w.data() + done, total - done, off + done);
-            if (r <= 0) { perror("pread"); return 1; }
+            const ssize_t r = pread(fd, (char *) out.data() + done, total - done, off + done);
+            if (r <= 0) { perror("pread"); exit(1); }
             done += r;
         }
         close(fd);
+    };
+    std::vector<uint16_t> w, w2; // w2: up for gate_up
+    if (glu) {
+        read_tensor(std::string(sname).replace(gu_at, 7, "gate"), w);
+        read_tensor(std::string(sname).replace(gu_at, 7, "up"), w2);
+    } else {
+        read_tensor(sname, w);
     }
     const bool down = strstr(name, "down") != nullptr; // down: one input row per (token, slot)
     const int64_t ne11 = down ? n_used : 1;
     printf("%s: K=%lld N=%lld E=%lld, tokens %d, skew %.2f\n", name, (long long) K, (long long) N, (long long) E, T, skew);
 
     ggml_backend_t be = ggml_backend_cuda_init(0);
-    ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, /*no_alloc*/ true };
+    ggml_init_params ip = { 16 * ggml_tensor_overhead() + 2 * ggml_graph_overhead(), nullptr, /*no_alloc*/ true }; // 2 graphs for gate_up
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * W = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16N, K, N, E);
+    ggml_tensor * W2 = glu ? ggml_new_tensor_3d(ctx, GGML_TYPE_BF16N, K, N, E) : nullptr;
     ggml_tensor * X = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, ne11, T);
     ggml_tensor * I = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, T);
-    ggml_tensor * Y = ggml_mul_mat_id(ctx, W, X, I);
+    ggml_tensor * Y = glu ? ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, W, X, I), ggml_mul_mat_id(ctx, W2, X, I))
+                          : ggml_mul_mat_id(ctx, W, X, I);
+    // the same GLU with a second consumer of the gate result, which keeps the backend from fusing it
+    ggml_tensor * G2 = glu ? ggml_mul_mat_id(ctx, W, X, I) : nullptr;
+    ggml_tensor * Y2 = glu ? ggml_swiglu_split(ctx, G2, ggml_mul_mat_id(ctx, W2, X, I)) : nullptr;
+    ggml_tensor * S2 = glu ? ggml_scale(ctx, G2, 1.0f) : nullptr;
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
     auto convert = (bool (*)(ggml_tensor *, const void *, int)) ggml_backend_reg_get_proc_address(
         ggml_backend_dev_backend_reg(ggml_backend_get_device(be)), "ggml_backend_cuda_bf16n_convert");
-    if (!convert || !convert(W, w.data(), 2 /* GGML_BF16N_HUFFMAN: pair code when it fits */)) { fprintf(stderr, "convert failed\n"); return 1; }
+    if (!convert || !convert(W, w.data(), 2 /* GGML_BF16N_HUFFMAN: pair code when it fits */) ||
+            (glu && !convert(W2, w2.data(), 2))) { fprintf(stderr, "convert failed\n"); return 1; }
 
     std::mt19937_64 rng(1234);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -120,7 +143,7 @@ int main(int argc, char ** argv) {
     }
     std::sort(rep_ms.begin(), rep_ms.end());
     const double ms = rep_ms[reps / 2];
-    const double flop = 2.0 * N * K * n_used * T;
+    const double flop = (glu ? 4.0 : 2.0) * N * K * n_used * T;
     printf("time %.3f ms  (median of %d, min %.3f, max %.3f; %.2f TFLOPS, %.1f G weights/s over the %lld used experts)\n",
            ms, reps, rep_ms.front(), rep_ms.back(), flop / ms * 1e-9,
            (double) N * K * std::count_if(tok_per_e.begin(), tok_per_e.end(), [](int c) { return c > 0; }) / ms * 1e-6,
@@ -128,17 +151,42 @@ int main(int argc, char ** argv) {
 
     std::vector<float> y(N * n_used * T);
     ggml_backend_tensor_get(Y, y.data(), 0, ggml_nbytes(Y));
+    if (glu) {
+        ggml_cgraph * gf2 = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf2, Y2);
+        ggml_build_forward_expand(gf2, S2);
+        ggml_backend_graph_compute(be, gf2);
+        std::vector<float> y2(y.size());
+        ggml_backend_tensor_get(Y2, y2.data(), 0, ggml_nbytes(Y2));
+        size_t ndiff = 0;
+        for (size_t i = 0; i < y.size(); i++) { ndiff += memcmp(&y[i], &y2[i], 4) != 0; }
+        printf("vs unfused GPU ops: %zu of %zu values differ bitwise\n", ndiff, y.size());
+    }
+    uint64_t fnv = 0xcbf29ce484222325ull; // FNV-1a of the output bytes: equal hashes = bitwise equal results
+    for (size_t i = 0; i < y.size() * 4; i++) { fnv = (fnv ^ ((const uint8_t *) y.data())[i]) * 0x100000001b3ull; }
+    printf("output fnv1a %016llx\n", (unsigned long long) fnv);
     double max_rel = 0, max_abs = 0; int bad = 0;
     std::uniform_int_distribution<int> cd(0, n_used * T - 1);
     for (int c = 0; c < check_cols; c++) {
         const int col = c == 0 ? 0 : cd(rng), t = col / n_used, s = col % n_used, e = ids[col];
         const float * xc = &x[((int64_t) t * ne11 + (down ? s : 0)) * K];
         for (int64_t n = 0; n < N; n++) {
-            const uint16_t * wr = &w[((int64_t) e * N + n) * K];
-            double ref = 0, mag = 0;
-            for (int64_t k = 0; k < K; k++) {
-                const double p = (double) bf16_to_f32(wr[k]) * (T > 8 ? round_bf16(xc[k]) : xc[k]);
-                ref += p; mag += std::fabs(p);
+            auto dot = [&](const std::vector<uint16_t> & wt, double & mg) {
+                const uint16_t * wr = &wt[((int64_t) e * N + n) * K];
+                double r = 0;
+                mg = 0;
+                for (int64_t k = 0; k < K; k++) {
+                    const double p = (double) bf16_to_f32(wr[k]) * (T > 8 ? round_bf16(xc[k]) : xc[k]);
+                    r += p; mg += std::fabs(p);
+                }
+                return r;
+            };
+            double mag, ref = dot(w, mag);
+            if (glu) { // silu(gate) * up; first-order error bound from both dot products (|silu'| < 1.1)
+                double mag_u;
+                const double u = dot(w2, mag_u), sg = ref / (1.0 + std::exp(-ref));
+                mag = mag_u * std::fabs(sg) + 1.1 * std::fabs(u) * mag;
+                ref = sg * u;
             }
             const double d = std::fabs(y[(int64_t) col * N + n] - ref);
             max_abs = std::max(max_abs, d);

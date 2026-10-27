@@ -22,10 +22,10 @@ index 85a1ae7..1973d68 100644
              struct ggml_tensor  * q,
 diff --git a/ggml/src/ggml-cuda/bf16n.cu b/ggml/src/ggml-cuda/bf16n.cu
 new file mode 100644
-index 0000000..38af096
+index 0000000..b840254
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/bf16n.cu
-@@ -0,0 +1,2062 @@
+@@ -0,0 +1,2246 @@
 +// GGML_TYPE_BF16N: lossless BF16 weights resident in compressed form.
 +//
 +// The ggml tensor holds the sign|mantissa byte plane (1 B/weight, 512-weight chunks, lane-major:
@@ -465,7 +465,7 @@ index 0000000..38af096
 +        }
 +        n_words += ustream[u].size();
 +    }
-+    GGML_ASSERT(n_words + 16 < (1ull << 32));
++    GGML_ASSERT(n_words + 32 < (1ull << 32));
 +    aux_header h = {};
 +    h.magic = BF16N_MAGIC; h.format = GGML_BF16N_HUFPAIR; h.K = (uint32_t) K; h.R = (uint32_t) R; h.rows = rows;
 +    h.off_a = 256;                                    // LUT
@@ -473,7 +473,7 @@ index 0000000..38af096
 +    h.off_c = h.off_b + unit_base.size() * 4;         // lane offsets relative to unit base (u16)
 +    h.off_d = (h.off_c + lane_rel.size() * 2 + 15) & ~15ull; // stream
 +    h.n_a = units; h.n_b = n_words; h.flags = cm ? 1 : 0;
-+    std::vector<uint8_t> aux(h.off_d + (n_words + 16) * 4, 0); // +16 words: prefetch lookahead
++    std::vector<uint8_t> aux(h.off_d + (n_words + 32) * 4, 0); // +32 words: lookahead of the decoders' prefetch and rings
 +    memcpy(aux.data(), &h, sizeof(h));
 +    memcpy(aux.data() + h.off_a, lut.data(), lut.size() * 4);
 +    memcpy(aux.data() + h.off_b, unit_base.data(), unit_base.size() * 4);
@@ -1347,6 +1347,70 @@ index 0000000..38af096
 +    return ent;
 +}
 +
++// RB > 0: the batched kernel reads its lane streams through a per-lane ring of RB 16-byte blocks in shared memory, filled by
++// cp.async. Lanes refill at different pair positions, and the scoreboard is per warp register, so with a register queue
++// every refill waits for the newest load into that register by any lane; an asynchronous copy has no register to wait
++// on. Word i of a stream sits in block i / 4, at ring block (i / 4 + key) % RB (key spreads the lanes over the
++// banks); consuming the last word of a block starts the copy of the block RB - 1 ahead into the freed slot. buf holds
++// MSB-first bits, v the valid count (exact in its low 7 bits). The stream buffer has 32 words of padding for these reads.
++
++__device__ __forceinline__ void cp_async16(void * smem, const void * gmem) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"((uint32_t) __cvta_generic_to_shared(smem)), "l"(gmem) : "memory");
++}
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
++template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory"); }
++
++template <int RB> struct hp_rdec { uint64_t buf; uint32_t idx, v, pa, pb, key; uint32_t * ring; };
++
++template <int RB>
++__device__ __forceinline__ uint32_t * hp_ring_block(const hp_rdec<RB> & d, uint32_t b) { return d.ring + 4 * ((b + d.key) & (RB - 1)); }
++
++__device__ __forceinline__ uint32_t hp_lane_start(const hp_ptrs & w, int64_t gu, int lane) {
++    return __ldg(w.ubase + gu) + __ldg(w.lrel + gu * 32 + lane);
++}
++
++// start a lane stream at word idx: fill the ring; hp_ring_first takes the first word once the copies are complete
++template <int RB>
++__device__ __forceinline__ void hp_ring_begin(hp_rdec<RB> & d, const uint32_t * __restrict__ lst, uint32_t idx) {
++    d.idx = idx; d.v = 32; d.pa = 0; d.pb = 0;
++#pragma unroll
++    for (int k = 0; k < RB; k++) { cp_async16(hp_ring_block(d, (idx >> 2) + k), lst + 4 * ((idx >> 2) + k)); }
++}
++
++// word idx was consumed: when it was the last word of its block, the freed slot takes the block RB - 1 ahead
++template <int RB>
++__device__ __forceinline__ void hp_ring_advance(hp_rdec<RB> & d, const uint32_t * __restrict__ lst) {
++    d.idx++;
++    if ((d.idx & 3u) == 0) {
++        const uint32_t b = (d.idx >> 2) + RB - 1;
++        cp_async16(hp_ring_block(d, b), lst + 4 * b);
++    }
++}
++
++template <int RB>
++__device__ __forceinline__ void hp_ring_first(hp_rdec<RB> & d, const uint32_t * __restrict__ lst) {
++    d.buf = (uint64_t) hp_ring_block(d, d.idx >> 2)[d.idx & 3] << 32;
++    hp_ring_advance(d, lst);
++}
++
++// one exponent-pair lookup; q = position within the 8 lookups of a row, a refill point when even
++template <int RB>
++__device__ __forceinline__ uint32_t hp_ring_pair(hp_rdec<RB> & d, int q, const uint32_t * __restrict__ lst, const uint32_t * lut) {
++    if (q % 2 == 0) {
++        d.v = d.v - d.pa - d.pb;
++        const uint32_t m = __funnelshift_r(0u, 1u, d.v);
++        if (!(d.v & 32u)) {
++            d.buf += (uint64_t) hp_ring_block(d, d.idx >> 2)[d.idx & 3] * m;
++            hp_ring_advance(d, lst);
++        }
++        d.v |= 32u;
++    }
++    const uint32_t ent = lut[(uint32_t) (d.buf >> 32) >> (32 - HP_LP)];
++    d.buf = shl64w(d.buf, ent);
++    if (q % 2 == 0) { d.pa = ent; } else { d.pb = ent; }
++    return ent;
++}
++
 +// ---------------------------------------------------------------- batched MUL_MAT_ID (prefill)
 +//
 +// One launch per MUL_MAT_ID; routing comes from ggml_cuda_launch_mm_ids_helper on the GPU (no host sync). A work item
@@ -1384,27 +1448,42 @@ index 0000000..38af096
 +// rows of each of its units into the 64-row slab; then all warps multiply the slab with the tokens' BF16 activations on
 +// the tensor cores: 2 row groups of 32 x NW / 2 token groups of WT*8 tokens; token groups without tokens split K
 +// instead. The accumulators of all H = R / RS slices stay in registers. The LUT is loaded once per block, and the next
-+// item's lane streams and plane rows are started during the last step of the current one.
-+template <int C, int R, int NW, int IL, int WT>
-+__global__ void __launch_bounds__(NW * 32, 1) k_hp_mm_ids(const hp_ptrs w, hpm_args a) {
++// item's lane streams and plane rows are started during the last step of the current one. RB = 0: lane streams through
++// the register queue of hp_dec. RB > 0: through the cp.async rings (the next item's lane starts are read at the start of
++// the current one); a group is committed at each of the 4 refill points of a row, and a refill point waits until at most
++// 4 (RB - 1) groups are pending, which covers every ring block it can read (started at least 4 (RB - 1) + 1 points
++// earlier). The rings pay off where a warp has one stream and long items (gate, down with 1-2 units per warp); with 4
++// interleaved streams per warp the register queue has enough independent chains and keeps the L1 larger.
++//
++// GLU: gate (w) and up (w2) of the same rows in one item, dst = silu(gate) * up (SWIGLU; the same values as MUL_MAT_ID,
++// MUL_MAT_ID, GLU). In each 32-row group of the slab the first 16-row mma tile holds gate rows and the second the same up
++// rows, so a thread has both values of its outputs.
++template <int C, int R, int NW, int IL, int WT, int RB, bool GLU>
++__global__ void __launch_bounds__(NW * 32, 1) k_hp_mm_ids(const hp_ptrs w, const hp_ptrs w2, hpm_args a) {
 +    constexpr int K = C * 512;
-+    constexpr int NU = NW * IL;           // units per item
-+    constexpr int RS = 64 / NU;           // rows per unit per step
-+    constexpr int H = R / RS;             // row slices (steps per chunk)
++    constexpr int NU = NW * IL;            // unit slots per item (both matrices for GLU)
++    constexpr int RS = 64 / NU;            // rows per unit per step
++    constexpr int H = R / RS;              // row slices (steps per chunk)
++    constexpr int SB = 16 / RS;            // unit slots per 16-row mma tile
++    constexpr int NUM = GLU ? NU / 2 : NU; // units of each matrix per item
++    constexpr int WG = RB ? 4 * (RB - 1) : 0; // cp.async groups a refill point lets pend
++    static_assert(RB == 0 || RB == 2 || RB == 4, "ring of 2 or 4 blocks");
 +    static_assert(NU * RS == 64 && R % RS == 0, "bad block shape");
++    static_assert(!GLU || (IL == 1 && 16 % RS == 0), "GLU needs one unit per warp and whole units per mma tile");
 +    static_assert(NW * H * 2 * WT * 4 * 32 * sizeof(float) <= 64 * HPM_LD * sizeof(uint16_t), "K-split sums exceed the slab");
 +    constexpr int TG = NW / 2;            // token groups (two row groups of 32 slab rows each)
 +    constexpr int TP = TG * WT * 8;       // tokens per item
 +    extern __shared__ uint32_t hpm_shm[];
-+    uint32_t * lut = hpm_shm;
-+    uint16_t * slab = (uint16_t *) (hpm_shm + (1 << HP_LP));
++    uint32_t * lut = hpm_shm;                                               // gate (or the only matrix), then up for GLU
++    uint16_t * slab = (uint16_t *) (hpm_shm + (GLU ? 2 : 1) * (1 << HP_LP));
++    uint32_t * rings = (uint32_t *) (slab + 64 * HPM_LD);                   // [NU][32 lanes][4 RB words]
 +    const int E = a.n_experts;
-+    int * bnd = (int *) (slab + 64 * HPM_LD); // routing bounds, E + 1
-+    int * toff = bnd + E + 1;                 // first token tile of each expert, E + 1
++    int * bnd = (int *) (rings + NU * 32 * 4 * RB);                     // routing bounds, E + 1
++    uint16_t * toff = (uint16_t *) (bnd + E + 1); // first token tile of each expert, E + 1 (< 2^16, checked by the launcher)
 +    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 +    const int g = lane >> 2, q = lane & 3;
 +    const int64_t units = a.rows / R;
-+    const int nx = (int) ((units + NU - 1) / NU);
++    const int nx = (int) ((units + NUM - 1) / NUM);
 +
 +    for (int i = threadIdx.x; i <= E; i += NW * 32) {
 +        bnd[i] = a.bounds[i];
@@ -1422,12 +1501,12 @@ index 0000000..38af096
 +                incl += lane >= d ? y : 0;
 +            }
 +            if (e < E) {
-+                toff[e] = run + incl - nt;
++                toff[e] = (uint16_t) (run + incl - nt);
 +            }
 +            run += __shfl_sync(0xffffffffu, incl, 31);
 +        }
 +        if (lane == 0) {
-+            toff[E] = run;
++            toff[E] = (uint16_t) run;
 +        }
 +    }
 +    __syncthreads();
@@ -1446,31 +1525,59 @@ index 0000000..38af096
 +        }
 +        e = lo;
 +        jb = bnd[lo] + (t - toff[lo]) * TP;
-+        ub = (int64_t) (it % nx) * NU;
++        ub = (int64_t) (it % nx) * NUM;
 +    };
 +#pragma unroll
 +    for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += NW * 32) {
 +        ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i);
++        if constexpr (GLU) { ((uint4 *) (lut + (1 << HP_LP)))[i] = __ldg((const uint4 *) w2.lut + i); }
 +    }
-+    const uint32_t * lst = w.stream;
-+    hp_dec dec[IL];
++    // unit slot of a warp's stream -> matrix and unit within the item (GLU: per 32-row group SB gate slots, then SB up)
++    const bool second = GLU && warp % (2 * SB) >= SB;
++    const int uslot = GLU ? warp / (2 * SB) * SB + warp % SB : warp * IL;
++    const hp_ptrs wm = second ? w2 : w;
++    const uint32_t * lst = wm.stream;
++    const uint32_t * lutm = second ? lut + (1 << HP_LP) : lut;
++    hp_dec qdec[IL];                // RB = 0
++    hp_rdec<RB ? RB : 2> dec[IL];   // RB > 0
 +    const uint8_t * up[IL];
 +    uint4 smv[IL][RS]; // plane rows of the next step
-+    auto start = [&](int e, int64_t ub) {
++    uint32_t nidx[IL]; // RB: lane stream starts of the next item
++    if constexpr (RB > 0) {
 +#pragma unroll
 +        for (int il = 0; il < IL; il++) {
-+            const int64_t u = ub + warp * IL + il;
-+            const int64_t gu = (int64_t) e * units + (u < units ? u : ub); // a missing unit decodes unit ub; never stored
-+            hp_dec_begin(dec[il], w, gu, lane);
-+            up[il] = w.sm + gu * R * K;
++            dec[il].ring = rings + ((warp * IL + il) * 32 + lane) * 4 * RB;
++            dec[il].key = (RB == 2 ? lane >> 2 : lane >> 1) & (RB - 1);
++        }
++    }
++    auto unit_of = [&](int e, int64_t ub, int il) {
++        const int64_t u = ub + uslot + il;
++        return (int64_t) e * units + (u < units ? u : ub); // a missing unit decodes unit ub; never stored
++    };
++    auto start = [&](int e, int64_t ub, bool first) {
++        if constexpr (RB > 0) {
++            cp_async_wait<0>(); // the old streams' last ring blocks target the same slots
++        }
++#pragma unroll
++        for (int il = 0; il < IL; il++) {
++            const int64_t gu = unit_of(e, ub, il);
++            if constexpr (RB > 0) {
++                hp_ring_begin(dec[il], lst, first ? hp_lane_start(wm, gu, lane) : nidx[il]);
++            } else {
++                hp_dec_begin(qdec[il], wm, gu, lane);
++            }
++            up[il] = wm.sm + gu * R * K;
 +#pragma unroll
 +            for (int rr = 0; rr < RS; rr++) { smv[il][rr] = ld_plane((const uint4 *) (up[il] + rr * 512) + lane); }
++        }
++        if constexpr (RB > 0) {
++            cp_async_commit();
 +        }
 +    };
 +    int e, jb;
 +    int64_t ub;
 +    locate(item, e, jb, ub);
-+    start(e, ub);
++    start(e, ub, true);
 +    const int rg = warp % 2, tg = warp / 2;
 +    const int scol = 32 * (lane >> 3) + 16 * (lane & 1) + 2 * ((lane >> 1) & 3);
 +    const uint16_t * ar = slab + (rg * 32 + (lane & 15)) * HPM_LD + (lane >> 4) * 8;
@@ -1496,6 +1603,10 @@ index 0000000..38af096
 +        int64_t nub = 0;
 +        if (next < n_items) {
 +            locate(next, ne, njb, nub);
++            if constexpr (RB > 0) {
++#pragma unroll
++                for (int il = 0; il < IL; il++) { nidx[il] = hp_lane_start(wm, unit_of(ne, nub, il), lane); }
++            }
 +        }
 +        float acc[H][2][WT][4]; // acc[0] belongs to the slice in the slab; rotated by one slice after every step
 +#pragma unroll
@@ -1509,6 +1620,11 @@ index 0000000..38af096
 +#pragma unroll 1
 +        for (int s = 0; s < C * H; s++) {
 +            const int c = s / H;
++            if (RB > 0 && s == 0) { // the item's ring blocks were started during the previous item
++                cp_async_wait<0>();
++#pragma unroll
++                for (int il = 0; il < IL; il++) { hp_ring_first(dec[il], lst); }
++            }
 +#pragma unroll
 +            for (int rr = 0; rr < RS; rr++) {
 +                const int p = s * RS + rr; // plane row in stream order: chunk-major, (c * R + row) * 512
@@ -1523,8 +1639,15 @@ index 0000000..38af096
 +                }
 +#pragma unroll
 +                for (int qq = 0; qq < 8; qq++) {
++                    if constexpr (RB > 0) {
++                        if (qq % 2 == 0) { cp_async_wait<WG>(); }
 +#pragma unroll
-+                    for (int il = 0; il < IL; il++) { ex[il][qq] = hp_pair(dec[il], qq, lst, lut); }
++                        for (int il = 0; il < IL; il++) { ex[il][qq] = hp_ring_pair(dec[il], qq, lst, lutm); }
++                        if (qq % 2 == 1) { cp_async_commit(); }
++                    } else {
++#pragma unroll
++                        for (int il = 0; il < IL; il++) { ex[il][qq] = hp_pair(qdec[il], qq, lst, lutm); }
++                    }
 +                }
 +#pragma unroll
 +                for (int il = 0; il < IL; il++) {
@@ -1537,7 +1660,7 @@ index 0000000..38af096
 +                }
 +            }
 +            if (s == C * H - 1 && next < n_items) { // this item's streams are consumed: start the next item's
-+                start(ne, nub);
++                start(ne, nub, false);
 +            }
 +            __syncthreads();
 +            if (live) {
@@ -1622,7 +1745,31 @@ index 0000000..38af096
 +                }
 +            }
 +        }
-+        if (live && ks == 0) {
++        if (GLU && live && ks == 0) { // tile 0 of the row group = gate rows, tile 1 = the same up rows
++#pragma unroll
++            for (int sl = 0; sl < H; sl++) {
++#pragma unroll
++                for (int hh = 0; hh < 2; hh++) {
++                    const int rho = g + 8 * hh;                 // row within the tile
++                    const int64_t u = ub + rg * SB + rho / RS;  // unit
++                    if (u >= units) {
++                        continue;
++                    }
++                    const int64_t row = u * R + sl * RS + rho % RS;
++#pragma unroll
++                    for (int i = 0; i < WT; i++) {
++#pragma unroll
++                        for (int t = 0; t < 2; t++) {
++                            if (dc[i][t] >= 0) {
++                                a.dst[(int64_t) dc[i][t] * a.dst_col + row] =
++                                    acc[sl][1][i][2 * hh + t] * ggml_cuda_op_silu_single(acc[sl][0][i][2 * hh + t]);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        if (!GLU && live && ks == 0) {
 +#pragma unroll
 +            for (int sl = 0; sl < H; sl++) {
 +#pragma unroll
@@ -1654,6 +1801,7 @@ index 0000000..38af096
 +        __syncthreads(); // the K-split sums were read from the slab
 +    }
 +}
++
 +
 +nib_ptrs nibp(const entry & e) { return {e.base, e.nib, e.lut_row, e.esc_off, e.esc}; }
 +huf_ptrs hufp(const entry & e) { return {e.base, e.hlut, e.lane_off, e.stream}; }
@@ -1771,28 +1919,37 @@ index 0000000..38af096
 +// (chunks per row, rows per unit) pairs with a batched kernel instance: slab of 64 rows
 +bool hpm_config(int C, int R) { return (C == 4 && R == 8) || (C == 1 && R == 16); }
 +
-+void launch_mm_ids(const entry & e, const hpm_args & a, int n_experts, int n_tok, int n_used, cudaStream_t stream) {
++// u: the up matrix of a fused gate/up + SWIGLU (dst = silu(gate) * up), or nullptr
++void launch_mm_ids(const entry & e, const entry * u, const hpm_args & a, int n_experts, int n_tok, int n_used, cudaStream_t stream) {
 +    // Units interleaved per warp (independent decode chains) for down's 8 warps while the experts have few tokens and
 +    // decode dominates; one unit per warp, and so more tokens per item, once the tensor cores have enough work. Gate/up
 +    // (16 warps) is fastest with one at every token count. Measured with bench/moe_prefill.cpp on Orin (T-006).
 +    const int64_t routed = (int64_t) n_tok * n_used; // / n_experts = average tokens per expert
 +    const int il = e.K != 512 ? 1 : routed <= 24 * (int64_t) n_experts ? 4 : routed <= 48 * (int64_t) n_experts ? 2 : 1;
-+#define MM(CC, RR, NW, IL, WT)                                                                                         \
-+    case CC * 1000 + RR * 10 + IL: {                                                                                   \
-+        const size_t shm = (4u << HP_LP) + 64 * HPM_LD * 2 + 2 * (n_experts + 1) * sizeof(int);                      \
++    GGML_ASSERT(routed / 8 + n_experts < 65536); // token tiles (>= 8 tokens each) fit the kernel's 16-bit tile offsets
++#define MM(CC, RR, NW, IL, WT, B, G)                                                                                   \
++    {                                                                                                                  \
++        const size_t shm = ((G ? 8u : 4u) << HP_LP) + 64 * HPM_LD * 2 + NW * IL * 32 * 16 * B +                      \
++            (n_experts + 1) * (sizeof(int) + sizeof(uint16_t));                                                        \
 +        static size_t attr = 0;                                                                                        \
 +        if (attr < shm) {                                                                                              \
-+            CUDA_CHECK(cudaFuncSetAttribute(k_hp_mm_ids<CC, RR, NW, IL, WT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm)); \
++            CUDA_CHECK(cudaFuncSetAttribute(k_hp_mm_ids<CC, RR, NW, IL, WT, B, G>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm)); \
 +            attr = shm;                                                                                                \
 +        }                                                                                                              \
-+        k_hp_mm_ids<CC, RR, NW, IL, WT><<<sm_count(), NW * 32, shm, stream>>>(hpp(e), a);                              \
-+    } break;
-+    switch ((int) (e.K / 512) * 1000 + e.R * 10 + il) {
-+        MM(4, 8, 16, 1, 2)
-+        MM(1, 16, 8, 1, 4)
-+        MM(1, 16, 8, 2, 2)
-+        MM(1, 16, 8, 4, 1)
-+        default: GGML_ABORT("bf16n: no batched kernel for this K/R");
++        k_hp_mm_ids<CC, RR, NW, IL, WT, B, G><<<sm_count(), NW * 32, shm, stream>>>(hpp(e), hpp(G ? *u : e), a);        \
++    }
++    // lane-stream rings (RB = 2) where a warp decodes one or two streams, the register queue for down's four (T-019)
++    if (u) {
++        GGML_ASSERT(e.K == 2048 && e.R == 8 && u->K == e.K && u->R == e.R);
++        MM(4, 8, 16, 1, 2, 2, true)
++    } else {
++        switch ((int) (e.K / 512) * 1000 + e.R * 10 + il) {
++            case 4081: MM(4, 8, 16, 1, 2, 2, false) break;
++            case 1161: MM(1, 16, 8, 1, 4, 2, false) break;
++            case 1162: MM(1, 16, 8, 2, 2, 2, false) break;
++            case 1164: MM(1, 16, 8, 4, 1, 0, false) break;
++            default: GGML_ABORT("bf16n: no batched kernel for this K/R");
++        }
 +    }
 +#undef MM
 +    CUDA_CHECK(cudaGetLastError());
@@ -1904,8 +2061,9 @@ index 0000000..38af096
 +        ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t);
 +}
 +
-+void ggml_cuda_bf16n_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-+        const ggml_tensor * ids, ggml_tensor * dst) {
++// u: up matrix of a fused gate/up + SWIGLU (dst = the GLU output), or nullptr
++static void ggml_cuda_bf16n_mul_mat_id_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const entry * u,
++        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
 +    int64_t row0 = 0;
 +    const entry * e = lookup(src0->data, row0);
 +    cudaStream_t stream = ctx.stream();
@@ -1918,7 +2076,33 @@ index 0000000..38af096
 +    ggml_cuda_pool_alloc<nv_bfloat16> x(ctx.pool(), ggml_nelements(src1));
 +    ggml_get_to_bf16_cuda(GGML_TYPE_F32)(src1->data, x.get(), ggml_nelements(src1), stream);
 +    const hpm_args a = { x.get(), src1->ne[0], ids_src1.get(), ids_dst.get(), bounds.get(), (float *) dst->data, dst->ne[0], src0->ne[1], n_experts };
-+    launch_mm_ids(*e, a, n_experts, n_tok, n_used, stream);
++    launch_mm_ids(*e, u, a, n_experts, n_tok, n_used, stream);
++}
++
++void ggml_cuda_bf16n_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++        const ggml_tensor * ids, ggml_tensor * dst) {
++    ggml_cuda_bf16n_mul_mat_id_impl(ctx, src0, nullptr, src1, ids, dst);
++}
++
++bool ggml_cuda_bf16n_mul_mat_id_glu_supported(const ggml_tensor * gate_w, const ggml_tensor * up_w, const ggml_tensor * src1,
++        const ggml_tensor * ids, const ggml_tensor * glu) {
++    static const bool no_glu = getenv("GGML_BF16N_NO_GLU") != nullptr;
++    if (no_glu || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 || ids->ne[1] <= 8 ||
++            gate_w->type != GGML_TYPE_BF16N || up_w->type != GGML_TYPE_BF16N || !ggml_are_same_shape(gate_w, up_w) ||
++            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || glu->ne[0] != gate_w->ne[1] ||
++            !ggml_cuda_bf16n_mul_mat_id_supported(gate_w, src1, ids, glu) || !ggml_cuda_bf16n_mul_mat_id_supported(up_w, src1, ids, glu)) {
++        return false;
++    }
++    int64_t rg = 0, ru = 0;
++    const entry * g = lookup(gate_w->data, rg);
++    const entry * u = lookup(up_w->data, ru);
++    return g->K == 2048 && g->R == 8 && u->K == g->K && u->R == g->R;
++}
++
++void ggml_cuda_bf16n_mul_mat_id_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
++        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu) {
++    int64_t ru = 0;
++    ggml_cuda_bf16n_mul_mat_id_impl(ctx, gate_w, lookup(up_w->data, ru), src1, ids, glu);
 +}
 +
 +void ggml_cuda_bf16n_dequant_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, void * out) {
@@ -2090,10 +2274,10 @@ index 0000000..38af096
 +}
 diff --git a/ggml/src/ggml-cuda/bf16n.cuh b/ggml/src/ggml-cuda/bf16n.cuh
 new file mode 100644
-index 0000000..cda847b
+index 0000000..f247f4a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/bf16n.cuh
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,43 @@
 +#pragma once
 +
 +#include "common.cuh"
@@ -2124,6 +2308,11 @@ index 0000000..cda847b
 +                                          const ggml_tensor * dst);
 +void ggml_cuda_bf16n_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
 +                                const ggml_tensor * ids, ggml_tensor * dst);
++// the same for gate and up of MUL_MAT_ID, MUL_MAT_ID, GLU(SWIGLU) in one kernel: dst = the GLU output
++bool ggml_cuda_bf16n_mul_mat_id_glu_supported(const ggml_tensor * gate_w, const ggml_tensor * up_w, const ggml_tensor * src1,
++                                              const ggml_tensor * ids, const ggml_tensor * glu);
++void ggml_cuda_bf16n_mul_mat_id_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
++                                    const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
 +
 +// GET_ROWS with a BF16N source (token embedding), F32 destination
 +void ggml_cuda_bf16n_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
@@ -3134,7 +3323,7 @@ index f9bf437..ee17876 100644
  void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                                ggml_cuda_gated_delta_net_fused_cache cache);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7905538..b86b7bc 100644
+index 7905538..797a392 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3,6 +3,7 @@
@@ -3257,10 +3446,18 @@ index 7905538..b86b7bc 100644
      if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
       && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
          const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
-@@ -3950,6 +4007,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3950,6 +4007,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up->src[1];
              const ggml_tensor * ids  = up->src[2];
  
++            if (src0->type == GGML_TYPE_BF16N && !ggml_cuda_bf16n_reference() && ids && gate->src[1] == src1 && gate->src[2] == ids &&
++                    ggml_cuda_bf16n_mul_mat_id_glu_supported(gate->src[0], src0, src1, ids, glu)) {
++                ggml_cuda_bf16n_mul_mat_id_glu(*cuda_ctx, gate->src[0], src0, src1, ids, glu);
++                fused_mul_mat_vec = true;
++                fused_node_count  = 3;
++                break;
++            }
++
 +            if (src0->type == GGML_TYPE_BF16N && !ggml_cuda_bf16n_reference() && gate->src[1] == src1 && gate->src[2] == ids &&
 +                    ggml_cuda_bf16n_can_fuse_glu(gate->src[0], src0, src1, ids, glu)) {
 +                ggml_cuda_bf16n_mul_mat_vec_glu(*cuda_ctx, gate->src[0], src0, src1, ids, glu);
@@ -3272,7 +3469,7 @@ index 7905538..b86b7bc 100644
              if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
-@@ -4152,6 +4217,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4152,6 +4225,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -3284,7 +3481,7 @@ index 7905538..b86b7bc 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
          ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
-@@ -4280,6 +4350,44 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4280,6 +4358,44 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  stream_ctx.concurrent_events.clear();
              }
  
@@ -3329,7 +3526,7 @@ index 7905538..b86b7bc 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
                  if (is_concurrent_event_active) {
-@@ -4314,7 +4422,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4314,7 +4430,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  prev_i = i;
  
@@ -3338,7 +3535,7 @@ index 7905538..b86b7bc 100644
                      continue;
                  }
  
-@@ -5173,6 +5281,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5173,6 +5289,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_IQ4_XS:
                      case GGML_TYPE_BF16:
                          return true;
@@ -3347,7 +3544,7 @@ index 7905538..b86b7bc 100644
                      default:
                          return false;
                  }
-@@ -5212,6 +5322,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5212,6 +5330,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
@@ -3356,7 +3553,7 @@ index 7905538..b86b7bc 100644
                      default:
                          return false;
                  }
-@@ -5695,6 +5807,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -5695,6 +5815,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }

@@ -27,19 +27,23 @@ during the current one's last step, units interleaved per warp for down at small
 306 / 530 / 613 to 665 / 943 / 1018 tok/s (pp8192 at `-ub 512 / 2048 / 4096`, pinned clocks) for −0.3 % decode, and
 upstream's chunked gated delta net (ported; 3.3 instead of 15.8 ms per layer for 2048 tokens) took it to
 760 / 1153 / 1283, and upstream's newer norm and conversion kernels (fused RMS_NORM + SCALE, float4 `rms_norm`, four
-elements per thread in the F32→BF16 conversion) to 800 / 1249 / 1403. The "12 % GPU idle" of the first profile was cold
-start; steady state is ≈ 2–3 %. A 2048-token forward at `-ub 2048` (≈ 1.65 s) now spends 53 % in the MoE kernel, 11 % in
-cuBLAS for the dense matrices, 6 % in the gated delta net, 4.3 % in F32→BF16 conversions, 3.3 % in SwiGLU, 2.8 % in
-`rms_norm`, 2.2 % each in the weighted sum of the experts and the broadcast adds, 2.1 % in `ssm_conv`.
+elements per thread in the F32→BF16 conversion) to 800 / 1249 / 1403, and lane-stream rings plus a fused gate / up /
+SwiGLU MoE kernel ([RESULTS.md](RESULTS.md#prefill-moe-kernel-latency-lane-stream-rings-fused-swiglu)) to
+811 / 1279 / 1429. The "12 % GPU idle" of the first profile was cold start; steady state is ≈ 2–3 %. Before the last
+step a 2048-token forward at `-ub 2048` (≈ 1.65 s) spent 53 % in the MoE kernel, 11 % in cuBLAS for the dense
+matrices, 6 % in the gated delta net, 4.3 % in F32→BF16 conversions, 3.3 % in SwiGLU (now fused), 2.8 % in `rms_norm`,
+2.2 % each in the weighted sum of the experts and the broadcast adds, 2.1 % in `ssm_conv`.
 
-1. **MoE kernel** (53 %): decode and products now overlap; at ≥ 2048 tokens down is bound by its tensor-core phase
-   (products alone 6.5 ms at 2048 tokens, ≈ 5.3 TFLOPS), and its single-chain variant (IL1, ≥ 1537 tokens) runs ≈ 11 %
-   slower than a schedule the compiler produced once (9.5 vs 10.6 ms at 2048 tokens) but that no clean source form has
-   reproduced yet. Open: the board's measured BF16 `mma` peak, `ldmatrix` and larger token tiles for down.
-2. **Conversions** (4.3 %, now at bandwidth): every BF16N matmul converts its F32 input again, 349 conversions per
-   forward for ≈ 80 distinct tensors. Converting each tensor once is worth ≈ 2 % and needs a BF16 buffer that lives
-   across ops and stays valid under CUDA graph replay; a fused gate/up + SwiGLU MoE kernel would remove the largest
-   share (and the 3.3 % SwiGLU pass) as a side effect.
+1. **MoE kernel** (≈ 50 %): latency-bound, not compute-bound. Nsight Compute and an oracle show that hiding the
+   activation loads would cut a layer by 22–25 % at 2048 tokens, but this kernel shape has no registers (gate: 128 at
+   512 threads) or shared memory (the 64-row slab) left to do it. Planned after the decode work: a layout of the expert
+   tensors in tensor-core fragment order, so each lane decodes exactly its `mma` A-fragment elements and multiplies them
+   at once — no slab, no barrier between decode and products, the activations staged once per block by `cp.async` and
+   shared by all warps (as Marlin does for 4-bit weights). Estimate ≈ 22 → ≈ 14 ms per layer at 2048 tokens; the expert
+   GEMV of the decode path must move to the same layout without losing speed, so it is planned together with decode.
+2. **Conversions** (≈ 4 %, at bandwidth): every BF16N matmul converts its F32 input again (≈ 300 conversions per
+   forward for ≈ 80 distinct tensors). Converting each tensor once is worth ≈ 2 % and needs a BF16 buffer that lives
+   across ops and stays valid under CUDA graph replay.
 3. **Dense matrices** (10.4 % + 1.6 % dequant): run them through the same decode-in-shared-memory kernel instead of
    dequantising to BF16 per micro-batch. By a parameter-count estimate (≈ 5.8 TFLOP in 190 ms) cuBLAS already runs at
    ≈ 30 TFLOPS, so the gain is mostly the dequant.

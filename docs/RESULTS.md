@@ -346,6 +346,69 @@ Per-shape kernel throughput (microbenchmarks in `bench/`, real weights, working 
 `bench/bwprobe.cu`: best plain streaming read is 180 GB/s (88 % of 204.8 GB/s); HUFPAIR kernels reach 150–175 GB/s of
 compressed bytes.
 
+## Prefill: MoE kernel latency (lane-stream rings, fused SwiGLU)
+
+At 9077d0c the MoE path was ≈ 61 % of a 2048-token forward at `-ub 2048`: gate + up 475 ms, down 400 ms, SwiGLU 51 ms,
+weighted sum 37 ms, conversions 33 ms, routing helper 17 ms per forward. Nsight Compute (`moe_prefill`, layer 20,
+2048 tokens) shows a latency-bound kernel: gate issues an instruction in 25 % of cycles and keeps the tensor cores 15 %
+busy; 43 % of stall samples wait on global loads, 19 % on barriers. Two instructions take most of it: the first `mma`
+of each group waiting for its activation fragment (20 % of all samples; the load is issued one group ahead and mostly
+hits L2) and the moves of the decoder's word queue (≈ 20 %).
+
+The queue looks four words deep but behaves like one. Lanes refill at different pair positions while the scoreboard is
+per warp register, so moving `wq[k]` waits for the newest load into `wq[k]` by any lane. A deeper or batched register
+queue keeps that property (and spilled: 2.6× slower). Software prefetch does not help either: `prefetch.global.L1`
+(CCTL.E.PF1) halves the `mma` waits but crowds the MIO queue, `prefetch.global.L2` doubles the decoder's load waits
+(gate +22–24 %).
+
+An oracle bounds the prize: replacing loads by register values (garbage output) cuts gate / down at 2048 tokens by
+17 / 23 % (lane-stream words), 10 / 12 % (sign|mantissa planes), 3 / 23 % (activations) and 45 / 49 % for all three.
+The effects add up super-linearly; the loads queue behind each other.
+
+What the patch does, all bitwise equal to the previous kernel (output hash in `moe_prefill`, CPU reference, and logits):
+
+* **Lane-stream rings.** Each lane reads its stream through a ring of two 16-byte blocks in shared memory filled by
+  `cp.async`; a group is committed at each of the four refill points of a row and a refill point lets four groups pend.
+  Nothing waits on a register any more; the decoder's long-scoreboard stalls disappear. Rings are used where a warp
+  decodes one or two streams (gate/up, down above 768 tokens). Down with four interleaved streams per warp (up to 768
+  tokens) keeps the register queue: there its independent chains hide the latency, and the rings were 13 % slower.
+* **Fused gate / up / SwiGLU.** One work item takes the same rows of gate and up; in each 32-row group of the slab the
+  first 16-row `mma` tile holds gate rows and the second the same up rows, so a thread holds both values of its outputs
+  and writes `silu(gate) · up`. This removes the SwiGLU pass, one F32→BF16 conversion and one routing helper per layer.
+  Fused vs unfused GPU ops: 0 of 8.4 M values differ at 2048 tokens (also at 9, 100, 512, skewed and uniform).
+* Tile offsets in shared memory are 16-bit, so gate's shared memory (LUT, slab, rings, bounds) still fits the 100 KB
+  carve-out. The L1 matters: the activations of two warps that share tokens meet there. With 66 KB of dummy shared
+  memory (L1 92 → 28 KB) the old gate kernel ran 30 % slower.
+
+Per matrix (`moe_prefill`, layer 20, ms, median of 20; previous = the 9077d0c library):
+
+| | tokens | previous | this patch |
+|---|---:|---:|---:|
+| gate + up + SwiGLU (fused vs separate ops) | 512 | 8.44 (skewed 8.72) | **8.08** (8.36) |
+| | 2048 | 13.40 (14.09) | **12.45** (13.21) |
+| down | 512 | 4.83 (5.34) | 4.82 (5.32) |
+| | 1024 | 6.71 (7.38) | **6.40** (7.34) |
+| | 2048 | 10.41 (11.49) | **9.56** (10.81) |
+
+End to end, alternating 9077d0c / this patch, two rounds, pinned clocks, desktop stopped, caches dropped per process,
+tok/s:
+
+| | 9077d0c | this patch | change |
+|---|---:|---:|---:|
+| pp8192, `-ub 512` | 800.3 / 798.4 | **812.0 / 810.9** | +1.5 % |
+| pp8192, `-ub 2048` | 1248.5 / 1247.3 | **1280.5 / 1278.1** | +2.5 % |
+| pp8192, `-ub 4096` | 1399.1 / 1389.3 | **1431.3 / 1426.7** | +2.5 % |
+| tg64 @ 0 / @ 2048 | 31.13 / 31.16, 31.12 / 31.12 | 31.17 / 31.21, 31.09 / 31.14 | unchanged |
+
+Logits against 9077d0c (wikitext-2, 8 × 2048, `-ub 512` and `-ub 2048`): mean KLD 0.000000, maximum 5.7e-5 (the
+precision of the stored logits, the same as 9077d0c against itself), same top-1 100 %.
+
+What is left is the activation side: with the rings in place, the first `mma` of a group waiting for its activations
+is 23 % (gate) / 17 % (down) of the samples, the barrier after the products 13 % / 8 %. Removing the activation loads
+altogether (oracle) would cut a layer by 22–25 % at 2048 tokens and 10–13 % at 512. Hiding them inside this kernel
+runs into its own budget: gate is at 128 registers for 512 threads and the slab leaves no shared memory for an
+activation tile. A different kernel shape is sketched in [ROADMAP.md](ROADMAP.md).
+
 ## Correctness
 
 * Weights: bit-exact round trip for every tensor (see above).
@@ -376,3 +439,8 @@ compressed bytes.
 * A plane prefetch ring in the chunk-major GEMV that runs on across chunk boundaries (64 registers, no spills):
   tg64 30.46 vs 30.54 for the ring that restarts per chunk, within noise.
 * The tiled conv-state concat for one token (decode): −0.85 % decode; it is now used only from 32 × 32 up.
+* MoE prefill kernel: software prefetch of activations (`prefetch.global.L1`) or of the next item (`prefetch.global.L2`):
+  gate +22–24 %; a batched register queue for the lane streams: spills, 2.6× slower; activation fragments 3–4 groups
+  ahead in registers: 13–16 % slower even at depth 2 with a generic loop (same semantics as the hand-written
+  two-buffer loop; not understood); plane rows staged in shared memory by `cp.async`: frees 16 registers but takes L1
+  from the activations, 1 % slower than plane rows in registers.
