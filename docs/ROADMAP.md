@@ -1,18 +1,19 @@
 # Roadmap: next research stages
 
-Where the time goes today, and what is left on the table. Numbers are per decode step (≈ 33 ms at ≈ 30 tok/s) on the
+Where the time goes today, and what is left on the table. Numbers are per decode step (≈ 32 ms at ≈ 31 tok/s) on the
 AGX Orin 64GB unless stated otherwise; "gain" estimates come from the measurements in [RESULTS.md](RESULTS.md) and are
 hypotheses until measured with alternating A/B runs.
 
 ## Ceiling
 
-A decode step streams ≈ 4.0 GB of compressed weights; at the 180 GB/s the board can actually read, that is **≈ 22 ms
-(≈ 45 tok/s)** for this format. At short context, today's ≈ 33 ms splits roughly into (long context adds KV-cache
-traffic on top, see Stage 2):
+A decode step streams ≈ 4.0 GB of compressed weights; at the 180 GB/s a plain stream reads, that is **≈ 22 ms
+(≈ 45 tok/s)** for this format. The GEMVs' own access pattern (a 512-byte plane row and 32 lane streams per warp) reads
+at ≈ 161–170 GB/s, so the practical ceiling with every overhead removed is **≈ 40 tok/s**. At short context, today's
+≈ 32 ms splits roughly into (long context adds KV-cache traffic on top, see Stage 2):
 
 | part | ms | gap to its own floor |
 |---|---:|---|
-| pair-Huffman GEMV (experts, lm_head, projections) | ≈ 26 | runs at ≈ 75 % of bandwidth: per-launch ramp-up and tails over ≈ 230 launches |
+| pair-Huffman GEMV (experts, lm_head, projections) | ≈ 26 | work phase at the pattern's DRAM limit; ≈ 3 ms is fixed per launch (cold prologue + tail, ≈ 13 µs) over ≈ 230 launches |
 | ≈ 1000 tiny kernels (norms, adds, router, α/β, conv state, GLU) | ≈ 3.3 | almost entirely fixed launch/start cost, 1.5–8 µs each |
 | small NIBBLE matrices (shared expert, k/v, α/β, router) | ≈ 2.5 | latency-bound, 1 row per warp |
 | gated delta net, attention, host/launch gap | ≈ 1.5 | close to their floors |
@@ -72,7 +73,14 @@ at 256K decode is 14.4 tok/s.
 
 ## Stage 3 — fewer, fatter kernels in the decode step (+10–20 %, medium–large)
 
-Graph-level fusions in ggml-cuda for the patterns this model repeats 30–40 times per token:
+The main item is a persistent decode kernel per layer (or per block of it): one launch runs the layer's GEMVs and small
+ops as stages with grid-wide barriers, and the next stage's independent prologue (exponent table, unit offsets, first
+stream words and plane rows) is issued before the barrier, so it overlaps the current stage's tail instead of following
+it. Estimate: ≈ 2 ms of the per-launch cost plus ≈ 2 ms of small kernels, ≈ +12–15 % (31 → ≈ 35 tok/s). The GEMV
+stages should take the expert layout as a parameter, since the prefill plan (Stage 1) wants a fragment-order layout.
+
+Smaller graph-level fusions for the patterns this model repeats 30–40 times per token (each ≈ 1 %, worth it only
+bundled or inside the persistent kernel):
 
 * `rms_norm × weight` folded into the prologue of every BF16N GEMV that consumes it (the GEMV stages x anyway).
 * router GEMV + shared-expert gate (same input) in one launch; α and β projections of the gated delta net in one launch.
@@ -81,7 +89,10 @@ Graph-level fusions in ggml-cuda for the patterns this model repeats 30–40 tim
 
 Measure each with the node-level nsys breakdown (`docs/RESULTS.md`) and alternating llama-bench runs.
 
-## Stage 4 — GEMV efficiency (+3–8 %, medium)
+## Stage 4 — GEMV efficiency (+1–3 %, medium)
+
+The work phase is already at the DRAM limit of the access pattern; `cp.async` rings that remove the long-scoreboard
+stalls did not make it faster ([RESULTS.md](RESULTS.md#what-did-not-help-measured)). What is left here is the tail:
 
 * Balance per-launch tails: smaller units (`R`) with dynamic work distribution so the slowest warp does not set the
   kernel time; measure the warp finish-time spread with the `DIAG` mode of `bench/hufpair_gemv.cu`.

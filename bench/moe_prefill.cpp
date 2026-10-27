@@ -7,6 +7,7 @@
 //
 // tensor: e.g. blk.20.ffn_gate_exps.weight (K x N x E). Each token picks 8 distinct experts; skew > 0 draws them with
 // probability ~ (rank + 1)^-skew over a random expert order (0: uniform). GGML_BF16N_NO_MMA=1 selects the old path.
+// A 2-D tensor (blk.20.attn_qkv.weight) runs as a plain MUL_MAT (the decode GEMV for up to 8 tokens).
 // A name with "gate_up" (blk.20.ffn_gate_up_exps.weight) times gate, up and SWIGLU as one graph (fused when the backend
 // can; GGML_BF16N_NO_GLU=1 disables it), compares it bitwise with the same ops computed unfused on the GPU, and checks it
 // against silu(gate) * up from the CPU reference.
@@ -42,8 +43,6 @@ int main(int argc, char ** argv) {
     if (reps < 1) { fprintf(stderr, "reps must be >= 1\n"); return 1; }
     const double skew = argc > 5 ? atof(argv[5]) : 0.0;
     const int check_cols = argc > 6 ? atoi(argv[6]) : 64;
-    const int n_used = 8;
-
     ggml_context * meta = nullptr;
     gguf_init_params gp = { /*no_alloc*/ true, &meta };
     gguf_context * g = gguf_init_from_file(path, gp);
@@ -52,11 +51,13 @@ int main(int argc, char ** argv) {
     const size_t gu_at = sname.find("gate_up");
     const bool glu = gu_at != std::string::npos;
     int64_t K = 0, N = 0, E = 0;
+    bool dense = false; // 2-D weight: MUL_MAT instead of MUL_MAT_ID
     auto read_tensor = [&](const std::string & tn, std::vector<uint16_t> & out) {
         const int64_t tid = gguf_find_tensor(g, tn.c_str());
         if (tid < 0) { fprintf(stderr, "no tensor %s\n", tn.c_str()); exit(1); }
         const ggml_tensor * tm = ggml_get_tensor(meta, tn.c_str());
-        if (tm->type != GGML_TYPE_BF16 || ggml_n_dims(tm) != 3) { fprintf(stderr, "%s: need a 3-D BF16 tensor\n", tn.c_str()); exit(1); }
+        if (tm->type != GGML_TYPE_BF16 || ggml_n_dims(tm) < 2 || ggml_n_dims(tm) > 3) { fprintf(stderr, "%s: need a 2-D or 3-D BF16 tensor\n", tn.c_str()); exit(1); }
+        dense = ggml_n_dims(tm) == 2;
         if (K && (tm->ne[0] != K || tm->ne[1] != N || tm->ne[2] != E)) { fprintf(stderr, "%s: shape differs\n", tn.c_str()); exit(1); }
         K = tm->ne[0]; N = tm->ne[1]; E = tm->ne[2];
         out.resize(K * N * E);
@@ -77,19 +78,22 @@ int main(int argc, char ** argv) {
     } else {
         read_tensor(sname, w);
     }
-    const bool down = strstr(name, "down") != nullptr; // down: one input row per (token, slot)
+    if (glu && dense) { fprintf(stderr, "gate_up needs expert tensors\n"); return 1; }
+    const int n_used = dense ? 1 : 8;
+    const bool down = !dense && strstr(name, "down") != nullptr; // down: one input row per (token, slot)
     const int64_t ne11 = down ? n_used : 1;
     printf("%s: K=%lld N=%lld E=%lld, tokens %d, skew %.2f\n", name, (long long) K, (long long) N, (long long) E, T, skew);
 
     ggml_backend_t be = ggml_backend_cuda_init(0);
     ggml_init_params ip = { 16 * ggml_tensor_overhead() + 2 * ggml_graph_overhead(), nullptr, /*no_alloc*/ true }; // 2 graphs for gate_up
     ggml_context * ctx = ggml_init(ip);
-    ggml_tensor * W = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16N, K, N, E);
+    ggml_tensor * W = dense ? ggml_new_tensor_2d(ctx, GGML_TYPE_BF16N, K, N) : ggml_new_tensor_3d(ctx, GGML_TYPE_BF16N, K, N, E);
     ggml_tensor * W2 = glu ? ggml_new_tensor_3d(ctx, GGML_TYPE_BF16N, K, N, E) : nullptr;
-    ggml_tensor * X = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, ne11, T);
-    ggml_tensor * I = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, T);
-    ggml_tensor * Y = glu ? ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, W, X, I), ggml_mul_mat_id(ctx, W2, X, I))
-                          : ggml_mul_mat_id(ctx, W, X, I);
+    ggml_tensor * X = dense ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, T) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, ne11, T);
+    ggml_tensor * I = dense ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, T);
+    ggml_tensor * Y = dense ? ggml_mul_mat(ctx, W, X)
+                    : glu   ? ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, W, X, I), ggml_mul_mat_id(ctx, W2, X, I))
+                            : ggml_mul_mat_id(ctx, W, X, I);
     // the same GLU with a second consumer of the gate result, which keeps the backend from fusing it
     ggml_tensor * G2 = glu ? ggml_mul_mat_id(ctx, W, X, I) : nullptr;
     ggml_tensor * Y2 = glu ? ggml_swiglu_split(ctx, G2, ggml_mul_mat_id(ctx, W2, X, I)) : nullptr;
@@ -124,7 +128,7 @@ int main(int argc, char ** argv) {
     printf("tokens per expert: max %d, mean %.1f, experts used %lld\n", *std::max_element(tok_per_e.begin(), tok_per_e.end()),
            (double) T * n_used / E, (long long) std::count_if(tok_per_e.begin(), tok_per_e.end(), [](int c) { return c > 0; }));
     ggml_backend_tensor_set(X, x.data(), 0, ggml_nbytes(X));
-    ggml_backend_tensor_set(I, ids.data(), 0, ggml_nbytes(I));
+    if (I) { ggml_backend_tensor_set(I, ids.data(), 0, ggml_nbytes(I)); }
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, Y);

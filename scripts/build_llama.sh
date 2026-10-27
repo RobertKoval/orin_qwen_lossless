@@ -5,17 +5,17 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 dir="${1:-llama.cpp}"
-commit=b29c606e28a01b1bc8c1351026a0fa6e616bf6c4
+commit=338fce6511c744893cc0d3d958b275f40552c7a4
 
 if [ ! -d "$dir/.git" ]; then
     git clone https://github.com/ggml-org/llama.cpp "$dir"
 fi
 cd "$dir"
 git checkout --quiet "$commit"
-if git apply --check "$here/patches/llama.cpp-b29c606-bf16n.patch" 2>/dev/null; then
-    git apply "$here/patches/llama.cpp-b29c606-bf16n.patch"
+if git apply --check "$here/patches/llama.cpp-338fce6-bf16n.patch" 2>/dev/null; then
+    git apply "$here/patches/llama.cpp-338fce6-bf16n.patch"
 else
-    git apply --reverse --check "$here/patches/llama.cpp-b29c606-bf16n.patch" # already applied, else fail loudly
+    git apply --reverse --check "$here/patches/llama.cpp-338fce6-bf16n.patch" # already applied, else fail loudly
 fi
 
 cmake -B build \

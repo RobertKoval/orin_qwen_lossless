@@ -1,46 +1,50 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="348" viewBox="0 0 760 348" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="Decode speed, Qwen3.6-35B-A3B on Jetson AGX Orin 64GB">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="388" viewBox="0 0 760 388" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="Decode speed, Qwen3.6-35B-A3B on Jetson AGX Orin 64GB">
 <title>Decode speed, Qwen3.6-35B-A3B on Jetson AGX Orin 64GB</title>
-<rect x="0.5" y="0.5" width="759" height="347" rx="12" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<rect x="0.5" y="0.5" width="759" height="387" rx="12" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
 <text x="24" y="36" font-size="17" font-weight="600" fill="#0b0b0b">Decode speed, Qwen3.6-35B-A3B on Jetson AGX Orin 64GB</text>
 <text x="24" y="58" font-size="13" fill="#52514e">single sequence, greedy, after a 2048-token context, tokens per second</text>
-<line x1="329.4" y1="86" x2="329.4" y2="296" stroke="#e1e0d9" stroke-width="1"/>
-<text x="329.4" y="314" font-size="11" fill="#898781" text-anchor="middle">0</text>
-<line x1="378.0" y1="86" x2="378.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
-<text x="378.0" y="314" font-size="11" fill="#898781" text-anchor="middle">5</text>
-<line x1="426.7" y1="86" x2="426.7" y2="296" stroke="#e1e0d9" stroke-width="1"/>
-<text x="426.7" y="314" font-size="11" fill="#898781" text-anchor="middle">10</text>
-<line x1="475.3" y1="86" x2="475.3" y2="296" stroke="#e1e0d9" stroke-width="1"/>
-<text x="475.3" y="314" font-size="11" fill="#898781" text-anchor="middle">15</text>
-<line x1="524.0" y1="86" x2="524.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
-<text x="524.0" y="314" font-size="11" fill="#898781" text-anchor="middle">20</text>
-<line x1="572.7" y1="86" x2="572.7" y2="296" stroke="#e1e0d9" stroke-width="1"/>
-<text x="572.7" y="314" font-size="11" fill="#898781" text-anchor="middle">25</text>
-<line x1="621.3" y1="86" x2="621.3" y2="296" stroke="#e1e0d9" stroke-width="1"/>
-<text x="621.3" y="314" font-size="11" fill="#898781" text-anchor="middle">30</text>
-<line x1="670.0" y1="86" x2="670.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
-<text x="670.0" y="314" font-size="11" fill="#898781" text-anchor="middle">35</text>
-<line x1="329.36" y1="86" x2="329.36" y2="296" stroke="#c3c2b7" stroke-width="1"/>
-<text x="670" y="334" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
-<line x1="621.3" y1="82" x2="621.3" y2="296" stroke="#52514e" stroke-width="1.5"/>
-<text x="615.3" y="78" font-size="12" fill="#52514e" text-anchor="end">target 30</text>
-<g fill="#86b6ef"><path d="M329.36,101.0 H373.73088 Q377.73088,101.0 377.73088,105.0 V119.0 Q377.73088,123.0 373.73088,123.0 H329.36 Z"/></g>
-<text x="317.36" y="116.5" font-size="13" fill="#52514e" text-anchor="end">PyTorch runtime, fused TCA format</text>
-<rect x="380.7" y="101.0" width="29.8" height="22" fill="#fcfcfb"/>
-<text x="385.7" y="116.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">5.0</text>
-<g fill="#86b6ef"><path d="M329.36,141.0 H554.5620571428572 Q558.5620571428572,141.0 558.5620571428572,145.0 V159.0 Q558.5620571428572,163.0 554.5620571428572,163.0 H329.36 Z"/></g>
-<text x="317.36" y="156.5" font-size="13" fill="#52514e" text-anchor="end">BF16N v1: nibble + Huffman, fused GLU</text>
-<rect x="561.6" y="141.0" width="37.1" height="22" fill="#fcfcfb"/>
-<text x="566.6" y="156.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">23.6</text>
-<g fill="#86b6ef"><path d="M329.36,181.0 H601.7650285714285 Q605.7650285714285,181.0 605.7650285714285,185.0 V199.0 Q605.7650285714285,203.0 601.7650285714285,203.0 H329.36 Z"/></g>
-<text x="317.36" y="196.5" font-size="13" fill="#52514e" text-anchor="end">+ exponent-pair Huffman</text>
-<rect x="608.8" y="181.0" width="37.1" height="22" fill="#fcfcfb"/>
-<text x="613.8" y="196.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">28.4</text>
-<g fill="#86b6ef"><path d="M329.36,221.0 H610.6216685714285 Q614.6216685714285,221.0 614.6216685714285,225.0 V239.0 Q614.6216685714285,243.0 610.6216685714285,243.0 H329.36 Z"/></g>
-<text x="317.36" y="236.5" font-size="13" fill="#52514e" text-anchor="end">+ Huffman for large dense tensors</text>
-<rect x="617.6" y="221.0" width="37.1" height="22" fill="#fcfcfb"/>
-<text x="622.6" y="236.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">29.3</text>
-<g fill="#2a78d6"><path d="M329.36,261.0 H622.2034285714286 Q626.2034285714286,261.0 626.2034285714286,265.0 V279.0 Q626.2034285714286,283.0 622.2034285714286,283.0 H329.36 Z"/></g>
-<text x="317.36" y="276.5" font-size="13" fill="#52514e" text-anchor="end">final: warm start, nothing on CPU</text>
-<rect x="629.2" y="261.0" width="37.1" height="22" fill="#fcfcfb"/>
-<text x="634.2" y="276.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">30.5</text>
+<line x1="351.2" y1="86" x2="351.2" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="351.2" y="354" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="396.7" y1="86" x2="396.7" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="396.7" y="354" font-size="11" fill="#898781" text-anchor="middle">5</text>
+<line x1="442.3" y1="86" x2="442.3" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="442.3" y="354" font-size="11" fill="#898781" text-anchor="middle">10</text>
+<line x1="487.8" y1="86" x2="487.8" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="487.8" y="354" font-size="11" fill="#898781" text-anchor="middle">15</text>
+<line x1="533.4" y1="86" x2="533.4" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="533.4" y="354" font-size="11" fill="#898781" text-anchor="middle">20</text>
+<line x1="578.9" y1="86" x2="578.9" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="578.9" y="354" font-size="11" fill="#898781" text-anchor="middle">25</text>
+<line x1="624.5" y1="86" x2="624.5" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="624.5" y="354" font-size="11" fill="#898781" text-anchor="middle">30</text>
+<line x1="670.0" y1="86" x2="670.0" y2="336" stroke="#e1e0d9" stroke-width="1"/>
+<text x="670.0" y="354" font-size="11" fill="#898781" text-anchor="middle">35</text>
+<line x1="351.20000000000005" y1="86" x2="351.20000000000005" y2="336" stroke="#c3c2b7" stroke-width="1"/>
+<text x="670" y="374" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
+<line x1="624.5" y1="82" x2="624.5" y2="336" stroke="#52514e" stroke-width="1.5"/>
+<text x="618.5" y="78" font-size="12" fill="#52514e" text-anchor="end">target 30</text>
+<g fill="#86b6ef"><path d="M351.20000000000005,101.0 H392.4696 Q396.4696,101.0 396.4696,105.0 V119.0 Q396.4696,123.0 392.4696,123.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="116.5" font-size="13" fill="#52514e" text-anchor="end">PyTorch runtime, fused TCA format</text>
+<rect x="399.5" y="101.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="404.5" y="116.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">5.0</text>
+<g fill="#86b6ef"><path d="M351.20000000000005,141.0 H561.7068571428572 Q565.7068571428572,141.0 565.7068571428572,145.0 V159.0 Q565.7068571428572,163.0 561.7068571428572,163.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="156.5" font-size="13" fill="#52514e" text-anchor="end">BF16N v1: nibble + Huffman, fused GLU</text>
+<rect x="568.7" y="141.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="573.7" y="156.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">23.6</text>
+<g fill="#86b6ef"><path d="M351.20000000000005,181.0 H605.8834285714286 Q609.8834285714286,181.0 609.8834285714286,185.0 V199.0 Q609.8834285714286,203.0 605.8834285714286,203.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="196.5" font-size="13" fill="#52514e" text-anchor="end">+ exponent-pair Huffman</text>
+<rect x="612.9" y="181.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="617.9" y="196.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">28.4</text>
+<g fill="#86b6ef"><path d="M351.20000000000005,221.0 H614.1722285714286 Q618.1722285714286,221.0 618.1722285714286,225.0 V239.0 Q618.1722285714286,243.0 614.1722285714286,243.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="236.5" font-size="13" fill="#52514e" text-anchor="end">+ Huffman for large dense tensors</text>
+<rect x="621.2" y="221.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="626.2" y="236.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">29.3</text>
+<g fill="#86b6ef"><path d="M351.20000000000005,261.0 H625.0114285714285 Q629.0114285714285,261.0 629.0114285714285,265.0 V279.0 Q629.0114285714285,283.0 625.0114285714285,283.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="276.5" font-size="13" fill="#52514e" text-anchor="end">final: warm start, nothing on CPU</text>
+<rect x="632.0" y="261.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="637.0" y="276.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">30.5</text>
+<g fill="#2a78d6"><path d="M351.20000000000005,301.0 H631.3874285714285 Q635.3874285714285,301.0 635.3874285714285,305.0 V319.0 Q635.3874285714285,323.0 631.3874285714285,323.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="316.5" font-size="13" fill="#52514e" text-anchor="end">current: upstream 338fce6, pinned clocks</text>
+<rect x="638.4" y="301.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="643.4" y="316.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">31.2</text>
 </svg>

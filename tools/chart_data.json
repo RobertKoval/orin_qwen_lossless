@@ -42,7 +42,12 @@
       {
         "label": "final: warm start, nothing on CPU",
         "value": 30.5,
-        "value_label": "30.5",
+        "value_label": "30.5"
+      },
+      {
+        "label": "current: upstream 338fce6, pinned clocks",
+        "value": 31.2,
+        "value_label": "31.2",
         "highlight": true
       }
     ]
@@ -176,7 +181,12 @@
       {
         "label": "-ub 512, + fused SwiGLU, lane-stream rings",
         "value": 811.4,
-        "value_label": "811",
+        "value_label": "811"
+      },
+      {
+        "label": "-ub 512, rebased on upstream 338fce6",
+        "value": 832.1,
+        "value_label": "832",
         "highlight": true
       },
       {
@@ -197,7 +207,12 @@
       {
         "label": "-ub 2048, + fused SwiGLU, lane-stream rings",
         "value": 1279.3,
-        "value_label": "1279",
+        "value_label": "1279"
+      },
+      {
+        "label": "-ub 2048, rebased on upstream 338fce6",
+        "value": 1323.3,
+        "value_label": "1323",
         "highlight": true
       },
       {
@@ -218,7 +233,12 @@
       {
         "label": "-ub 4096, + fused SwiGLU, lane-stream rings",
         "value": 1429.0,
-        "value_label": "1429",
+        "value_label": "1429"
+      },
+      {
+        "label": "-ub 4096, rebased on upstream 338fce6",
+        "value": 1480.8,
+        "value_label": "1481",
         "highlight": true
       }
     ]

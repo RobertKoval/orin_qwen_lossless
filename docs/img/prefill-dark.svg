@@ -1,28 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="628" viewBox="0 0 760 628" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="Prefill speed, 8192-token prompt">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="748" viewBox="0 0 760 748" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="Prefill speed, 8192-token prompt">
 <title>Prefill speed, 8192-token prompt</title>
-<rect x="0.5" y="0.5" width="759" height="627" rx="12" fill="#1a1a19" stroke="rgba(255,255,255,0.10)"/>
+<rect x="0.5" y="0.5" width="759" height="747" rx="12" fill="#1a1a19" stroke="rgba(255,255,255,0.10)"/>
 <text x="24" y="36" font-size="17" font-weight="600" fill="#f0efec">Prefill speed, 8192-token prompt</text>
 <text x="24" y="58" font-size="13" fill="#c3c2b7">tokens per second by micro-batch size, each step on top of the previous one (pinned clocks)</text>
-<line x1="373.0" y1="86" x2="373.0" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="373.0" y="594" font-size="11" fill="#898781" text-anchor="middle">0</text>
-<line x1="410.2" y1="86" x2="410.2" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="410.2" y="594" font-size="11" fill="#898781" text-anchor="middle">200</text>
-<line x1="447.3" y1="86" x2="447.3" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="447.3" y="594" font-size="11" fill="#898781" text-anchor="middle">400</text>
-<line x1="484.4" y1="86" x2="484.4" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="484.4" y="594" font-size="11" fill="#898781" text-anchor="middle">600</text>
-<line x1="521.5" y1="86" x2="521.5" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="521.5" y="594" font-size="11" fill="#898781" text-anchor="middle">800</text>
-<line x1="558.6" y1="86" x2="558.6" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="558.6" y="594" font-size="11" fill="#898781" text-anchor="middle">1000</text>
-<line x1="595.8" y1="86" x2="595.8" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="595.8" y="594" font-size="11" fill="#898781" text-anchor="middle">1200</text>
-<line x1="632.9" y1="86" x2="632.9" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="632.9" y="594" font-size="11" fill="#898781" text-anchor="middle">1400</text>
-<line x1="670.0" y1="86" x2="670.0" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="670.0" y="594" font-size="11" fill="#898781" text-anchor="middle">1600</text>
-<line x1="373.04" y1="86" x2="373.04" y2="576" stroke="#383835" stroke-width="1"/>
-<text x="670" y="614" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
+<line x1="373.0" y1="86" x2="373.0" y2="696" stroke="#2c2c2a" stroke-width="1"/>
+<text x="373.0" y="714" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="410.2" y1="86" x2="410.2" y2="696" stroke="#2c2c2a" stroke-width="1"/>
+<text x="410.2" y="714" font-size="11" fill="#898781" text-anchor="middle">200</text>
+<line x1="447.3" y1="86" x2="447.3" y2="696" stroke="#2c2c2a" stroke-width="1"/>
+<text x="447.3" y="714" font-size="11" fill="#898781" text-anchor="middle">400</text>
+<line x1="484.4" y1="86" x2="484.4" y2="696" stroke="#2c2c2a" stroke-width="1"/>
+<text x="484.4" y="714" font-size="11" fill="#898781" text-anchor="middle">600</text>
+<line x1="521.5" y1="86" x2="521.5" y2="696" stroke="#2c2c2a" stroke-width="1"/>
+<text x="521.5" y="714" font-size="11" fill="#898781" text-anchor="middle">800</text>
+<line x1="558.6" y1="86" x2="558.6" y2="696" stroke="#2c2c2a" stroke-width="1"/>
+<text x="558.6" y="714" font-size="11" fill="#898781" text-anchor="middle">1000</text>
+<line x1="595.8" y1="86" x2="595.8" y2="696" stroke="#2c2c2a" stroke-width="1"/>
+<text x="595.8" y="714" font-size="11" fill="#898781" text-anchor="middle">1200</text>
+<line x1="632.9" y1="86" x2="632.9" y2="696" stroke="#2c2c2a" stroke-width="1"/>
+<text x="632.9" y="714" font-size="11" fill="#898781" text-anchor="middle">1400</text>
+<line x1="670.0" y1="86" x2="670.0" y2="696" stroke="#2c2c2a" stroke-width="1"/>
+<text x="670.0" y="714" font-size="11" fill="#898781" text-anchor="middle">1600</text>
+<line x1="373.04" y1="86" x2="373.04" y2="696" stroke="#383835" stroke-width="1"/>
+<text x="670" y="734" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
 <g fill="#184f95"><path d="M373.04,101.0 H425.88928000000004 Q429.88928000000004,101.0 429.88928000000004,105.0 V119.0 Q429.88928000000004,123.0 425.88928000000004,123.0 H373.04 Z"/></g>
 <text x="361.04" y="116.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 512, dequant + cuBLAS</text>
 <rect x="432.9" y="101.0" width="29.8" height="22" fill="#1a1a19"/>
@@ -35,40 +35,52 @@
 <text x="361.04" y="196.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 512, + chunked GDN, faster norms</text>
 <rect x="524.5" y="181.0" width="29.8" height="22" fill="#1a1a19"/>
 <text x="529.5" y="196.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">800</text>
-<g fill="#3987e5"><path d="M373.04,221.0 H519.63584 Q523.63584,221.0 523.63584,225.0 V239.0 Q523.63584,243.0 519.63584,243.0 H373.04 Z"/></g>
+<g fill="#184f95"><path d="M373.04,221.0 H519.63584 Q523.63584,221.0 523.63584,225.0 V239.0 Q523.63584,243.0 519.63584,243.0 H373.04 Z"/></g>
 <text x="361.04" y="236.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 512, + fused SwiGLU, lane-stream rings</text>
 <rect x="526.6" y="221.0" width="29.8" height="22" fill="#1a1a19"/>
 <text x="531.6" y="236.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">811</text>
-<g fill="#184f95"><path d="M373.04,261.0 H467.33376000000004 Q471.33376000000004,261.0 471.33376000000004,265.0 V279.0 Q471.33376000000004,283.0 467.33376000000004,283.0 H373.04 Z"/></g>
-<text x="361.04" y="276.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 2048, dequant + cuBLAS</text>
-<rect x="474.3" y="261.0" width="29.8" height="22" fill="#1a1a19"/>
-<text x="479.3" y="276.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">530</text>
-<g fill="#184f95"><path d="M373.04,301.0 H544.13504 Q548.13504,301.0 548.13504,305.0 V319.0 Q548.13504,323.0 544.13504,323.0 H373.04 Z"/></g>
-<text x="361.04" y="316.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 2048, batched MoE kernel</text>
-<rect x="551.1" y="301.0" width="29.8" height="22" fill="#1a1a19"/>
-<text x="556.1" y="316.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">943</text>
-<g fill="#184f95"><path d="M373.04,341.0 H600.87296 Q604.87296,341.0 604.87296,345.0 V359.0 Q604.87296,363.0 600.87296,363.0 H373.04 Z"/></g>
-<text x="361.04" y="356.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 2048, + chunked GDN, faster norms</text>
-<rect x="607.9" y="341.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="612.9" y="356.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1249</text>
-<g fill="#3987e5"><path d="M373.04,381.0 H606.47808 Q610.47808,381.0 610.47808,385.0 V399.0 Q610.47808,403.0 606.47808,403.0 H373.04 Z"/></g>
-<text x="361.04" y="396.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 2048, + fused SwiGLU, lane-stream rings</text>
-<rect x="613.5" y="381.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="618.5" y="396.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1279</text>
-<g fill="#184f95"><path d="M373.04,421.0 H482.77567999999997 Q486.77567999999997,421.0 486.77567999999997,425.0 V439.0 Q486.77567999999997,443.0 482.77567999999997,443.0 H373.04 Z"/></g>
-<text x="361.04" y="436.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 4096, dequant + cuBLAS</text>
-<rect x="489.8" y="421.0" width="29.8" height="22" fill="#1a1a19"/>
-<text x="494.8" y="436.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">613</text>
-<g fill="#184f95"><path d="M373.04,461.0 H557.94368 Q561.94368,461.0 561.94368,465.0 V479.0 Q561.94368,483.0 557.94368,483.0 H373.04 Z"/></g>
-<text x="361.04" y="476.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 4096, batched MoE kernel</text>
-<rect x="564.9" y="461.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="569.9" y="476.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1018</text>
-<g fill="#184f95"><path d="M373.04,501.0 H629.4553599999999 Q633.4553599999999,501.0 633.4553599999999,505.0 V519.0 Q633.4553599999999,523.0 629.4553599999999,523.0 H373.04 Z"/></g>
-<text x="361.04" y="516.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 4096, + chunked GDN, faster norms</text>
-<rect x="636.5" y="501.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="641.5" y="516.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1403</text>
-<g fill="#3987e5"><path d="M373.04,541.0 H634.2624000000001 Q638.2624000000001,541.0 638.2624000000001,545.0 V559.0 Q638.2624000000001,563.0 634.2624000000001,563.0 H373.04 Z"/></g>
-<text x="361.04" y="556.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 4096, + fused SwiGLU, lane-stream rings</text>
-<rect x="641.3" y="541.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="646.3" y="556.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1429</text>
+<g fill="#3987e5"><path d="M373.04,261.0 H523.47776 Q527.47776,261.0 527.47776,265.0 V279.0 Q527.47776,283.0 523.47776,283.0 H373.04 Z"/></g>
+<text x="361.04" y="276.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 512, rebased on upstream 338fce6</text>
+<rect x="530.5" y="261.0" width="29.8" height="22" fill="#1a1a19"/>
+<text x="535.5" y="276.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">832</text>
+<g fill="#184f95"><path d="M373.04,301.0 H467.33376000000004 Q471.33376000000004,301.0 471.33376000000004,305.0 V319.0 Q471.33376000000004,323.0 467.33376000000004,323.0 H373.04 Z"/></g>
+<text x="361.04" y="316.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 2048, dequant + cuBLAS</text>
+<rect x="474.3" y="301.0" width="29.8" height="22" fill="#1a1a19"/>
+<text x="479.3" y="316.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">530</text>
+<g fill="#184f95"><path d="M373.04,341.0 H544.13504 Q548.13504,341.0 548.13504,345.0 V359.0 Q548.13504,363.0 544.13504,363.0 H373.04 Z"/></g>
+<text x="361.04" y="356.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 2048, batched MoE kernel</text>
+<rect x="551.1" y="341.0" width="29.8" height="22" fill="#1a1a19"/>
+<text x="556.1" y="356.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">943</text>
+<g fill="#184f95"><path d="M373.04,381.0 H600.87296 Q604.87296,381.0 604.87296,385.0 V399.0 Q604.87296,403.0 600.87296,403.0 H373.04 Z"/></g>
+<text x="361.04" y="396.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 2048, + chunked GDN, faster norms</text>
+<rect x="607.9" y="381.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="612.9" y="396.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1249</text>
+<g fill="#184f95"><path d="M373.04,421.0 H606.47808 Q610.47808,421.0 610.47808,425.0 V439.0 Q610.47808,443.0 606.47808,443.0 H373.04 Z"/></g>
+<text x="361.04" y="436.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 2048, + fused SwiGLU, lane-stream rings</text>
+<rect x="613.5" y="421.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="618.5" y="436.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1279</text>
+<g fill="#3987e5"><path d="M373.04,461.0 H614.6444799999999 Q618.6444799999999,461.0 618.6444799999999,465.0 V479.0 Q618.6444799999999,483.0 614.6444799999999,483.0 H373.04 Z"/></g>
+<text x="361.04" y="476.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 2048, rebased on upstream 338fce6</text>
+<rect x="621.6" y="461.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="626.6" y="476.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1323</text>
+<g fill="#184f95"><path d="M373.04,501.0 H482.77567999999997 Q486.77567999999997,501.0 486.77567999999997,505.0 V519.0 Q486.77567999999997,523.0 482.77567999999997,523.0 H373.04 Z"/></g>
+<text x="361.04" y="516.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 4096, dequant + cuBLAS</text>
+<rect x="489.8" y="501.0" width="29.8" height="22" fill="#1a1a19"/>
+<text x="494.8" y="516.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">613</text>
+<g fill="#184f95"><path d="M373.04,541.0 H557.94368 Q561.94368,541.0 561.94368,545.0 V559.0 Q561.94368,563.0 557.94368,563.0 H373.04 Z"/></g>
+<text x="361.04" y="556.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 4096, batched MoE kernel</text>
+<rect x="564.9" y="541.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="569.9" y="556.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1018</text>
+<g fill="#184f95"><path d="M373.04,581.0 H629.4553599999999 Q633.4553599999999,581.0 633.4553599999999,585.0 V599.0 Q633.4553599999999,603.0 629.4553599999999,603.0 H373.04 Z"/></g>
+<text x="361.04" y="596.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 4096, + chunked GDN, faster norms</text>
+<rect x="636.5" y="581.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="641.5" y="596.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1403</text>
+<g fill="#184f95"><path d="M373.04,621.0 H634.2624000000001 Q638.2624000000001,621.0 638.2624000000001,625.0 V639.0 Q638.2624000000001,643.0 634.2624000000001,643.0 H373.04 Z"/></g>
+<text x="361.04" y="636.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 4096, + fused SwiGLU, lane-stream rings</text>
+<rect x="641.3" y="621.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="646.3" y="636.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1429</text>
+<g fill="#3987e5"><path d="M373.04,661.0 H643.87648 Q647.87648,661.0 647.87648,665.0 V679.0 Q647.87648,683.0 643.87648,683.0 H373.04 Z"/></g>
+<text x="361.04" y="676.5" font-size="13" fill="#c3c2b7" text-anchor="end">-ub 4096, rebased on upstream 338fce6</text>
+<rect x="650.9" y="661.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="655.9" y="676.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1481</text>
 </svg>

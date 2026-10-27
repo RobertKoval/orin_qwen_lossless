@@ -2,7 +2,9 @@
 
 Hardware: Jetson AGX Orin Developer Kit 64GB (P3701-0005, GA10B SM87 @ 1300.5 MHz, LPDDR5 3199 MHz = 204.8 GB/s,
 SK hynix DRAM), L4T R36.5, CUDA 12.6, `nvpmodel` MAXN. Model: `Qwen/Qwen3.6-35B-A3B`, BF16 GGUF
-converted with llama.cpp. llama.cpp `b29c606` + `patches/llama.cpp-b29c606-bf16n.patch`. Single sequence, greedy.
+converted with llama.cpp. llama.cpp `338fce6` + `patches/llama.cpp-338fce6-bf16n.patch` (sections before
+[the rebase](#rebase-onto-upstream-llamacpp-338fce6) were measured on `b29c606` with the patch of that time). Single
+sequence, greedy.
 
 Clocks: until 2026-10-26 the board ran with dynamic clocks (GPU devfreq `nvhost_podgov` 306–1300.5 MHz, CPU `schedutil`
 from 729 MHz), not with `jetson_clocks` as this file said earlier. Since a reboot that day the GPU is pinned at
@@ -409,6 +411,33 @@ altogether (oracle) would cut a layer by 22–25 % at 2048 tokens and 10–13 % 
 runs into its own budget: gate is at 128 registers for 512 threads and the slab leaves no shared memory for an
 activation tile. A different kernel shape is sketched in [ROADMAP.md](ROADMAP.md).
 
+## Rebase onto upstream llama.cpp 338fce6
+
+The patch moved from `b29c606` to upstream `338fce6` (978 commits later). Upstream already contains every kernel the
+previous patch had ported (chunked gated delta net, fused RMS_NORM + SCALE, float4 norms, vectorised conversions, norm
+grid limits), so the patch is now only this project's own code: 2988 lines instead of 4768. Three conflicts, all small.
+
+One regression showed up and is fixed: upstream's `build_rs` now gathers all recurrent states with one GET_ROWS and
+takes two views of it, the state of the current sequence and an empty view of "extra" states. The in-place state read
+of the gated delta net required the GET_ROWS to have a single consumer, stopped firing, and decode lost 1.5 % to 30
+state copies per token (620 µs); zero-element consumers are no longer counted.
+
+Checks: `test-backend-ops` CONCAT 275/275, GATED_DELTA_NET 43/43; `run_prompts.sh` against the previous build: two of
+four greedy prompts text-identical, the other two diverge at the known near-ties (token 47 of prompt 1, where the exact
+dequant + cuBLAS reference diverges too, and token 36 of the long prompt), median top-1 |Δlogprob| 2e-5. KL against
+the previous build (wikitext-2, 8 × 2048, `-ub 512`): PPL 4.7464 vs 4.7481, mean KLD 0.0029, same top-1 98.30 % —
+upstream's own kernel changes, the summation-order band seen before.
+
+Alternating previous build / rebased, two rounds, pinned clocks, desktop stopped, tok/s:
+
+| | previous (`b29c606` base) | rebased (`338fce6`) | change |
+|---|---:|---:|---:|
+| pp8192, `-ub 512` | 810.5 / 810.9 | **830.8 / 833.3** | +2.6 % |
+| pp8192, `-ub 2048` | 1282.1 / 1277.9 | **1323.5 / 1323.0** | +3.4 % |
+| pp8192, `-ub 4096` | 1429.0 / 1428.6 | **1480.8 / 1480.7** | +3.6 % |
+| tg64 @ 0 | 31.07 / 31.12 | **31.23 / 31.24** | +0.4 % |
+| tg64 @ 2048 | 31.13 / 31.16 | 31.14 / 31.17 | unchanged |
+
 ## Correctness
 
 * Weights: bit-exact round trip for every tensor (see above).
@@ -444,3 +473,10 @@ activation tile. A different kernel shape is sketched in [ROADMAP.md](ROADMAP.md
   ahead in registers: 13–16 % slower even at depth 2 with a generic loop (same semantics as the hand-written
   two-buffer loop; not understood); plane rows staged in shared memory by `cp.async`: frees 16 registers but takes L1
   from the activations, 1 % slower than plane rows in registers.
+* Decode GEMVs with the lane streams and the planes through `cp.async` rings in shared memory (as in the MoE prefill
+  kernel): Nsight Compute had shown 60–68 % of the stall samples on long scoreboard, but the GEMV work phase already
+  runs at the DRAM limit of its access pattern (165–170 GB/s inside a launch, 161 GB/s for the whole lm_head); the
+  stalls are the normal state of a memory-bound kernel. Two versions, bitwise equal: the first cut the long-scoreboard
+  share to 21 % with 69 % more instructions at the same speed, the leaner second one (predicated refill, one wait per
+  step) was slower. An oracle that removes loads removes their bandwidth as well; it bounds nothing for a memory-bound
+  kernel.
