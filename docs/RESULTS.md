@@ -105,54 +105,57 @@ over 256 experts for each of the 120 MoE matrices (ids copied to the host, two s
 conversion and a cuBLAS GEMM per expert); `k_hp_dequant` took 20 % of the GPU time, experts with ≤ 8 tokens went through
 the GEMV (36 % at `-ub 512`).
 
-**Now.** One launch per `MUL_MAT_ID`: `ggml_cuda_launch_mm_ids_helper` sorts the tokens by expert on the GPU, the
-activations are converted to BF16 once, and `k_hp_mm_ids` decodes each expert's weights once per block into a shared slab
-and multiplies them on the tensor cores with all tokens routed to that expert (`mma.m16n8k16`, FP32 accumulation). This
-needed chunk-major lane streams for the gate/up experts (a K-slab of many rows must be decodable at once); the format,
-size and the bit-exact round-trip are otherwise unchanged ([FORMAT.md](FORMAT.md)).
+**Now.** One persistent launch per `MUL_MAT_ID`, one block per SM. `ggml_cuda_launch_mm_ids_helper` sorts the
+tokens by expert on the GPU and the activations are converted to BF16 once; each block of `k_hp_mm_ids` builds its own
+work list (an expert × a tile of the tokens routed to it × a group of units) from the routing bounds in shared memory,
+loads the exponent LUT once, decodes the weights once per token tile into a shared slab and multiplies them on the
+tensor cores (`mma.m16n8k16`, FP32 accumulation). The next item's lane streams and plane rows start during the current
+item's last step, so decode and products overlap. While the experts have few tokens (≤ 48 on average) down interleaves
+two or four units per warp to give each SM more independent decode chains. This needed chunk-major lane streams for the
+gate/up experts (a K-slab of many rows must be decodable at once); the format, size and the bit-exact round-trip are
+otherwise unchanged ([FORMAT.md](FORMAT.md)).
 
-Per matrix, real `blk.20` weights, 8 of 256 experts per token drawn uniformly, GPU warmed for 2 s
-([`bench/moe_prefill.cpp`](../bench/moe_prefill.cpp); ms per `MUL_MAT_ID`):
+Per matrix, real `blk.20` weights, 8 of 256 experts per token drawn uniformly, pinned clocks; median of 30
+individually synchronised repetitions, page cache dropped before each run
+([`bench/moe_prefill.cpp`](../bench/moe_prefill.cpp); ms per `MUL_MAT_ID`; dequant + cuBLAS = `GGML_BF16N_NO_MMA=1`,
+the published path):
 
-| tokens | gate (K 2048, N 512): old → new | down (K 512, N 2048): old → new |
+| tokens | gate (K 2048, N 512): dequant + cuBLAS / 5fd8a05 / this patch | down (K 512, N 2048): dequant + cuBLAS / 5fd8a05 / this patch |
 |---:|---:|---:|
-| 512 | 23.6 → **6.3** | 16.5 → **10.1** |
-| 2048 | 35.5 → **9.2** | 33.5 → **13.4** |
-| 4096 | 53.8 → **15.1** | 47.7 → **23.6** |
+| 512 | 20.8 / 6.0 / **4.2** | 14.9 / 10.0 / **4.9** |
+| 2048 | 26.6 / 8.8 / **6.5** | 20.5 / 13.1 / **10.6** |
+| 4096 | 37.2 / 14.3 / **10.8** | 28.3 / 22.9 / **18.0** |
+
+An earlier version of this table was measured with dynamic clocks and averaged the repetitions; it overstated the
+dequant + cuBLAS path (gate 23.6 / 35.5 / 53.8 ms).
 
 Every result is checked against a CPU reference (exact BF16 weights, BF16-rounded activations, double accumulation):
-max |error| / Σ|w·x| ≤ 4.1e-7 for 9 to 4096 tokens, also with skewed routing; the GEMV path (≤ 8 tokens, F32
-activations) ≤ 1.1e-7.
+max |error| / Σ|w·x| ≤ 7e-7 for 9 to 4096 tokens, uniform and skewed routing, on 64 random output columns per run and
+on every column (`check_cols` = 8 × tokens) at 100, 768, 769, 1537 and 4096 tokens, both sides of the down interleave
+thresholds; the GEMV path (≤ 8 tokens, F32 activations) ≤ 1.1e-7.
 
-End to end, dynamic clocks (see the hardware note), alternating processes, caches dropped before each
-(`llama-bench -p 2048,8192 -n 0 -b 8192`, tok/s, two runs each):
+End to end at pinned clocks, alternating processes with caches dropped before each (`tg64 -r 3`, then
+`-p 8192 -n 0 -b 8192 -r 2`), tok/s. The first column is the published patch, the second the first batched kernel
+(commit 65baf68 plus the conv-state concat below, 5fd8a05), the third the persistent kernel; the 5fd8a05 numbers
+reproduce within 0.3 % across the two sessions, which ran published / 5fd8a05 and 5fd8a05 / this patch:
 
-| | published patch | batched MoE kernel |
-|---|---:|---:|
-| pp2048, `-ub 512` | 271.7 / 272.3 | **507.4 / 506.2** |
-| pp2048, `-ub 2048` | 429.6 / 437.9 | **767.2 / 765.8** |
-| pp8192, `-ub 512` | 264.6 / 266.5 | **495.5 / 495.4** |
-| pp8192, `-ub 2048` | 435.9 / 435.7 | **768.5 / 766.7** |
-| pp8192, `-ub 4096` | 505.2 / 504.8 | **811.0 / 809.5** |
+| | published patch | 5fd8a05 | this patch | vs published |
+|---|---:|---:|---:|---:|
+| pp8192, `-ub 512` | 306.5 / 306.0 | 514.6 / 513.3 | **664.2 / 665.1** | 2.17× |
+| pp8192, `-ub 2048` | 526.5 / 532.7 | 819.2 / 816.4 | **942.0 / 944.9** | 1.78× |
+| pp8192, `-ub 4096` | 613.1 / 612.5 | 900.1 / 900.1 | **1017.3 / 1018.3** | 1.66× |
+| tg64 @ 0 | 30.64 / 30.67 | 30.50 / 30.51 | 30.57 / 30.57 | −0.3 % |
+| tg64 @ 2048 | 30.70 / 30.66 | 30.52 / 30.56 | 30.59 / 30.63 | −0.3 % |
 
-The 1.6–1.9× in this table is inflated: with dynamic clocks the published path's host loop over experts ran slower.
+With dynamic clocks the first batched kernel had measured 1.6–1.9× over the published patch; that was inflated, because
+the published path's host loop over experts ran slower with dynamic clocks.
 
-**Pinned clocks, final patch** (batched MoE kernel + conv-state concat below), the same alternating protocol
-(published, new, new, published; `tg64 -r 3`, then `-p 8192 -n 0 -b 8192 -r 2`), tok/s:
-
-| | published patch | this patch | |
-|---|---:|---:|---:|
-| pp8192, `-ub 512` | 306.5 / 306.0 | **514.4 / 514.2** | 1.68× |
-| pp8192, `-ub 2048` | 526.5 / 532.7 | **820.9 / 819.3** | 1.55× |
-| pp8192, `-ub 4096` | 613.1 / 612.5 | **901.2 / 898.7** | 1.47× |
-| tg64 @ 0 | 30.64 / 30.67 | 30.51 / 30.47 | −0.5 % |
-| tg64 @ 2048 | 30.70 / 30.66 | 30.52 / 30.49 | −0.6 % |
-
-Model-level check (`scripts/run_prompts.sh`, now with a ~1500-token prompt, greedy, against `GGML_BF16N_REFERENCE=1`):
-the batched path is text-identical on the three short prompts and first differs at token 64 of the long one; the
-published prefill path differs on one short prompt (token 47) and at the same token 64 of the long one. Median top-1
-|Δlogprob| 3.9e-5 vs 3.6e-5: both are summation-order differences at near-ties. The final patch reproduces these outputs
-bit for bit (texts and logprobs of all four prompts).
+Model-level check (`scripts/run_prompts.sh`: three short prompts and one of ~1500 tokens, greedy, against
+`GGML_BF16N_REFERENCE=1`): text-identical on three of the four, including the long one; the fourth first differs at
+token 47, where the published prefill path differs too. Median top-1 |Δlogprob| 6.9e-5 (p99 0.10, max 0.20 over 381
+tokens; the first batched kernel 3.9e-5, the published path 3.6e-5). The outputs are not bitwise those of 5fd8a05: the
+token tiles and the K-split summation order changed. The every-column check above rules out a fault hidden in columns
+the 64-column sample skips.
 
 ### Conv-state concat
 
@@ -171,16 +174,17 @@ The earlier profile's "12 % idle" was cold start inside the one forward nsys tra
 modules, the first cuBLAS call (208 ms), growth of the memory pool. Later forwards run as CUDA graphs (the MoE matrices
 no longer sync with the host), so the 3-repetition profile traces only the first one. Steady state is ≈ 2 % idle.
 
-Where pp2048 (`-ub 2048`, final patch, one forward 2.56 s) goes: `k_hp_mm_ids` 48 %, `gated_delta_net_cuda` 19 %
-(15.9 ms per layer), cuBLAS GEMMs of the dense matrices 7 %, F32→BF16 conversions 5 %, `rms_norm` 5 %, SwiGLU 2 %,
-`ssm_conv` 1.3 %, dense dequant 1.1 %, conv-state concat 0.9 %, idle 2 %.
+Where pp2048 (`-ub 2048`, this patch, one forward 2.20 s under nsys; it was 2.56 s with the first batched kernel)
+goes ([`tools/fwd_breakdown.py`](../tools/fwd_breakdown.py) on the nsys export, last forward): `k_hp_mm_ids` 40 % (874 ms, was 1237), `gated_delta_net_cuda` 22 % (15.9 ms per layer, unchanged), cuBLAS GEMMs
+of the dense matrices 8.7 %, F32→BF16 conversions 5.8 %, `rms_norm` 5.6 %, SwiGLU 2.5 %, the weighted sum of the
+experts 1.7 %, broadcast adds 1.7 %, `ssm_conv` 1.6 %, dense dequant 1.4 %, conv-state concat 1.2 %, idle 2.4 %.
 
 ### Cost for decode
 
 Decode pays 0.5 % for the chunk-major gate/up layout. Node-level nsys of `tg64 -r 3` on both trees (193 tokens): the
 total GPU time differs by +0.47 %, all of it in the gate/up GEMV, 82.1 µs per call chunk-major vs 79.8 µs row-major
 (+2.9 %); every other kernel matches within ±1.4 ms over the run. Keeping both layouts would double the expert memory,
-so the trade stays: +47–68 % prefill for −0.5 % decode.
+so the trade stays: 1.66–2.17× prefill for −0.5 % decode.
 
 Getting there took four attempts. The first chunk-major GEMV, with 8 rows unrolled in its loop body, cost 3.2–3.8 % of
 decode speed; nsys in real decode showed 97 vs 84 µs per gate/up call while an isolated microbenchmark (the same 8

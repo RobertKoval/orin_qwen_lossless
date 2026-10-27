@@ -21,26 +21,28 @@ Single items below ~1 % are not worth doing on their own; they only pay off bund
 
 ## Stage 1 — prefill
 
-Done: the batched MoE kernel ([RESULTS.md](RESULTS.md#prefill-batched-moe-kernel)) and a tiled transpose for the
-conv-state concat took prefill from 306 / 530 / 613 to 514 / 820 / 900 tok/s (pp8192 at `-ub 512 / 2048 / 4096`,
-pinned clocks) for −0.5 % decode. The "12 % GPU idle" of the first profile was cold start; steady state is ≈ 2 %. A
-2048-token forward at `-ub 2048` now spends 48 % in the MoE kernel, 19 % in `gated_delta_net_cuda`, 7 % in cuBLAS for
-the dense matrices, 5 % in F32→BF16 conversions, 5 % in `rms_norm`, 0.9 % in the conv-state concat.
+Done: the batched MoE kernel ([RESULTS.md](RESULTS.md#prefill-batched-moe-kernel)), a tiled transpose for the
+conv-state concat and a persistent MoE kernel (one block per SM, LUT loaded once, the next work item's decode started
+during the current one's last step, units interleaved per warp for down at small token counts) took prefill from
+306 / 530 / 613 to 665 / 943 / 1018 tok/s (pp8192 at `-ub 512 / 2048 / 4096`, pinned clocks) for −0.3 % decode. The
+"12 % GPU idle" of the first profile was cold start; steady state is ≈ 2 %. A 2048-token forward at `-ub 2048` now
+spends 40 % in the MoE kernel, 22 % in `gated_delta_net_cuda`, 8.7 % in cuBLAS for the dense matrices, 5.8 % in
+F32→BF16 conversions, 5.6 % in `rms_norm`, 1.2 % in the conv-state concat.
 
-1. **MoE kernel decode rate** (48 %): it decodes ≈ 4.6 G weights/s per SM against 7.8 in the GEMV, because only 16 warps
-   per SM decode (8 for down) and decode and products alternate behind block barriers. Options: persistent blocks per
-   expert (one LUT load, overlap the next unit's stream start), double-buffered half-chunk slabs so decode and mma
-   overlap, 16 decode warps for down. Expected 1.3–1.6× on this part; measure with `bench/moe_prefill.cpp` (warmed GPU).
-2. **Gated delta net** (19 %, 15.9 ms per layer for 2048 tokens): a chunked formulation on the tensor cores instead of the
+1. **Gated delta net** (22 %, 15.9 ms per layer for 2048 tokens): a chunked formulation on the tensor cores instead of the
    token-by-token recurrence. Expected several times faster for long prompts. Upstream kernel; effort large.
-3. **Conversions** (5 %): the MoE kernel and the dense cuBLAS path each convert F32 activations to BF16; the norm that
+2. **MoE kernel** (40 %): decode and products now overlap; at ≥ 2048 tokens down is bound by its tensor-core phase
+   (products alone 6.5 ms at 2048 tokens, ≈ 5.3 TFLOPS), and its single-chain variant (IL1, ≥ 1537 tokens) runs ≈ 11 %
+   slower than a schedule the compiler produced once (9.5 vs 10.6 ms at 2048 tokens) but that no clean source form has
+   reproduced yet. Open: the board's measured BF16 `mma` peak, `ldmatrix` and larger token tiles for down.
+3. **Conversions** (5.8 %): the MoE kernel and the dense cuBLAS path each convert F32 activations to BF16; the norm that
    produces them could write BF16 directly.
-4. **Dense matrices** (7 % + dequant): run them through the same decode-in-shared-memory kernel instead of
+4. **Dense matrices** (8.7 % + 1.4 % dequant): run them through the same decode-in-shared-memory kernel instead of
    dequantising to BF16 per micro-batch.
-5. **Micro-batch size**: `-ub 2048` is worth 1.6× over 512 and `-ub 4096` another 10 % at 8K; still open: memory headroom
+5. **Micro-batch size**: `-ub 2048` is worth 1.42× over 512 and `-ub 4096` another 8 % at 8K; still open: memory headroom
    of large micro-batches at long contexts and whether llama-server should pick it for BF16N models.
-6. **GEMV/batched threshold** (now 8 tokens): batched costs 1.2 ms at 9 tokens vs 0.6 ms for the GEMV at 8; the crossover
-   is probably at 24–32 tokens (speculative decoding and parallel requests sit there).
+6. **GEMV/batched threshold** (now 8 tokens): the first batched kernel cost 1.2 ms at 9 tokens vs 0.6 ms for the GEMV
+   at 8; the crossover is probably at 24–32 tokens (speculative decoding and parallel requests sit there).
 
 ## Stage 2 — long context (KV-cache traffic)
 

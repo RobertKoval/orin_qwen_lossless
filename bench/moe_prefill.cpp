@@ -35,6 +35,7 @@ int main(int argc, char ** argv) {
     const char * path = argv[1]; const char * name = argv[2];
     const int T = atoi(argv[3]);
     const int reps = argc > 4 ? atoi(argv[4]) : 10;
+    if (reps < 1) { fprintf(stderr, "reps must be >= 1\n"); return 1; }
     const double skew = argc > 5 ? atof(argv[5]) : 0.0;
     const int check_cols = argc > 6 ? atoi(argv[6]) : 64;
     const int n_used = 8;
@@ -109,12 +110,19 @@ int main(int argc, char ** argv) {
         ggml_backend_graph_compute(be, gf);
         ggml_backend_synchronize(be);
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int r = 0; r < reps; r++) { ggml_backend_graph_compute(be, gf); }
-    ggml_backend_synchronize(be);
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+    // median of individually synchronised repetitions: one host stall must not move the result
+    std::vector<double> rep_ms(reps);
+    for (int r = 0; r < reps; r++) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ggml_backend_graph_compute(be, gf);
+        ggml_backend_synchronize(be);
+        rep_ms[r] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    std::sort(rep_ms.begin(), rep_ms.end());
+    const double ms = rep_ms[reps / 2];
     const double flop = 2.0 * N * K * n_used * T;
-    printf("time %.3f ms  (%.2f TFLOPS, %.1f G weights/s over the %lld used experts)\n", ms, flop / ms * 1e-9,
+    printf("time %.3f ms  (median of %d, min %.3f, max %.3f; %.2f TFLOPS, %.1f G weights/s over the %lld used experts)\n",
+           ms, reps, rep_ms.front(), rep_ms.back(), flop / ms * 1e-9,
            (double) N * K * std::count_if(tok_per_e.begin(), tok_per_e.end(), [](int c) { return c > 0; }) / ms * 1e-6,
            (long long) std::count_if(tok_per_e.begin(), tok_per_e.end(), [](int c) { return c > 0; }));
 
