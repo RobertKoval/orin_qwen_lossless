@@ -28,9 +28,10 @@ decodes it inside llama.cpp's CUDA matrix–vector kernels, so a decode step str
 ## Highlights
 
 * **Lossless.** All 34.66 B weights round-trip bit-exactly, verified on the GPU for every tensor when the model loads.
-  Greedy generations match llama.cpp's stock BF16 path token for token.
+  Greedy generations follow llama.cpp's stock BF16 path up to near-ties that any change of summation order can flip
+  (see [Limitations](#limitations)).
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671), which leaves space for long contexts.
-* **Fast.** ≈ 30 tok/s single-stream decode and 660–1020 tok/s prefill on a 60 W board. Per matrix, the fused
+* **Fast.** ≈ 30 tok/s single-stream decode and 760–1280 tok/s prefill on a 60 W board. Per matrix, the fused
   decode+GEMV beats raw BF16: the 248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **GPU only.** Embedding, weights and every model op run on the GPU; MoE experts are picked on the GPU, so the decode
   step stays one CUDA graph.
@@ -68,7 +69,9 @@ entropy), the exponent is not (≈ 2.6 bits). So:
 * Prefill runs every MoE matrix as one persistent kernel: routing on the GPU, each expert's weights decoded once per tile
   of routed tokens into shared memory and multiplied on the BF16 tensor cores, with the next tile's decode started while
   the current one finishes. Dense matrices in prefill use exact
-  dequantisation plus the stock cuBLAS BF16 path.
+  dequantisation plus the stock cuBLAS BF16 path. The gated delta net runs upstream llama.cpp's chunked tensor-core
+  kernel (newer than `b29c606`, ported in the patch) instead of the token-by-token recurrence: 3.3 vs 15.8 ms per layer
+  for 2048 tokens.
 
 The full specification is in [docs/FORMAT.md](docs/FORMAT.md). Why the kernels look the way they do (the INT32 datapath on
 GA10B, L1 behaviour, what did not work) is in [docs/RESULTS.md](docs/RESULTS.md) and [docs/ORIN_NOTES.md](docs/ORIN_NOTES.md).
@@ -82,14 +85,14 @@ Jetson AGX Orin Developer Kit 64GB, MAXN with GPU and CPU clocks pinned at maxim
 |---|---|
 | resident weights | **46.5 GB** of 69.3 GB (ratio 0.671), 472/472 tensors bit-exact |
 | decode | **30.5 tok/s** at context 0 and at 2048 (±0.3 % between processes) |
-| prefill (8K prompt) | **665 tok/s** with the default `-ub 512`, **943** with `-ub 2048`, **1018** with `-b 8192 -ub 4096` (1.66–2.17× the dequant + cuBLAS path) |
+| prefill (8K prompt) | **760 tok/s** with the default `-ub 512`, **1153** with `-ub 2048`, **1283** with `-b 8192 -ub 4096` (2.1–2.5× the dequant + cuBLAS path) |
 | previous best on this board, PyTorch runtime with a fused lossless format | 5.0 tok/s |
 | BF16 without compression | does not fit |
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-dark.svg">
-    <img alt="Prefill of an 8192-token prompt: -ub 512 306 vs 665, -ub 2048 530 vs 943, -ub 4096 613 vs 1018 tokens/s for dequant + cuBLAS vs the batched MoE kernel" src="docs/img/prefill-light.svg" width="760">
+    <img alt="Prefill of an 8192-token prompt in tokens/s, dequant + cuBLAS / batched MoE kernel / + chunked gated delta net: -ub 512 306 / 665 / 760, -ub 2048 530 / 943 / 1153, -ub 4096 613 / 1018 / 1283" src="docs/img/prefill-light.svg" width="760">
   </picture>
 </p>
 
@@ -126,7 +129,7 @@ LLAMA_BF16N=hybrid ./llama.cpp/build/bin/llama-server -m qwen3.6-35b-a3b-bf16.gg
 ```
 
 Loading reads the 69 GB GGUF and encodes it (≈ 3–4 min on the Orin's NVMe and CPU). Run fully offloaded (`-ngl 99`).
-For long prompts use larger micro-batches: `-ub 2048` lifts prefill from ≈ 665 to ≈ 945 tok/s (measured with
+For long prompts use larger micro-batches: `-ub 2048` lifts prefill from ≈ 760 to ≈ 1150 tok/s (measured with
 `llama-bench`; it needs a larger compute buffer).
 Close desktop applications for best speed: on Orin the compositor and remote desktop share the GPU and DRAM.
 
@@ -170,12 +173,23 @@ g++ -O2 -std=c++17 -I llama.cpp/ggml/include bench/moe_prefill.cpp -o moe_prefil
 ./moe_prefill qwen3.6-35b-a3b-bf16.gguf blk.20.ffn_down_exps.weight 4096 30 1 32768   # 30 reps, skewed, every column
 ```
 
+`gdn_check.cpp` runs one gated delta net layer (model-like inputs, decay from the layer's own `ssm_a` and `dt_bias`)
+through the same backend and compares outputs and final state with a double-precision recurrence:
+
+```bash
+g++ -O2 -std=c++17 -I llama.cpp/ggml/include bench/gdn_check.cpp -o gdn_check \
+    -L llama.cpp/build/bin -lggml -lggml-base -lggml-cuda -Wl,-rpath,$PWD/llama.cpp/build/bin
+./gdn_check qwen3.6-35b-a3b-bf16.gguf 0 2048        # layer 0, 2048 tokens; [reps] [1 = random initial state]
+```
+
 ## FAQ
 
 **Is this quantisation?** No. Every BF16 bit pattern is reproduced exactly. In decode the products are FP32 FMAs of the
 exact weights; in prefill, as in llama.cpp's own BF16 path, the activations are rounded to BF16 for the tensor cores and
 accumulated in FP32. Only the order of the floating-point summation differs from llama.cpp's own BF16 kernels, as it does
-between any two GEMM implementations.
+between any two GEMM implementations. The chunked gated delta net multiplies a two-part BF16 split of its FP32
+operands (≈ 1e-5 relative error against FP64, vs ≈ 1e-6 for the FP32 recurrence); its effect on the next-token
+distributions is the same size as changing the micro-batch size ([details](docs/RESULTS.md#prefill-chunked-gated-delta-net-upstream-kernel-ported)).
 
 **Why not FP8 or 4-bit?** They are smaller and faster, and they change the model. This is for when you want the
 reference model itself: evaluation baselines, quantisation research, regulated settings, or just not wondering.
@@ -193,16 +207,18 @@ what worked, what did not, and by how much.
 * Tested on one configuration: Qwen3.6-35B-A3B, Jetson AGX Orin 64GB (SM87), CUDA 12.6, llama.cpp `b29c606`.
 * The compressed exponent buffers are allocated outside ggml's buffers, so llama.cpp's automatic memory fitting does not
   see them (≈ 11 GB); set the context size explicitly.
-* Dense matrices in prefill are still dequantised to BF16 per micro-batch; the gated delta net is the upstream
-  token-by-token kernel and takes 22 % of the prefill time.
+* Dense matrices in prefill are still dequantised to BF16 per micro-batch.
+* Outputs are deterministic for a given build and settings, but not bitwise equal across prefill kernels or micro-batch
+  sizes: summation order moves next-token distributions by a mean KLD ≈ 0.002 (top-1 agreement ≈ 98.4 % on wikitext-2,
+  perplexity unchanged). The weights are bit-exact either way; see [docs/RESULTS.md](docs/RESULTS.md).
 * The chunk-major expert layout that the prefill kernel needs costs 0.5 % of decode speed (gate/up GEMV 82 vs 80 µs).
 * The in-place recurrent-state read is only enabled for single-sequence batches.
 
 ## Roadmap
 
 Decode sits at ≈ 67 % of what this format allows on the board (≈ 45 tok/s at 180 GB/s); prefill still has headroom in the
-gated delta net (22 % of a 2048-token forward) and in the MoE kernel (40 %), whose down matrices are now bound by the
-tensor-core phase at large micro-batches.
+MoE kernel (48 % of a 2048-token forward; decode and tensor-core products overlap only partly) and in the small
+operations around the matrices (conversions, norms, SwiGLU: ≈ 17 %).
 The next research stages, with expected gains and how to measure them, are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License and credits

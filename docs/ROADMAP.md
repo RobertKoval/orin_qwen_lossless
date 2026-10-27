@@ -24,24 +24,24 @@ Single items below ~1 % are not worth doing on their own; they only pay off bund
 Done: the batched MoE kernel ([RESULTS.md](RESULTS.md#prefill-batched-moe-kernel)), a tiled transpose for the
 conv-state concat and a persistent MoE kernel (one block per SM, LUT loaded once, the next work item's decode started
 during the current one's last step, units interleaved per warp for down at small token counts) took prefill from
-306 / 530 / 613 to 665 / 943 / 1018 tok/s (pp8192 at `-ub 512 / 2048 / 4096`, pinned clocks) for −0.3 % decode. The
-"12 % GPU idle" of the first profile was cold start; steady state is ≈ 2 %. A 2048-token forward at `-ub 2048` now
-spends 40 % in the MoE kernel, 22 % in `gated_delta_net_cuda`, 8.7 % in cuBLAS for the dense matrices, 5.8 % in
-F32→BF16 conversions, 5.6 % in `rms_norm`, 1.2 % in the conv-state concat.
+306 / 530 / 613 to 665 / 943 / 1018 tok/s (pp8192 at `-ub 512 / 2048 / 4096`, pinned clocks) for −0.3 % decode, and
+upstream's chunked gated delta net (ported; 3.3 instead of 15.8 ms per layer for 2048 tokens) took it to
+760 / 1153 / 1283. The "12 % GPU idle" of the first profile was cold start; steady state is ≈ 2–3 %. A 2048-token forward
+at `-ub 2048` (1.83 s) now spends 48 % in the MoE kernel, 10.4 % in cuBLAS for the dense matrices, 6.9 % in F32→BF16
+conversions, 6.8 % in `rms_norm`, 5.5 % in the gated delta net, 3.0 % in SwiGLU, 1.5 % in the conv-state concat.
 
-1. **Gated delta net** (22 %, 15.9 ms per layer for 2048 tokens): a chunked formulation on the tensor cores instead of the
-   token-by-token recurrence. Expected several times faster for long prompts. Upstream kernel; effort large.
-2. **MoE kernel** (40 %): decode and products now overlap; at ≥ 2048 tokens down is bound by its tensor-core phase
+1. **MoE kernel** (48 %): decode and products now overlap; at ≥ 2048 tokens down is bound by its tensor-core phase
    (products alone 6.5 ms at 2048 tokens, ≈ 5.3 TFLOPS), and its single-chain variant (IL1, ≥ 1537 tokens) runs ≈ 11 %
    slower than a schedule the compiler produced once (9.5 vs 10.6 ms at 2048 tokens) but that no clean source form has
    reproduced yet. Open: the board's measured BF16 `mma` peak, `ldmatrix` and larger token tiles for down.
-3. **Conversions** (5.8 %): the MoE kernel and the dense cuBLAS path each convert F32 activations to BF16; the norm that
+2. **Conversions** (6.9 %): the MoE kernel and the dense cuBLAS path each convert F32 activations to BF16; the norm that
    produces them could write BF16 directly.
-4. **Dense matrices** (8.7 % + 1.4 % dequant): run them through the same decode-in-shared-memory kernel instead of
-   dequantising to BF16 per micro-batch.
-5. **Micro-batch size**: `-ub 2048` is worth 1.42× over 512 and `-ub 4096` another 8 % at 8K; still open: memory headroom
+3. **Dense matrices** (10.4 % + 1.6 % dequant): run them through the same decode-in-shared-memory kernel instead of
+   dequantising to BF16 per micro-batch. By a parameter-count estimate (≈ 5.8 TFLOP in 190 ms) cuBLAS already runs at
+   ≈ 30 TFLOPS, so the gain is mostly the dequant.
+4. **Micro-batch size**: `-ub 2048` is worth 1.52× over 512 and `-ub 4096` another 11 % at 8K; still open: memory headroom
    of large micro-batches at long contexts and whether llama-server should pick it for BF16N models.
-6. **GEMV/batched threshold** (now 8 tokens): the first batched kernel cost 1.2 ms at 9 tokens vs 0.6 ms for the GEMV
+5. **GEMV/batched threshold** (now 8 tokens): the first batched kernel cost 1.2 ms at 9 tokens vs 0.6 ms for the GEMV
    at 8; the crossover is probably at 24–32 tokens (speculative decoding and parallel requests sit there).
 
 ## Stage 2 — long context (KV-cache traffic)

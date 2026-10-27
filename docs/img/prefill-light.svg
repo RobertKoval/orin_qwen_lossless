@@ -1,46 +1,60 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="388" viewBox="0 0 760 388" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="Prefill speed, 8192-token prompt">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="508" viewBox="0 0 760 508" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="Prefill speed, 8192-token prompt">
 <title>Prefill speed, 8192-token prompt</title>
-<rect x="0.5" y="0.5" width="759" height="387" rx="12" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<rect x="0.5" y="0.5" width="759" height="507" rx="12" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
 <text x="24" y="36" font-size="17" font-weight="600" fill="#0b0b0b">Prefill speed, 8192-token prompt</text>
-<text x="24" y="58" font-size="13" fill="#52514e">tokens per second by micro-batch size: dequant + cuBLAS per expert vs the batched MoE kernel (pinned clocks)</text>
-<line x1="263.8" y1="86" x2="263.8" y2="336" stroke="#e1e0d9" stroke-width="1"/>
-<text x="263.8" y="354" font-size="11" fill="#898781" text-anchor="middle">0</text>
-<line x1="331.5" y1="86" x2="331.5" y2="336" stroke="#e1e0d9" stroke-width="1"/>
-<text x="331.5" y="354" font-size="11" fill="#898781" text-anchor="middle">200</text>
-<line x1="399.2" y1="86" x2="399.2" y2="336" stroke="#e1e0d9" stroke-width="1"/>
-<text x="399.2" y="354" font-size="11" fill="#898781" text-anchor="middle">400</text>
-<line x1="466.9" y1="86" x2="466.9" y2="336" stroke="#e1e0d9" stroke-width="1"/>
-<text x="466.9" y="354" font-size="11" fill="#898781" text-anchor="middle">600</text>
-<line x1="534.6" y1="86" x2="534.6" y2="336" stroke="#e1e0d9" stroke-width="1"/>
-<text x="534.6" y="354" font-size="11" fill="#898781" text-anchor="middle">800</text>
-<line x1="602.3" y1="86" x2="602.3" y2="336" stroke="#e1e0d9" stroke-width="1"/>
-<text x="602.3" y="354" font-size="11" fill="#898781" text-anchor="middle">1000</text>
-<line x1="670.0" y1="86" x2="670.0" y2="336" stroke="#e1e0d9" stroke-width="1"/>
-<text x="670.0" y="354" font-size="11" fill="#898781" text-anchor="middle">1200</text>
-<line x1="263.84000000000003" y1="86" x2="263.84000000000003" y2="336" stroke="#c3c2b7" stroke-width="1"/>
-<text x="670" y="374" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
-<g fill="#86b6ef"><path d="M263.84000000000003,101.0 H363.51234 Q367.51234,101.0 367.51234,105.0 V119.0 Q367.51234,123.0 363.51234,123.0 H263.84000000000003 Z"/></g>
-<text x="251.84000000000003" y="116.5" font-size="13" fill="#52514e" text-anchor="end">-ub 512, dequant + cuBLAS</text>
-<rect x="370.5" y="101.0" width="29.8" height="22" fill="#fcfcfb"/>
-<text x="375.5" y="116.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">306</text>
-<g fill="#2a78d6"><path d="M263.84000000000003,141.0 H484.81879333333336 Q488.81879333333336,141.0 488.81879333333336,145.0 V159.0 Q488.81879333333336,163.0 484.81879333333336,163.0 H263.84000000000003 Z"/></g>
-<text x="251.84000000000003" y="156.5" font-size="13" fill="#52514e" text-anchor="end">-ub 512, batched MoE kernel</text>
-<rect x="491.8" y="141.0" width="29.8" height="22" fill="#fcfcfb"/>
-<text x="496.8" y="156.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">665</text>
-<g fill="#86b6ef"><path d="M263.84000000000003,181.0 H439.0919466666667 Q443.0919466666667,181.0 443.0919466666667,185.0 V199.0 Q443.0919466666667,203.0 439.0919466666667,203.0 H263.84000000000003 Z"/></g>
-<text x="251.84000000000003" y="196.5" font-size="13" fill="#52514e" text-anchor="end">-ub 2048, dequant + cuBLAS</text>
-<rect x="446.1" y="181.0" width="29.8" height="22" fill="#fcfcfb"/>
-<text x="451.1" y="196.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">530</text>
-<g fill="#2a78d6"><path d="M263.84000000000003,221.0 H579.1494533333333 Q583.1494533333333,221.0 583.1494533333333,225.0 V239.0 Q583.1494533333333,243.0 579.1494533333333,243.0 H263.84000000000003 Z"/></g>
-<text x="251.84000000000003" y="236.5" font-size="13" fill="#52514e" text-anchor="end">-ub 2048, batched MoE kernel</text>
-<rect x="586.1" y="221.0" width="29.8" height="22" fill="#fcfcfb"/>
-<text x="591.1" y="236.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">943</text>
-<g fill="#86b6ef"><path d="M263.84000000000003,261.0 H467.25237333333337 Q471.25237333333337,261.0 471.25237333333337,265.0 V279.0 Q471.25237333333337,283.0 467.25237333333337,283.0 H263.84000000000003 Z"/></g>
-<text x="251.84000000000003" y="276.5" font-size="13" fill="#52514e" text-anchor="end">-ub 4096, dequant + cuBLAS</text>
-<rect x="474.3" y="261.0" width="29.8" height="22" fill="#fcfcfb"/>
-<text x="479.3" y="276.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">613</text>
-<g fill="#2a78d6"><path d="M263.84000000000003,301.0 H604.3313733333333 Q608.3313733333333,301.0 608.3313733333333,305.0 V319.0 Q608.3313733333333,323.0 604.3313733333333,323.0 H263.84000000000003 Z"/></g>
-<text x="251.84000000000003" y="316.5" font-size="13" fill="#52514e" text-anchor="end">-ub 4096, batched MoE kernel</text>
-<rect x="611.3" y="301.0" width="37.1" height="22" fill="#fcfcfb"/>
-<text x="616.3" y="316.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1018</text>
+<text x="24" y="58" font-size="13" fill="#52514e">tokens per second by micro-batch size, each step on top of the previous one (pinned clocks)</text>
+<line x1="314.8" y1="86" x2="314.8" y2="456" stroke="#e1e0d9" stroke-width="1"/>
+<text x="314.8" y="474" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="365.5" y1="86" x2="365.5" y2="456" stroke="#e1e0d9" stroke-width="1"/>
+<text x="365.5" y="474" font-size="11" fill="#898781" text-anchor="middle">200</text>
+<line x1="416.3" y1="86" x2="416.3" y2="456" stroke="#e1e0d9" stroke-width="1"/>
+<text x="416.3" y="474" font-size="11" fill="#898781" text-anchor="middle">400</text>
+<line x1="467.0" y1="86" x2="467.0" y2="456" stroke="#e1e0d9" stroke-width="1"/>
+<text x="467.0" y="474" font-size="11" fill="#898781" text-anchor="middle">600</text>
+<line x1="517.8" y1="86" x2="517.8" y2="456" stroke="#e1e0d9" stroke-width="1"/>
+<text x="517.8" y="474" font-size="11" fill="#898781" text-anchor="middle">800</text>
+<line x1="568.5" y1="86" x2="568.5" y2="456" stroke="#e1e0d9" stroke-width="1"/>
+<text x="568.5" y="474" font-size="11" fill="#898781" text-anchor="middle">1000</text>
+<line x1="619.3" y1="86" x2="619.3" y2="456" stroke="#e1e0d9" stroke-width="1"/>
+<text x="619.3" y="474" font-size="11" fill="#898781" text-anchor="middle">1200</text>
+<line x1="670.0" y1="86" x2="670.0" y2="456" stroke="#e1e0d9" stroke-width="1"/>
+<text x="670.0" y="474" font-size="11" fill="#898781" text-anchor="middle">1400</text>
+<line x1="314.8" y1="86" x2="314.8" y2="456" stroke="#c3c2b7" stroke-width="1"/>
+<text x="670" y="494" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
+<g fill="#86b6ef"><path d="M314.8,101.0 H388.51268571428574 Q392.51268571428574,101.0 392.51268571428574,105.0 V119.0 Q392.51268571428574,123.0 388.51268571428574,123.0 H314.8 Z"/></g>
+<text x="302.8" y="116.5" font-size="13" fill="#52514e" text-anchor="end">-ub 512, dequant + cuBLAS</text>
+<rect x="395.5" y="101.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="400.5" y="116.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">306</text>
+<g fill="#86b6ef"><path d="M314.8,141.0 H479.4438857142857 Q483.4438857142857,141.0 483.4438857142857,145.0 V159.0 Q483.4438857142857,163.0 479.4438857142857,163.0 H314.8 Z"/></g>
+<text x="302.8" y="156.5" font-size="13" fill="#52514e" text-anchor="end">-ub 512, batched MoE kernel</text>
+<rect x="486.4" y="141.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="491.4" y="156.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">665</text>
+<g fill="#2a78d6"><path d="M314.8,181.0 H503.67359999999996 Q507.67359999999996,181.0 507.67359999999996,185.0 V199.0 Q507.67359999999996,203.0 503.67359999999996,203.0 H314.8 Z"/></g>
+<text x="302.8" y="196.5" font-size="13" fill="#52514e" text-anchor="end">-ub 512, + chunked gated delta net</text>
+<rect x="510.7" y="181.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="515.7" y="196.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">760</text>
+<g fill="#86b6ef"><path d="M314.8,221.0 H445.16708571428575 Q449.16708571428575,221.0 449.16708571428575,225.0 V239.0 Q449.16708571428575,243.0 445.16708571428575,243.0 H314.8 Z"/></g>
+<text x="302.8" y="236.5" font-size="13" fill="#52514e" text-anchor="end">-ub 2048, dequant + cuBLAS</text>
+<rect x="452.2" y="221.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="457.2" y="236.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">530</text>
+<g fill="#86b6ef"><path d="M314.8,261.0 H550.1540571428571 Q554.1540571428571,261.0 554.1540571428571,265.0 V279.0 Q554.1540571428571,283.0 550.1540571428571,283.0 H314.8 Z"/></g>
+<text x="302.8" y="276.5" font-size="13" fill="#52514e" text-anchor="end">-ub 2048, batched MoE kernel</text>
+<rect x="557.2" y="261.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="562.2" y="276.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">943</text>
+<g fill="#2a78d6"><path d="M314.8,301.0 H603.3325714285714 Q607.3325714285714,301.0 607.3325714285714,305.0 V319.0 Q607.3325714285714,323.0 603.3325714285714,323.0 H314.8 Z"/></g>
+<text x="302.8" y="316.5" font-size="13" fill="#52514e" text-anchor="end">-ub 2048, + chunked gated delta net</text>
+<rect x="610.3" y="301.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="615.3" y="316.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1153</text>
+<g fill="#86b6ef"><path d="M314.8,341.0 H466.27611428571424 Q470.27611428571424,341.0 470.27611428571424,345.0 V359.0 Q470.27611428571424,363.0 466.27611428571424,363.0 H314.8 Z"/></g>
+<text x="302.8" y="356.5" font-size="13" fill="#52514e" text-anchor="end">-ub 4096, dequant + cuBLAS</text>
+<rect x="473.3" y="341.0" width="29.8" height="22" fill="#fcfcfb"/>
+<text x="478.3" y="356.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">613</text>
+<g fill="#86b6ef"><path d="M314.8,381.0 H569.0304 Q573.0304,381.0 573.0304,385.0 V399.0 Q573.0304,403.0 569.0304,403.0 H314.8 Z"/></g>
+<text x="302.8" y="396.5" font-size="13" fill="#52514e" text-anchor="end">-ub 4096, batched MoE kernel</text>
+<rect x="576.0" y="381.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="581.0" y="396.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1018</text>
+<g fill="#2a78d6"><path d="M314.8,421.0 H636.3661714285715 Q640.3661714285715,421.0 640.3661714285715,425.0 V439.0 Q640.3661714285715,443.0 636.3661714285715,443.0 H314.8 Z"/></g>
+<text x="302.8" y="436.5" font-size="13" fill="#52514e" text-anchor="end">-ub 4096, + chunked gated delta net</text>
+<rect x="643.4" y="421.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="648.4" y="436.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1283</text>
 </svg>

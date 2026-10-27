@@ -136,10 +136,10 @@ thresholds; the GEMV path (≤ 8 tokens, F32 activations) ≤ 1.1e-7.
 
 End to end at pinned clocks, alternating processes with caches dropped before each (`tg64 -r 3`, then
 `-p 8192 -n 0 -b 8192 -r 2`), tok/s. The first column is the published patch, the second the first batched kernel
-(commit 65baf68 plus the conv-state concat below, 5fd8a05), the third the persistent kernel; the 5fd8a05 numbers
+(commit 65baf68 plus the conv-state concat below, 5fd8a05), the third the persistent kernel (66f5be6); the 5fd8a05 numbers
 reproduce within 0.3 % across the two sessions, which ran published / 5fd8a05 and 5fd8a05 / this patch:
 
-| | published patch | 5fd8a05 | this patch | vs published |
+| | published patch | 5fd8a05 | 66f5be6 | vs published |
 |---|---:|---:|---:|---:|
 | pp8192, `-ub 512` | 306.5 / 306.0 | 514.6 / 513.3 | **664.2 / 665.1** | 2.17× |
 | pp8192, `-ub 2048` | 526.5 / 532.7 | 819.2 / 816.4 | **942.0 / 944.9** | 1.78× |
@@ -174,7 +174,7 @@ The earlier profile's "12 % idle" was cold start inside the one forward nsys tra
 modules, the first cuBLAS call (208 ms), growth of the memory pool. Later forwards run as CUDA graphs (the MoE matrices
 no longer sync with the host), so the 3-repetition profile traces only the first one. Steady state is ≈ 2 % idle.
 
-Where pp2048 (`-ub 2048`, this patch, one forward 2.20 s under nsys; it was 2.56 s with the first batched kernel)
+Where pp2048 (`-ub 2048`, persistent MoE kernel 66f5be6, one forward 2.20 s under nsys; it was 2.56 s with the first batched kernel)
 goes ([`tools/fwd_breakdown.py`](../tools/fwd_breakdown.py) on the nsys export, last forward): `k_hp_mm_ids` 40 % (874 ms, was 1237), `gated_delta_net_cuda` 22 % (15.9 ms per layer, unchanged), cuBLAS GEMMs
 of the dense matrices 8.7 %, F32→BF16 conversions 5.8 %, `rms_norm` 5.6 %, SwiGLU 2.5 %, the weighted sum of the
 experts 1.7 %, broadcast adds 1.7 %, `ssm_conv` 1.6 %, dense dequant 1.4 %, conv-state concat 1.2 %, idle 2.4 %.
@@ -197,6 +197,69 @@ continues across chunk boundaries (64 registers, no spills) did not help.
 Measurement note: with dynamic clocks the GPU governor (`nvhost_podgov`, 306–1300 MHz) ramps up only under sustained
 load, so kernel microbenchmarks need a warm-up; without one, two runs of the same kernel differed by 1.5×.
 `bench/moe_prefill.cpp` warms the GPU for 2 s.
+
+## Prefill: chunked gated delta net (upstream kernel, ported)
+
+In `b29c606` the CUDA gated delta net is a token-by-token recurrence: each warp owns one column of the 128 × 128 state
+and does two warp reductions per token, 15.9 ms per layer for 2048 tokens, 22 % of the forward. Upstream llama.cpp has
+since merged two replacements, both ported here: #30087 (four state columns per warp, same algorithm, different FP32
+summation order) and #29353 (chunked kernel: chunks of 16 tokens, the products on the tensor cores with every FP32
+operand split into a high and a low BF16 part and three `mma` per product, FP32 state). The port keeps this patch's
+in-place state read (the chunked kernel reads the state rows through the same ids), takes the two swizzled `ldmatrix`
+helpers it needs into `mma.cuh`, and adds Orin (cc 8.7) to the chunked kernel's architecture list.
+`test-backend-ops -o GATED_DELTA_NET`: 43/43.
+
+One layer against a sequential recurrence in double precision ([`bench/gdn_check.cpp`](../bench/gdn_check.cpp): 32 value
+heads, 16 key heads, L2-normalised q and k, β = sigmoid, decay from layer 0's `ssm_a` and `dt_bias`; median of 10,
+pinned clocks):
+
+| kernel | ms, 512 tokens | ms, 2048 tokens | relative RMS error, tokens 1024–2047 | final state |
+|---|---:|---:|---:|---:|
+| one column per warp (`b29c606`) | 3.97 | 15.78 | 1.43e-6 | 1.41e-6 |
+| four columns per warp (#30087) | 1.88 | 7.41 | 1.43e-6 | 1.41e-6 |
+| chunked (#29353) | **0.87** | **3.30** | 8.3e-6 | 7.0e-6 |
+
+The chunked kernel is ≈ 6× less accurate than the FP32 recurrence, ≈ 200× below one BF16 rounding (≤ 3.9e-3), which
+every matmul input in the model takes anyway. Of its launch shapes, upstream's choice for 32 heads (one block of 256
+threads per head) is also the fastest on Orin: 3.33 ms at 2048 tokens vs 4.66–7.28 ms for the value-split variants.
+
+End to end, alternating 66f5be6 / this patch, two rounds (pp: `-b 8192 -r 2`, `-ub 4096`: base / new / new / base),
+caches dropped before each process, desktop stopped, pinned clocks, tok/s:
+
+| | 66f5be6 | this patch | change |
+|---|---:|---:|---:|
+| pp2048, `-ub 512` | 683.4 / 684.1 | **781.3 / 780.2** | +14.2 % |
+| pp8192, `-ub 512` | 670.4 / 668.4 | **760.0 / 760.4** | +13.6 % |
+| pp2048, `-ub 2048` | 966.2 / 968.2 | **1175.4 / 1174.8** | +21.5 % |
+| pp8192, `-ub 2048` | 954.1 / 953.8 | **1153.7 / 1152.3** | +20.9 % |
+| pp8192, `-ub 4096` | 1024.6 / 1024.8 | **1286.4 / 1280.1** | +25.2 % |
+| tg64 @ 0 / @ 2048 | 30.79 / 30.82, 30.81 / 30.85 | 30.81 / 30.87, 30.76 / 30.79 | ±0.1 % |
+
+The four-columns-per-warp kernel alone gives +13 % at `-ub 2048` and +9 % at `-ub 512`. Decode uses the recurrent
+kernel either way. A 2048-token forward at `-ub 2048` (nsys, last eager forward) now takes 1.83 s: `k_hp_mm_ids` 48 %,
+cuBLAS GEMMs of the dense matrices 10.4 %, F32→BF16 conversions 6.9 %, `rms_norm` 6.8 %, the chunked gated delta net
+5.5 % (3.3 ms per layer), SwiGLU 3.0 %, weighted sum of the experts 2.0 %, broadcast adds 2.0 %, `ssm_conv` 1.9 %, dense
+dequant 1.6 %, conv-state concat 1.5 %, idle 3.2 %.
+
+**Is the output still the same?** Not bitwise: any change of FP32 summation order moves the next-token distributions,
+and this one does too. `llama-perplexity --kl-divergence` on wikitext-2 (test), 8 × 2048 tokens, against 66f5be6 at
+`-ub 2048`:
+
+| change against the base run | PPL | mean KLD | same top-1 |
+|---|---:|---:|---:|
+| none (second run of the same build) | 4.7470 | 0 | 100 % |
+| same build, `-ub 512` | 4.7551 | 0.0021 | 98.40 % |
+| same build, `GGML_BF16N_REFERENCE=1` (dequant + cuBLAS) | 4.7451 | 0.0019 | 98.25 % |
+| four columns per warp | 4.7467 | 0.0021 | 98.44 % |
+| chunked kernel (this patch) | 4.7465 | 0.0024 | 98.30 % |
+| this patch at `-ub 512` vs 66f5be6 at `-ub 512` (state carried over four micro-batches) | 4.7489 vs 4.7551 | 0.0026 | 98.36 % |
+
+A different micro-batch size, or this patch's own exact-dequantisation reference path, moves the outputs as much as the
+new kernel: ≈ 1.6 % of positions are near-ties between the two best tokens, and any rounding difference upstream of them
+can flip the choice. In greedy generation the text stays identical up to the first such tie and then continues differently (when the
+batched MoE kernel changed the summation order, two of four `scripts/run_prompts.sh` prompts first differed where the
+two best tokens had 0.476 vs 0.457 and 0.200 vs 0.199). Perplexity does not move (±0.005).
+The weights stay bit-exact, and a given build with given settings is deterministic.
 
 ## KV-cache compressibility (measured, not implemented)
 
@@ -263,6 +326,9 @@ compressed bytes.
   * BF16N kernels vs `GGML_BF16N_REFERENCE=1` (exact dequant + stock cuBLAS BF16 path): identical text, no top-1
     divergence in 288 tokens, top-1 |Δlogprob| median 1.2e-5 (p99 0.07; the reference rounds activations to BF16).
   * GDN state in place vs gathered copy, embedding on GPU vs CPU: bitwise-identical text and logprobs.
+* Prefill summation order (batched MoE kernel, chunked gated delta net, micro-batch size) moves next-token
+  distributions by a mean KLD ≈ 0.002 (top-1 agreement ≈ 98.3–98.4 % on wikitext-2) with unchanged perplexity; see
+  [the gated delta net section](#prefill-chunked-gated-delta-net-upstream-kernel-ported).
 
 ## What did not help (measured)
 

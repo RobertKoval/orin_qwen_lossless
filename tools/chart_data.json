@@ -143,9 +143,9 @@
   },
   "prefill": {
     "title": "Prefill speed, 8192-token prompt",
-    "subtitle": "tokens per second by micro-batch size: dequant + cuBLAS per expert vs the batched MoE kernel (pinned clocks)",
+    "subtitle": "tokens per second by micro-batch size, each step on top of the previous one (pinned clocks)",
     "unit": "tokens / s",
-    "axis_max": 1200,
+    "axis_max": 1400,
     "ticks": [
       0,
       200,
@@ -153,7 +153,8 @@
       600,
       800,
       1000,
-      1200
+      1200,
+      1400
     ],
     "rows": [
       {
@@ -164,7 +165,12 @@
       {
         "label": "-ub 512, batched MoE kernel",
         "value": 664.7,
-        "value_label": "665",
+        "value_label": "665"
+      },
+      {
+        "label": "-ub 512, + chunked gated delta net",
+        "value": 760.2,
+        "value_label": "760",
         "highlight": true
       },
       {
@@ -175,7 +181,12 @@
       {
         "label": "-ub 2048, batched MoE kernel",
         "value": 943.4,
-        "value_label": "943",
+        "value_label": "943"
+      },
+      {
+        "label": "-ub 2048, + chunked gated delta net",
+        "value": 1153.0,
+        "value_label": "1153",
         "highlight": true
       },
       {
@@ -186,7 +197,12 @@
       {
         "label": "-ub 4096, batched MoE kernel",
         "value": 1017.8,
-        "value_label": "1018",
+        "value_label": "1018"
+      },
+      {
+        "label": "-ub 4096, + chunked gated delta net",
+        "value": 1283.2,
+        "value_label": "1283",
         "highlight": true
       }
     ]
