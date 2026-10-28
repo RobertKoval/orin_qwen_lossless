@@ -438,6 +438,26 @@ Alternating previous build / rebased, two rounds, pinned clocks, desktop stopped
 | tg64 @ 0 | 31.07 / 31.12 | **31.23 / 31.24** | +0.4 % |
 | tg64 @ 2048 | 31.13 / 31.16 | 31.14 / 31.17 | unchanged |
 
+## Serving: full window and images
+
+`llama-server` with the full 262,144-token window, one slot, `-ub 2048` and the BF16 vision projector
+(`--mmproj`) leaves about 4 GB of the 61.4 GiB free with the desktop running. Two bugs only showed up there:
+
+* **The projector did not start.** Every ggml CUDA context reserves 32 GB of virtual address space for its memory pool
+  up front; the projector has its own context, and a second reservation next to the model fails
+  (`cuMemAddressReserve`), although the pool maps only tens of MB. `GGML_CUDA_VMM_POOL_GB` sets the reservation; the
+  server runs with 4.
+* **Image prompts crashed with an illegal memory access in the gated delta net.** The in-place state read passes the
+  kernel the row index of the GET_ROWS it replaces. That index is a graph input, and ggml's allocator frees it after its
+  last reader, which for the last recurrent layer is that layer's own GET_ROWS: the memory could be reused before the
+  kernel ran (a debug print read 1058905918, the bits of a float). Text prompts survived only by allocation luck. The
+  in-place read is now enabled only for layers whose index is still read by a later node; the last layer gathers
+  normally (2 MB per token).
+
+Checks after the fix: a 1024×576 image (598 prompt tokens) and a 3840×2160 one (4102 tokens) are described correctly,
+and the answer is text-identical to a run with the in-place read disabled. `llama-bench` pp2048 / tg64, pinned clocks,
+desktop running: 1347.5 / 30.64 tok/s with the fix, 1352.4 / 30.38 with `GGML_CUDA_NO_GDN_ROWS=1`.
+
 ## Correctness
 
 * Weights: bit-exact round trip for every tensor (see above).

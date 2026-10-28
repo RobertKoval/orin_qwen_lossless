@@ -30,13 +30,14 @@ decodes it inside llama.cpp's CUDA matrix–vector kernels, so a decode step str
 * **Lossless.** All 34.66 B weights round-trip bit-exactly, verified on the GPU for every tensor when the model loads.
   Greedy generations follow llama.cpp's stock BF16 path up to near-ties that any change of summation order can flip
   (see [Limitations](#limitations)).
-* **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671), which leaves space for long contexts.
+* **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671): the model's full 262,144-token window
+  and its vision projector fit beside the weights.
 * **Fast.** ≈ 31 tok/s single-stream decode and 830–1480 tok/s prefill on a 60 W board. Per matrix, the fused
   decode+GEMV beats raw BF16: the 248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **GPU only.** Embedding, weights and every model op run on the GPU; MoE experts are picked on the GPU, so the decode
   step stays one CUDA graph.
-* **Drop-in.** One patch on upstream llama.cpp, an ordinary BF16 GGUF and `LLAMA_BF16N=hybrid`. Tested with
-  `llama-server` and `llama-bench`.
+* **Drop-in.** One patch on upstream llama.cpp, an ordinary BF16 GGUF and `LLAMA_BF16N=hybrid`. Runs as
+  `llama-server` with the OpenAI-compatible API, text and images, and under `llama-bench`.
 
 <p align="center">
   <picture>
@@ -116,7 +117,8 @@ layers keep a fixed-size state. The step time fits `33.5 ms + 0.138 µs × conte
 |---|---:|---:|---:|---:|---:|---:|
 | decode, tok/s | 30.4 | 29.7 | 26.3 | 23.4 | 19.3 | 14.4 |
 
-Measured before the clocks were pinned (see [docs/RESULTS.md](docs/RESULTS.md)); with pinned clocks the 2K point is now 31.2.
+Measured on the previous base (`b29c606`) with dynamic clocks ([docs/RESULTS.md](docs/RESULTS.md#long-context)); the
+current build with pinned clocks gives 31.2 at 2K.
 
 Correctness, methodology and the full history of what was tried: [docs/RESULTS.md](docs/RESULTS.md).
 
@@ -126,13 +128,27 @@ Correctness, methodology and the full history of what was tried: [docs/RESULTS.m
 git clone https://github.com/RobertKoval/orin_qwen_lossless && cd orin_qwen_lossless
 scripts/build_llama.sh        # clones llama.cpp 338fce6, applies the patch, builds for SM87
 
-# a BF16 GGUF of Qwen/Qwen3.6-35B-A3B (llama.cpp convert_hf_to_gguf.py --outtype bf16)
-LLAMA_BF16N=hybrid ./llama.cpp/build/bin/llama-server -m qwen3.6-35b-a3b-bf16.gguf -ngl 99 -fa on -c 32768
+# BF16 GGUFs of Qwen/Qwen3.6-35B-A3B: the language model and the vision projector
+python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --outtype bf16 --outfile qwen3.6-35b-a3b-bf16.gguf
+python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --outtype bf16 --mmproj --outfile mmproj-bf16.gguf
+
+# OpenAI-compatible server (/v1/chat/completions, images included) with the full 262,144-token window
+LLAMA_BF16N=hybrid GGML_CUDA_VMM_POOL_GB=4 ./llama.cpp/build/bin/llama-server \
+  -m qwen3.6-35b-a3b-bf16.gguf --mmproj mmproj-bf16.gguf -c 262144 -np 1 -ngl 99 -fa on --fit off \
+  -b 2048 -ub 2048 -cram 0 --alias qwen3-a3b-30b --host 0.0.0.0 --port 8000
 ```
 
-Loading reads the 69 GB GGUF and encodes it (≈ 3–4 min on the Orin's NVMe and CPU). Run fully offloaded (`-ngl 99`).
-For long prompts use larger micro-batches: `-ub 2048` lifts prefill from ≈ 830 to ≈ 1320 tok/s (measured with
-`llama-bench`; it needs a larger compute buffer).
+Loading reads the 69 GB GGUF and encodes it (≈ 3 min on the Orin's NVMe and CPU). With the full window and the
+projector, about 4 GB of the 61.4 GiB stay free after a 4K image (desktop running), so the server gets one slot (`-np 1`).
+What the flags are for:
+
+* `--fit off`: llama.cpp's automatic fitting does not see the encoded exponent streams (≈ 11 GB) and would shrink
+  the context; set `-c` yourself (KV costs 20 KiB per token, 5 GiB for the full window).
+* `-ub 2048`: larger micro-batches lift prefill from ≈ 830 to ≈ 1320 tok/s at the price of a larger compute buffer.
+* `-cram 0`: no prompt cache in RAM, which the unified memory cannot spare.
+* `GGML_CUDA_VMM_POOL_GB=4`: the projector's CUDA context needs its own pool; the default 32 GB address reservation
+  per pool fails next to the model.
+
 Close desktop applications for best speed: on Orin the compositor and remote desktop share the GPU and DRAM.
 
 | variable | effect |
@@ -144,6 +160,7 @@ Close desktop applications for best speed: on Orin the compositor and remote des
 | `GGML_BF16N_REFERENCE=1` | route every product through exact dequant + stock cuBLAS (slow; for verification) |
 | `GGML_BF16N_NO_MMA=1` | prefill MoE through per-expert dequant + cuBLAS instead of the batched kernel |
 | `GGML_CUDA_NO_GDN_ROWS=1` | disable the in-place recurrent-state read |
+| `GGML_CUDA_VMM_POOL_GB=<n>` | virtual address space each CUDA memory pool reserves (default 32); `4` lets the image projector's context start next to the model |
 | `GGML_BF16N_HP_GLU=1` | fused gate/up/SWIGLU for pair-Huffman experts in decode (measured slower on Orin) |
 | `GGML_BF16N_NO_GLU=1` | no gate/up/SWIGLU fusion at all (decode GEMV and prefill MoE kernel) |
 
@@ -213,13 +230,16 @@ what worked, what did not, and by how much.
 
 * Tested on one configuration: Qwen3.6-35B-A3B, Jetson AGX Orin 64GB (SM87), CUDA 12.6, llama.cpp `338fce6`.
 * The compressed exponent buffers are allocated outside ggml's buffers, so llama.cpp's automatic memory fitting does not
-  see them (≈ 11 GB); set the context size explicitly.
+  see them (≈ 11 GB); run with `--fit off` and set the context size explicitly.
+* Not compressed yet: the vision projector (0.9 GB BF16) and the KV cache (F16). The checkpoint's multi-token-prediction
+  head is not used.
 * Dense matrices in prefill are still dequantised to BF16 per micro-batch.
 * Outputs are deterministic for a given build and settings, but not bitwise equal across prefill kernels or micro-batch
   sizes: summation order moves next-token distributions by a mean KLD ≈ 0.002 (top-1 agreement ≈ 98.4 % on wikitext-2,
   perplexity unchanged). The weights are bit-exact either way; see [docs/RESULTS.md](docs/RESULTS.md).
 * The chunk-major expert layout that the prefill kernel needs costs 0.5 % of decode speed (gate/up GEMV 82 vs 80 µs).
-* The in-place recurrent-state read is only enabled for single-sequence batches.
+* The in-place recurrent-state read is only enabled for single-sequence batches (and not for the last recurrent layer,
+  whose row index is freed before its kernel runs).
 
 ## Roadmap
 
@@ -228,6 +248,8 @@ fixed cost over 231 kernel launches per token, ≈ 3.4 ms in ≈ 1000 small kern
 matrices, so the practical ceiling with this format is ≈ 40 tok/s and a persistent per-layer decode kernel is the way
 there. Prefill is limited by the latency of the MoE kernel's activation loads, which needs a different kernel shape
 (the expert weights decoded straight into tensor-core fragments).
+For serving, the next steps are memory headroom at the full window (the projector and the KV cache compressed
+losslessly) and the multi-token-prediction head as a speculative draft.
 The next research stages, with expected gains and how to measure them, are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License and credits
