@@ -111,9 +111,9 @@ Measured (RESULTS.md, MTP section): the checkpoint's MTP head as a draft accepts
 steps because every column re-decodes the weights (dense 2.6× one column at 3–4 columns) and each token brings its own
 experts (3.7× at 4 tokens). A multi-column GEMV that decodes each weight once and multiplies it with all columns (and
 decodes a shared expert once for the tokens routed to it) leaves the experts as the floor: ≈ 42–46 tok/s estimated.
-Memory comes first: the draft adds ≈ 1.5–2 GB, which the full window with an image does not have today (share the
-model's embedding and output matrices with the draft, compress the KV cache). This is the only lever beyond ≈ 45 tok/s
-on this hardware.
+The draft fits next to the full window and an image since its context uses a 64-token micro-batch and an F16 KV
+cache (+1.74 GB in total, 2.7 GB free after a 4K image); sharing the model's embedding and output matrices would save
+≈ 0.7 GB more. This is the only lever beyond ≈ 45 tok/s on this hardware.
 
 ## Stage 7 — platform
 

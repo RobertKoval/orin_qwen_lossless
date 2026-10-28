@@ -493,10 +493,29 @@ tensors (single-tensor harness): a dense matrix costs 1.34× one column for 2 co
 ≈ 1.15× and leave the experts as the floor: ≈ 53–59 ms per 4-token verification plus ≈ 10 ms of drafting for 2.87 tokens,
 ≈ 42–46 tok/s (+36–48 %).
 
-Memory: with the full window, the projector and the Q4_K_M draft (draft KV in q8_0), 1.23 GB stayed free in the
-Normal zone after loading (the kernel's min watermark is 1.04 GB) and a 3840×2160 image got the server OOM-killed, so
-the served configuration runs without the draft until the KV cache is compressed or the draft shares the model's
-embedding and output matrices (≈ 0.7 GB of the draft file).
+Memory. The first attempt (full window, projector, Q4_K_M draft with q8_0 draft KV, defaults otherwise) left 1.23 GB
+free in the Normal zone after loading (the kernel's min watermark is 1.04 GB) and a 3840×2160 image got the server
+OOM-killed. `-lv 4` shows where the draft's ≈ 4.2 GB went:
+
+| draft context, full window | `-ub 2048`, KV q8_0 | `--spec-draft-n-ubatch 64`, KV q8_0 | `--spec-draft-n-ubatch 64`, KV F16 |
+|---|---:|---:|---:|
+| weights | 1190 MiB | 1190 MiB | 1190 MiB |
+| KV cache (1 layer) | 272 MiB | 272 MiB | 512 MiB |
+| CUDA compute buffer | 1728 MiB | 550 MiB | **37 MiB** |
+| host compute buffer | 1040 MiB | 33 MiB | 33 MiB |
+| Normal zone free after load (no draft: 5.27 GB) | OOM at the projector warm-up | 3.20 GB | **3.53 GB** |
+
+* The host buffer is the attention mask, window × micro-batch in F16 (262,144 × 2048 × 2 B = 1 GiB); a 64-token draft
+  micro-batch shrinks it to 32 MiB. Prefill with the draft runs at 1105 vs 1185 tok/s on a 16.7K-token prompt.
+* A quantized draft KV makes flash attention keep F16 copies of K and V for the whole window (2 × 256 MiB), so the
+  F16 draft cache is smaller in total.
+* The main context has the same mask: 1056 MiB in the host buffer at `-ub 2048` and very likely a device copy of the
+  same size inside its 1440 MiB compute buffer. On a unified-memory board the copy is redundant, but upstream disables
+  the CUDA backend's integrated-GPU path (reading host buffers directly) because of corrupted outputs (llama.cpp
+  #15034), so it is not used here; `-ub 1024` would halve both at the cost of prefill speed.
+
+With the last column the production server (full window, projector, Q4_K_M draft, one draft token) answers a
+3840×2160 image at 33.85 tok/s and text at 33.4–34.0 tok/s, and 2.7 GB stay free after the image.
 
 ## Correctness
 

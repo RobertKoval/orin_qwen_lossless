@@ -32,7 +32,8 @@ decodes it inside llama.cpp's CUDA matrix–vector kernels, so a decode step str
   (see [Limitations](#limitations)).
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671): the model's full 262,144-token window
   and its vision projector fit beside the weights.
-* **Fast.** ≈ 31 tok/s single-stream decode and 830–1480 tok/s prefill on a 60 W board. Per matrix, the fused
+* **Fast.** ≈ 31 tok/s single-stream decode (≈ 34 with the checkpoint's own multi-token-prediction head as a
+  speculative draft) and 830–1480 tok/s prefill on a 60 W board. Per matrix, the fused
   decode+GEMV beats raw BF16: the 248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **GPU only.** Embedding, weights and every model op run on the GPU; MoE experts are picked on the GPU, so the decode
   step stays one CUDA graph.
@@ -137,6 +138,13 @@ python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --outtype bf16 --mmproj 
 LLAMA_BF16N=hybrid GGML_CUDA_VMM_POOL_GB=4 ./llama.cpp/build/bin/llama-server \
   -m qwen3.6-35b-a3b-bf16.gguf --mmproj mmproj-bf16.gguf -c 262144 -np 1 -ngl 99 -fa on --fit off \
   -b 2048 -ub 2048 -cram 0 --alias qwen3-a3b-30b --host 0.0.0.0 --port 8000
+
+# optional: the checkpoint's multi-token-prediction head as a speculative draft (+7–10 % decode; the full model still
+# verifies every token, so the draft may be quantized)
+python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --mtp --outtype bf16 --outfile mtp-bf16.gguf
+./llama.cpp/build/bin/llama-quantize mtp-bf16.gguf mtp-Q4_K_M.gguf Q4_K_M
+# then add to the server command:
+#   -md mtp-Q4_K_M.gguf --spec-type draft-mtp -ngld 99 --spec-draft-n-max 1 --spec-draft-n-ubatch 64
 ```
 
 Loading reads the 69 GB GGUF and encodes it (≈ 3 min on the Orin's NVMe and CPU). With the full window and the
@@ -149,6 +157,10 @@ What the flags are for:
 * `-cram 0`: no prompt cache in RAM, which the unified memory cannot spare.
 * `GGML_CUDA_VMM_POOL_GB=4`: the projector's CUDA context needs its own pool; the default 32 GB address reservation
   per pool fails next to the model.
+* Draft flags: one draft token (verifying more costs more than it gains with today's kernels); a 64-token draft
+  micro-batch, because the draft context's attention mask is window × micro-batch (1 GiB at 2048); F16 draft KV,
+  because a quantized one makes flash attention keep F16 copies of the whole window. With all of it about 2.7 GB stay
+  free after a 4K image.
 
 Close desktop applications for best speed: on Orin the compositor and remote desktop share the GPU and DRAM.
 
@@ -233,9 +245,9 @@ what worked, what did not, and by how much.
 * The compressed exponent buffers are allocated outside ggml's buffers, so llama.cpp's automatic memory fitting does not
   see them (≈ 11 GB); run with `--fit off` and set the context size explicitly.
 * Not compressed yet: the vision projector (0.9 GB BF16) and the KV cache (F16).
-* The checkpoint's multi-token-prediction head works as a speculative draft (+7–9 % decode, see
-  [docs/RESULTS.md](docs/RESULTS.md#speculative-decoding-with-the-mtp-head)) but does not fit next to the full window
-  and an image yet.
+* The multi-token-prediction draft pays only with one draft token (+7–10 %,
+  [docs/RESULTS.md](docs/RESULTS.md#speculative-decoding-with-the-mtp-head)): verifying more tokens re-decodes the
+  weights once per token.
 * Dense matrices in prefill are still dequantised to BF16 per micro-batch.
 * Outputs are deterministic for a given build and settings, but not bitwise equal across prefill kernels or micro-batch
   sizes: summation order moves next-token distributions by a mean KLD ≈ 0.002 (top-1 agreement ≈ 98.4 % on wikitext-2,
@@ -251,9 +263,10 @@ fixed cost over 231 kernel launches per token, ≈ 3.4 ms in ≈ 1000 small kern
 matrices, so the practical ceiling with this format is ≈ 40 tok/s and a persistent per-layer decode kernel is the way
 there. Prefill is limited by the latency of the MoE kernel's activation loads, which needs a different kernel shape
 (the expert weights decoded straight into tensor-core fragments).
-For serving, the next steps are memory headroom at the full window (a losslessly compressed KV cache, the draft sharing
-the model's embedding and output matrices) and a matrix–vector kernel that decodes each weight once for several tokens,
-which would let the multi-token-prediction draft verify 3 tokens per step (≈ +35–50 % estimated, from +7–9 % today).
+For serving, the next steps are a matrix–vector kernel that decodes each weight once for several tokens, which would
+let the multi-token-prediction draft verify 3 tokens per step (≈ +35–50 % estimated, from +7–10 % today), and more
+memory headroom at the full window (a losslessly compressed KV cache, the draft sharing the model's embedding and
+output matrices).
 The next research stages, with expected gains and how to measure them, are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License and credits
