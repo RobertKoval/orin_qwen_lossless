@@ -9,8 +9,8 @@ sequence, greedy.
 Clocks: until 2026-10-26 the board ran with dynamic clocks (GPU devfreq `nvhost_podgov` 306–1300.5 MHz, CPU `schedutil`
 from 729 MHz), not with `jetson_clocks` as this file said earlier. Since a reboot that day the GPU is pinned at
 1300.5 MHz and the CPU at ≥ 2.2 GHz, and the measurement scripts print both before every run. Sections marked
-**pinned clocks** were measured that way; everything else (Throughput, Long context, the first prefill table) with
-dynamic clocks. Pinning made decode ≈ 1–3 % faster and the host-bound published prefill path 16–22 % faster, so
+**pinned clocks** were measured that way, as were Long context, Serving and the MTP section; everything else
+(Throughput, the first prefill table) with dynamic clocks. Pinning made decode ≈ 1–3 % faster and the host-bound published prefill path 16–22 % faster, so
 ratios between variants are only compared within one clock state.
 
 ## Memory
@@ -73,25 +73,27 @@ Model geometry (from the GGUF): 40 layers, every 4th is full attention (10 layer
 DeltaNet with a fixed-size state. The F16 KV cache therefore costs 10 × 2 × 2 × 256 × 2 B = **20 KiB per token**,
 5.0 GiB for the native 262,144-token window.
 
-`llama-bench -ngl 99 -fa 1 -p 0 -n 32 -d <depth>`, final patch on clean upstream, desktop running, caches dropped and
-memory compacted before the process. Depths 32K–256K are one repetition from a single sweep; 2K and 8K are `-r 3` from a
-second process (the sweep's first test right after loading read 26.4 tok/s at depth 0, a second process measured
-28.8 ± 1.7 there with one slow repetition, so the first test after load is not representative; the dedicated three-process
-runs above give 29.8).
+Current build (upstream `338fce6` + patch), pinned clocks, desktop running, caches dropped and memory compacted before
+the process: `llama-bench -ngl 99 -fa 1 -t 2 -b 2048 -ub 2048 -p 0 -n 32 -d <depth> -r 1`, one process for the whole
+sweep. At depth 262,144 llama-bench was OOM-killed twice with `-ub 2048` (its test needs 262,176 cells, and it
+allocates more than the server); the 224K point is the production server instead (`-c 262144 -ub 2048`, projector
+loaded): a 224,303-token prompt (llama.cpp sources) prefilled in 348 s (648 tok/s on average), 21 tokens generated at
+16.61 tok/s, correct answer, zone free memory ≥ 3.85 GB throughout.
 
-| depth | tok/s | ms / token | KV read per token |
+| depth | tok/s | ms / token | previous base (`b29c606`, dynamic clocks) |
 |---:|---:|---:|---:|
-| 2048 | 30.39 ± 0.43 | 32.9 | 0.04 GB |
-| 8192 | 29.69 ± 0.42 (sweep: 29.28) | 33.7 | 0.17 GB |
-| 32768 | 26.30 | 38.0 | 0.67 GB |
-| 65536 | 23.37 | 42.8 | 1.34 GB |
-| 131072 | 19.30 | 51.8 | 2.68 GB |
-| 262144 | 14.42 | 69.3 | 5.37 GB |
+| 2048 | 30.64 | 32.6 | 30.39 |
+| 8192 | 30.04 | 33.3 | 29.69 |
+| 32768 | 27.66 | 36.2 | 26.30 |
+| 65536 | 25.10 | 39.8 | 23.37 |
+| 131072 | 20.90 | 47.8 | 19.30 |
+| 224303 (server) | 16.61 | 60.2 | — |
+| 262144 | — | — | 14.42 |
 
-A least-squares line through the sweep gives `t ≈ 33.5 ms + 0.138 µs × depth`, i.e. 20 KiB per token read at
-≈ 149 GB/s (83 % of the measured 180 GB/s read bandwidth); flash attention over the KV cache is near its floor, and at 256K
-the cache traffic is larger than the weight traffic. At 262,144 tokens the run fit, but the kernel's `MemAvailable` fell
-below 100 MiB (desktop running, `-ub 512`).
+A least-squares line through 2K–128K gives `t ≈ 32.3 ms + 0.118 µs × depth` (previous base: 33.5 ms + 0.138 µs), i.e. 20 KiB
+per token read at ≈ 174 GB/s (97 % of the measured 180 GB/s read bandwidth, 85 % of the 204.8 GB/s peak); the line
+predicts 15.8 tok/s at 262,144 and 17.0 at 224K (measured 16.6 over only 21 tokens). The gain at depth (+5 % at 32K,
++8 % at 128K) is upstream's flash-attention work picked up by the rebase; the previous base also ran with dynamic clocks.
 
 Prefill of an 8192-token prompt against the micro-batch size with the first published patch (`-p 8192 -n 0 -b 8192
 -ub <n>`, one process per pair of values; MoE prefill dequantised the used experts once per micro-batch):
@@ -323,8 +325,8 @@ K and V, each 32768 × 512 F16 values. Entropies are plug-in estimates (≥ 32K 
 * Tables built on the first 4096 tokens cost only 0.02–0.06 bit on the rest, so static per-channel tables fit an
   append-only cache.
 * Outlier: V of the last attention layer (layer 39) needs only 1.93 exponent bits and 0.68 sign bits per channel.
-* With the long-context fit above, KV traffic × 0.85 predicts 15.6 instead of 14.4 tok/s at 256K (+8 %), ≈ +3 % at 64K,
-  and 0.8 GiB less memory at 262K. A lossy Q8_0 cache would predict ≈ 19 tok/s at 256K.
+* With the long-context fit above (current build), KV traffic × 0.85 predicts 17.1 instead of 15.8 tok/s at 256K (+8 %),
+  ≈ +3 % at 64K, and 0.8 GiB less memory at 262K. A lossy Q8_0 cache would predict ≈ 20.5 tok/s at 256K.
 * Single text domain (English Wikipedia prose); code or other languages may differ.
 
 ## Where a decode step goes (nsys node-level trace; tracing adds ≈ 10 %, captured with the busy desktop)
@@ -457,6 +459,44 @@ Alternating previous build / rebased, two rounds, pinned clocks, desktop stopped
 Checks after the fix: a 1024×576 image (598 prompt tokens) and a 3840×2160 one (4102 tokens) are described correctly,
 and the answer is text-identical to a run with the in-place read disabled. `llama-bench` pp2048 / tg64, pinned clocks,
 desktop running: 1347.5 / 30.64 tok/s with the fix, 1352.4 / 30.38 with `GGML_CUDA_NO_GDN_ROWS=1`.
+
+## Speculative decoding with the MTP head
+
+The checkpoint ships one multi-token-prediction layer (`mtp.*`, a full-attention block with its own 256-expert MoE).
+Upstream `338fce6` runs it as a draft (`--spec-type draft-mtp`) from an MTP-only GGUF (`convert_hf_to_gguf.py --mtp`,
+which also copies the embedding, final norm and output matrix: 3.7 GB in BF16). The target model verifies every drafted
+token, so the draft's precision only moves the acceptance rate, never the output; the draft was quantized with
+`llama-quantize` (Q4_K_M 1192 MiB, Q8_0 1888 MiB). BF16 drafts go through the BF16N loader like the main model.
+
+`llama-server -c 32768 -ub 2048 -md <draft> --spec-type draft-mtp -ngld 99 --spec-draft-n-max N`, greedy, four prompts
+(code, Ukrainian, arithmetic, English) × 400 tokens, pinned clocks, desktop running:
+
+| draft | `n_max` | tok/s | accepted drafts |
+|---|---:|---:|---:|
+| none | — | 30.92 | — |
+| Q4_K_M | 1 | **33.20** (+7.4 %) | 0.850 |
+| Q4_K_M | 2 | 26.31 | 0.738 |
+| Q4_K_M | 3 | 27.93 | 0.639 (2.87 tokens per step) |
+| Q8_0 | 1 | 32.20 | 0.853 |
+| BF16 | 1 | 32.48 | 0.853 |
+
+Long prompts (16,690 tokens of llama.cpp source, 20,634 tokens of Ukrainian notes): 28.91 tok/s without a draft,
+31.58 (+9 %) with the Q4_K_M draft (acceptance 0.849; BF16 draft 0.855). Quantizing the draft does not lower acceptance,
+at short or long context: the MTP layer reads the target's exact hidden state, so its own rounding does not accumulate.
+Greedy text against the run without a draft: three prompts identical, one diverges at character 1583 of 1812, inside the
+summation-order band (verification runs 2–4 tokens through other kernels).
+
+More than one draft token loses today because verifying 3–4 tokens costs ≈ 3 decode steps. Measured per GEMV on real
+tensors (single-tensor harness): a dense matrix costs 1.34× one column for 2 columns (the second column hits L2) but
+2.6× for 3–4 (the grid splits the SMs per column); expert matrices scale with the distinct experts the tokens route to
+(1.95/3.3/3.7× for 2/3/4 tokens). A kernel that decodes each weight once for all columns would cut the dense part to
+≈ 1.15× and leave the experts as the floor: ≈ 53–59 ms per 4-token verification plus ≈ 10 ms of drafting for 2.87 tokens,
+≈ 42–46 tok/s (+36–48 %).
+
+Memory: with the full window, the projector and the Q4_K_M draft (draft KV in q8_0), 1.23 GB stayed free in the
+Normal zone after loading (the kernel's min watermark is 1.04 GB) and a 3840×2160 image got the server OOM-killed, so
+the served configuration runs without the draft until the KV cache is compressed or the draft shares the model's
+embedding and output matrices (≈ 0.7 GB of the draft file).
 
 ## Correctness
 

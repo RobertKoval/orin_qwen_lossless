@@ -115,7 +115,9 @@ def line_chart(name, spec):
         for c, v in (pts[0], pts[-1]):  # label the endpoints only
             anchor = "start" if c == pts[0][0] else "end"
             dx = 10 if anchor == "start" else -10
-            o.append(f'<text x="{sx(c) + dx:.1f}" y="{sy(v) - 12:.1f}" font-size="13" font-weight="600" fill="{t["ink"]}" text-anchor="{anchor}" '
+            # a line falling into the last point would cross a label above it
+            dy = 24 if anchor == "end" and pts[-2][1] > v else -12
+            o.append(f'<text x="{sx(c) + dx:.1f}" y="{sy(v) + dy:.1f}" font-size="13" font-weight="600" fill="{t["ink"]}" text-anchor="{anchor}" '
                      f'stroke="{t["surface"]}" stroke-width="5" stroke-linejoin="round" paint-order="stroke">{v:.1f}</text>')
         o.append("</svg>")
         (OUT / f"{name}-{mode}.svg").write_text("\n".join(o) + "\n")

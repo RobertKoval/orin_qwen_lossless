@@ -28,13 +28,13 @@
 <text x="720.0" y="316" font-size="11" fill="#898781" text-anchor="middle">256K</text>
 <text x="720" y="338" font-size="11" fill="#898781" text-anchor="end">context, tokens (log scale)</text>
 <text x="62" y="78" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
-<path d="M72.0,118.9 L257.1,122.9 L442.3,142.7 L534.9,159.8 L627.4,183.5 L720.0,212.0" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="72.0" cy="118.9" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
-<circle cx="257.1" cy="122.9" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
-<circle cx="442.3" cy="142.7" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
-<circle cx="534.9" cy="159.8" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
-<circle cx="627.4" cy="183.5" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
-<circle cx="720.0" cy="212.0" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
-<text x="82.0" y="106.9" font-size="13" font-weight="600" fill="#f0efec" text-anchor="start" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">30.4</text>
-<text x="710.0" y="200.0" font-size="13" font-weight="600" fill="#f0efec" text-anchor="end" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">14.4</text>
+<path d="M72.0,117.4 L257.1,120.9 L442.3,134.8 L534.9,149.7 L627.4,174.2 L699.2,199.2" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="72.0" cy="117.4" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="257.1" cy="120.9" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="442.3" cy="134.8" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="534.9" cy="149.7" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="627.4" cy="174.2" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<circle cx="699.2" cy="199.2" r="4.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<text x="82.0" y="105.4" font-size="13" font-weight="600" fill="#f0efec" text-anchor="start" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">30.6</text>
+<text x="689.2" y="223.2" font-size="13" font-weight="600" fill="#f0efec" text-anchor="end" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">16.6</text>
 </svg>

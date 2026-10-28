@@ -53,23 +53,21 @@ matrices, 6 % in the gated delta net, 4.3 % in F32→BF16 conversions, 3.3 % in 
 5. **GEMV/batched threshold** (now 8 tokens): the first batched kernel cost 1.2 ms at 9 tokens vs 0.6 ms for the GEMV
    at 8; the crossover is probably at 24–32 tokens (speculative decoding and parallel requests sit there).
 
-## Stage 2 — long context (KV-cache traffic)
+## Stage 2 — long context (KV-cache memory and traffic)
 
-Measured: `t ≈ 33.5 ms + 0.138 µs × context` (see [RESULTS.md](RESULTS.md#long-context)). The 10 full-attention layers
-read 20 KiB of F16 KV cache per token of context at ≈ 149 GB/s, so from ≈ 64K tokens on the cache traffic dominates and
-at 256K decode is 14.4 tok/s.
+Measured on the current build: `t ≈ 32.3 ms + 0.118 µs × context` (see [RESULTS.md](RESULTS.md#long-context)). The 10
+full-attention layers read 20 KiB of F16 KV cache per token of context at ≈ 174 GB/s (97 % of plain-read bandwidth), so
+from ≈ 64K tokens on the cache traffic dominates; 16.6 tok/s at 224K, ≈ 15.8 predicted at 256K. The KV cache stays
+lossless (user decision 10-28: compress it the way the weights are compressed, no Q8_0).
 
-1. **Q8_0 KV cache** (`-ctk q8_0 -ctv q8_0`): ≈ 0.53× the traffic. Predicted 256K decode ≈ 19 tok/s (52.7 ms). This
-   quantises activations, not weights, so it breaks bit-exactness of the outputs; measure it and its effect on logits as an
-   explicit trade-off, never as a default.
-2. **Lossless KV compression — measured on a real 32K cache** ([RESULTS.md](RESULTS.md#kv-cache-compressibility-measured-not-implemented)):
+1. **Lossless KV compression — measured on a real 32K cache** ([RESULTS.md](RESULTS.md#kv-cache-compressibility-measured-not-implemented)):
    only the F16 exponent is redundant, ≈ −15 % with per-channel Huffman tables (static tables from the first 4K tokens
-   work), −17 % entropy bound. That clears the 10 % bar, but predicts only +8 % decode at 256K (+3 % at 64K) and 0.8 GiB
-   less memory at 262K. Cost: decoding inside the flash-attention kernel, block-wise encoding of the append-only cache.
-   Risk: at 256K a step must decode 2.7 G values at ≥ 88 G values/s to hide under the 30 ms compressed read, alongside
-   the attention math; the weight GEMV reaches ≈ 125 G values/s with the INT datapath to itself. Below prefill and MTP in priority; reconsider if memory at 256K becomes
-   the constraint.
-3. **Flash-attention efficiency**: at 83 % of the read bandwidth, ≤ 10 % at 256K is left in the kernel itself.
+   work), −17 % entropy bound: 0.8 GiB less memory at 262K and ≈ +8 % decode at 256K (+3 % at 64K). Memory is now the
+   constraint: the MTP draft (Stage 6) needs ≈ 1.5–2 GB that the full window with an image does not have. Cost: decoding
+   inside the flash-attention kernel, block-wise encoding of the append-only cache. Risk: at 256K a step must decode
+   2.7 G values at ≥ 88 G values/s to hide under the compressed read, alongside the attention math; the weight GEMV
+   reaches ≈ 125 G values/s with the INT datapath to itself.
+2. **Flash-attention efficiency**: at 97 % of the plain-read bandwidth, nothing is left in the kernel itself.
 
 ## Stage 3 — fewer, fatter kernels in the decode step (+10–20 %, medium–large)
 
@@ -106,11 +104,16 @@ The step is bandwidth-bound, so every saved bit is time. Code the exponent joint
 mantissa+sign entropy given the exponent: 7.86 of 8 bits), or use context from the neighbouring pair. Must stay a single
 table lookup per two weights.
 
-## Stage 6 — more tokens per weight pass (× 1.5–2, out of scope so far)
+## Stage 6 — more tokens per weight pass (+35–50 %, medium–large)
 
-Multi-token prediction (the checkpoint ships an MTP head) or speculative decoding: one pass over the weights verifies
-several tokens. Needs a multi-column GEMV that decodes each weight once and multiplies it with all columns (today every
-column re-decodes). This is the only lever beyond ≈ 45 tok/s on this hardware.
+Measured (RESULTS.md, MTP section): the checkpoint's MTP head as a draft accepts 85 % of single drafts and gives
++7–9 % with one draft token; with three it would average 2.87 tokens per step, but verifying 4 tokens costs ≈ 3 decode
+steps because every column re-decodes the weights (dense 2.6× one column at 3–4 columns) and each token brings its own
+experts (3.7× at 4 tokens). A multi-column GEMV that decodes each weight once and multiplies it with all columns (and
+decodes a shared expert once for the tokens routed to it) leaves the experts as the floor: ≈ 42–46 tok/s estimated.
+Memory comes first: the draft adds ≈ 1.5–2 GB, which the full window with an image does not have today (share the
+model's embedding and output matrices with the draft, compress the KV cache). This is the only lever beyond ≈ 45 tok/s
+on this hardware.
 
 ## Stage 7 — platform
 

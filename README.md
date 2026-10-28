@@ -104,21 +104,22 @@ Jetson AGX Orin Developer Kit 64GB, MAXN with GPU and CPU clocks pinned at maxim
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/context-dark.svg">
-    <img alt="Decode speed vs. context: 30.4 tokens/s at 2K, 29.7 at 8K, 26.3 at 32K, 23.4 at 64K, 19.3 at 128K, 14.4 at 256K" src="docs/img/context-light.svg" width="760">
+    <img alt="Decode speed vs. context: 30.6 tokens/s at 2K, 30.0 at 8K, 27.7 at 32K, 25.1 at 64K, 20.9 at 128K, 16.6 at 224K" src="docs/img/context-light.svg" width="760">
   </picture>
 </p>
 
 The model's full 262,144-token window fits next to the compressed weights. Decode slows down linearly with context
 because the 10 full-attention layers read the whole F16 KV cache (20 KiB per token) at every step; the 30 Gated DeltaNet
-layers keep a fixed-size state. The step time fits `33.5 ms + 0.138 µs × context`, i.e. attention streams the cache at
-≈ 149 GB/s, close to the board's 180 GB/s.
+layers keep a fixed-size state. The step time fits `32.3 ms + 0.118 µs × context`, i.e. attention streams the cache at
+≈ 174 GB/s, close to the 180 GB/s the board reaches with plain reads.
 
-| context | 2K | 8K | 32K | 64K | 128K | 256K |
+| context | 2K | 8K | 32K | 64K | 128K | 224K |
 |---|---:|---:|---:|---:|---:|---:|
-| decode, tok/s | 30.4 | 29.7 | 26.3 | 23.4 | 19.3 | 14.4 |
+| decode, tok/s | 30.6 | 30.0 | 27.7 | 25.1 | 20.9 | 16.6 |
 
-Measured on the previous base (`b29c606`) with dynamic clocks ([docs/RESULTS.md](docs/RESULTS.md#long-context)); the
-current build with pinned clocks gives 31.2 at 2K.
+2K–128K: `llama-bench -p 0 -n 32 -d <context> -ub 2048`, pinned clocks, desktop running. 224K: the server above with a
+224,303-token prompt, which it prefilled at 648 tok/s on average (5.8 min) and answered correctly, with ≥ 3.8 GB free
+throughout.
 
 Correctness, methodology and the full history of what was tried: [docs/RESULTS.md](docs/RESULTS.md).
 
@@ -231,8 +232,10 @@ what worked, what did not, and by how much.
 * Tested on one configuration: Qwen3.6-35B-A3B, Jetson AGX Orin 64GB (SM87), CUDA 12.6, llama.cpp `338fce6`.
 * The compressed exponent buffers are allocated outside ggml's buffers, so llama.cpp's automatic memory fitting does not
   see them (≈ 11 GB); run with `--fit off` and set the context size explicitly.
-* Not compressed yet: the vision projector (0.9 GB BF16) and the KV cache (F16). The checkpoint's multi-token-prediction
-  head is not used.
+* Not compressed yet: the vision projector (0.9 GB BF16) and the KV cache (F16).
+* The checkpoint's multi-token-prediction head works as a speculative draft (+7–9 % decode, see
+  [docs/RESULTS.md](docs/RESULTS.md#speculative-decoding-with-the-mtp-head)) but does not fit next to the full window
+  and an image yet.
 * Dense matrices in prefill are still dequantised to BF16 per micro-batch.
 * Outputs are deterministic for a given build and settings, but not bitwise equal across prefill kernels or micro-batch
   sizes: summation order moves next-token distributions by a mean KLD ≈ 0.002 (top-1 agreement ≈ 98.4 % on wikitext-2,
@@ -248,8 +251,9 @@ fixed cost over 231 kernel launches per token, ≈ 3.4 ms in ≈ 1000 small kern
 matrices, so the practical ceiling with this format is ≈ 40 tok/s and a persistent per-layer decode kernel is the way
 there. Prefill is limited by the latency of the MoE kernel's activation loads, which needs a different kernel shape
 (the expert weights decoded straight into tensor-core fragments).
-For serving, the next steps are memory headroom at the full window (the projector and the KV cache compressed
-losslessly) and the multi-token-prediction head as a speculative draft.
+For serving, the next steps are memory headroom at the full window (a losslessly compressed KV cache, the draft sharing
+the model's embedding and output matrices) and a matrix–vector kernel that decodes each weight once for several tokens,
+which would let the multi-token-prediction draft verify 3 tokens per step (≈ +35–50 % estimated, from +7–9 % today).
 The next research stages, with expected gains and how to measure them, are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License and credits
