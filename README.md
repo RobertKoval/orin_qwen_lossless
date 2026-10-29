@@ -139,16 +139,17 @@ LLAMA_BF16N=hybrid GGML_CUDA_VMM_POOL_GB=4 ./llama.cpp/build/bin/llama-server \
   -m qwen3.6-35b-a3b-bf16.gguf --mmproj mmproj-bf16.gguf -c 262144 -np 1 -ngl 99 -fa on --fit off \
   -b 2048 -ub 2048 -cram 0 --alias qwen3-a3b-30b --host 0.0.0.0 --port 8000
 
-# optional: the checkpoint's multi-token-prediction head as a speculative draft (+7–10 % decode; the full model still
-# verifies every token, so the draft may be quantized)
+# optional: the checkpoint's multi-token-prediction head as a speculative draft (+7–9 % decode; the full model still
+# verifies every token, so the head may be quantized)
 python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --mtp --outtype bf16 --outfile mtp-bf16.gguf
 ./llama.cpp/build/bin/llama-quantize mtp-bf16.gguf mtp-Q4_K_M.gguf Q4_K_M
-# then add to the server command:
-#   -md mtp-Q4_K_M.gguf --spec-type draft-mtp -ngld 99 --spec-draft-n-max 1 --spec-draft-n-ubatch 64
+# then start the server with LLAMA_MODEL_EXTRA=mtp-Q4_K_M.gguf and add
+#   --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-n-ubatch 64
 ```
 
-Loading reads the 69 GB GGUF and encodes it (≈ 3 min on the Orin's NVMe and CPU). With the full window and the
-projector, about 4 GB of the 61.4 GiB stay free after a 4K image (desktop running), so the server gets one slot (`-np 1`).
+Loading reads the 69 GB GGUF and encodes it (≈ 3 min on the Orin's NVMe and CPU). With the full window, the projector
+and the MTP draft the server process holds 55.9 GB after a 4K image and about 3 GB of the 61.4 GiB stay free (desktop
+running, the kernel keeps 1 GB in reserve), so the server gets one slot (`-np 1`).
 What the flags are for:
 
 * `--fit off`: llama.cpp's automatic fitting does not see the encoded exponent streams (≈ 11 GB) and would shrink
@@ -157,10 +158,15 @@ What the flags are for:
 * `-cram 0`: no prompt cache in RAM, which the unified memory cannot spare.
 * `GGML_CUDA_VMM_POOL_GB=4`: the projector's CUDA context needs its own pool; the default 32 GB address reservation
   per pool fails next to the model.
-* Draft flags: one draft token (verifying more costs more than it gains with today's kernels); a 64-token draft
-  micro-batch, because the draft context's attention mask is window × micro-batch (1 GiB at 2048); F16 draft KV,
-  because a quantized one makes flash attention keep F16 copies of the whole window. With all of it about 2.7 GB stay
-  free after a 4K image.
+* Draft: `LLAMA_MODEL_EXTRA` loads the MTP layer into the model itself, so the draft runs on the model's own
+  embedding and output matrices instead of the draft file's copies (0.7 GB). One draft token (verifying more costs
+  more than it gains with today's kernels); a 64-token draft micro-batch, because the draft context's attention mask
+  is window × micro-batch (1 GiB at 2048); F16 draft KV, because a quantized one makes flash attention keep F16 copies
+  of the whole window.
+* The attention mask of the model itself is 1 GiB at `-ub 2048`. On Orin the GPU reads it, like every graph input,
+  straight from host memory instead of a device copy (−1.06 GB); upstream switches this off because llama.cpp
+  overwrote inputs the GPU was still reading (#15034), which the patch prevents by synchronizing before it writes
+  them. `-ub 1024` would save the same again but costs 13–17 % of prefill speed.
 
 Close desktop applications for best speed: on Orin the compositor and remote desktop share the GPU and DRAM.
 
@@ -174,6 +180,8 @@ Close desktop applications for best speed: on Orin the compositor and remote des
 | `GGML_BF16N_NO_MMA=1` | prefill MoE through per-expert dequant + cuBLAS instead of the batched kernel |
 | `GGML_CUDA_NO_GDN_ROWS=1` | disable the in-place recurrent-state read |
 | `GGML_CUDA_VMM_POOL_GB=<n>` | virtual address space each CUDA memory pool reserves (default 32); `4` lets the image projector's context start next to the model |
+| `GGML_CUDA_NO_INTEGRATED=1` | copy graph inputs to the device as upstream does, instead of reading them from host memory in place |
+| `LLAMA_MODEL_EXTRA=<gguf>` | add the layers a model file lacks from a second GGUF, e.g. the MTP head from `convert_hf_to_gguf.py --mtp` |
 | `GGML_BF16N_HP_GLU=1` | fused gate/up/SWIGLU for pair-Huffman experts in decode (measured slower on Orin) |
 | `GGML_BF16N_NO_GLU=1` | no gate/up/SWIGLU fusion at all (decode GEMV and prefill MoE kernel) |
 
@@ -245,7 +253,7 @@ what worked, what did not, and by how much.
 * The compressed exponent buffers are allocated outside ggml's buffers, so llama.cpp's automatic memory fitting does not
   see them (≈ 11 GB); run with `--fit off` and set the context size explicitly.
 * Not compressed yet: the vision projector (0.9 GB BF16) and the KV cache (F16).
-* The multi-token-prediction draft pays only with one draft token (+7–10 %,
+* The multi-token-prediction draft pays only with one draft token (+7–9 %,
   [docs/RESULTS.md](docs/RESULTS.md#speculative-decoding-with-the-mtp-head)): verifying more tokens re-decodes the
   weights once per token.
 * Dense matrices in prefill are still dequantised to BF16 per micro-batch.

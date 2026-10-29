@@ -2617,7 +2617,7 @@ index f9bf437..ee17876 100644
  void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                                ggml_cuda_gated_delta_net_fused_cache cache);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index aba2152..72e686d 100644
+index aba2152..ad35e87 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3,6 +3,7 @@
@@ -2637,7 +2637,20 @@ index aba2152..72e686d 100644
  
  static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
  
-@@ -574,8 +577,23 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+@@ -334,7 +337,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
+ 
+         info.default_tensor_split[id] = total_vram;
+         total_vram += device_vram;
+-        info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
++        // an integrated GPU reads host buffers in place, so the scheduler skips the device copies of graph inputs (on
++        // Orin the attention mask alone is window x micro-batch, 1 GiB at 262144 x 2048). Upstream disables this because
++        // llama.cpp overwrote inputs still in use by the previous graph (#15034); llama_context synchronizes for it
++        // (sync_host_inputs). GGML_CUDA_NO_INTEGRATED=1 restores the copies.
++        info.devices[id].integrated = prop.integrated && getenv("GGML_CUDA_NO_INTEGRATED") == nullptr;
+         info.devices[id].nsm        = prop.multiProcessorCount;
+         info.devices[id].smpb       = prop.sharedMemPerBlock;
+         info.devices[id].warp_size  = prop.warpSize;
+@@ -574,8 +581,23 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
  
  // pool with virtual memory
  #if defined(GGML_USE_VMM)
@@ -2662,7 +2675,7 @@ index aba2152..72e686d 100644
  
      int device;
      int physical_device;
-@@ -1881,6 +1899,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+@@ -1881,6 +1903,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
      ggml_tensor *       src1 = tensor->src[1];
      const ggml_tensor * dst  = tensor;
  
@@ -2673,7 +2686,7 @@ index aba2152..72e686d 100644
      const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                     ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                     src0->view_src;
-@@ -2019,6 +2041,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2019,6 +2045,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
          return;
      }
  
@@ -2699,7 +2712,7 @@ index aba2152..72e686d 100644
      // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
      // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
      // Therefore, in such cases use cuBLAS.
-@@ -2073,6 +2114,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -2073,6 +2118,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
  
@@ -2711,7 +2724,7 @@ index aba2152..72e686d 100644
      const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
  
      if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-@@ -2113,10 +2159,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -2113,10 +2163,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
      const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
  
@@ -2732,7 +2745,7 @@ index aba2152..72e686d 100644
              if (ggml_is_quantized(src0->type)) {
                  const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                  if (ne2 <= mmvq_mmid_max) {
-@@ -2274,7 +2329,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2274,7 +2333,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
              ggml_cuda_op_repeat_back(ctx, dst);
              break;
          case GGML_OP_GET_ROWS:
@@ -2745,7 +2758,7 @@ index aba2152..72e686d 100644
              break;
          case GGML_OP_GET_ROWS_BACK:
              ggml_cuda_op_get_rows_back(ctx, dst);
-@@ -4399,6 +4458,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4399,6 +4462,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up->src[1];
              const ggml_tensor * ids  = up->src[2];
  
@@ -2768,7 +2781,7 @@ index aba2152..72e686d 100644
              if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
-@@ -4758,6 +4833,64 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4758,6 +4837,64 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  stream_ctx.concurrent_events.clear();
              }
  
@@ -2833,7 +2846,7 @@ index aba2152..72e686d 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
  #ifdef USE_CUDA_GRAPH
-@@ -4801,7 +4934,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4801,7 +4938,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  prev_i = i;
  
@@ -2842,7 +2855,7 @@ index aba2152..72e686d 100644
                      continue;
                  }
  
-@@ -5768,6 +5901,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5768,6 +5905,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_IQ4_XS:
                      case GGML_TYPE_BF16:
                          return true;
@@ -2851,7 +2864,7 @@ index aba2152..72e686d 100644
                      default:
                          return false;
                  }
-@@ -5807,6 +5942,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5807,6 +5946,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
@@ -2860,7 +2873,7 @@ index aba2152..72e686d 100644
                      default:
                          return false;
                  }
-@@ -6296,6 +6433,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -6296,6 +6437,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }
@@ -2889,11 +2902,185 @@ index 5d8449a..b6f9f1e 100644
      [GGML_TYPE_BF16] = {
          .type_name                = "bf16",
          .blck_size                = 1,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 455f519..d5d4b90 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -523,6 +523,23 @@ llama_context::llama_context(
+ 
+         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+ 
++        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++            if (ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++                continue;
++            }
++            for (auto * backend : backend_ptrs) {
++                auto * dev = ggml_backend_get_device(backend);
++                const auto type = ggml_backend_dev_type(dev);
++                if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
++                        ggml_backend_dev_supports_buft(dev, backend_buft[i])) {
++                    sync_host_inputs = true;
++                }
++            }
++        }
++        if (sync_host_inputs) {
++            LLAMA_LOG_INFO("%s: the GPU reads graph inputs from host memory in place, synchronizing before writing them\n", __func__);
++        }
++
+         // TODO: move these checks to ggml_backend_sched
+         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+         bool pipeline_parallel =
+@@ -1523,6 +1540,12 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    // the previous graph_compute_async may still be reading inputs that the memory update, a graph rebuild or
++    // set_inputs below overwrite (llama.cpp #15034, #28056)
++    if (sync_host_inputs) {
++        ggml_backend_sched_synchronize(sched.get());
++    }
++
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -3916,6 +3939,9 @@ void llama_context::opt_epoch_iter(
+             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+             ggml_opt_alloc(opt_ctx, train);
+ 
++            if (sync_host_inputs) {
++                ggml_backend_sched_synchronize(sched.get());
++            }
+             res->set_inputs(&ubatch);
+             {
+                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..21e6a1f 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -428,6 +428,10 @@ private:
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+ 
++    // a GPU backend reads the CPU backend's (host) buffer in place (integrated GPUs): nothing orders the next write of
++    // graph inputs after the previous, still running, compute, so process_ubatch synchronizes first
++    bool sync_host_inputs = false;
++
+     // true after the prism.hadamard coverage check passes on a reserved graph
+     bool hadamard_verified = false;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index e108f04..31a1541 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -858,6 +858,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
+                 std::any_of(layers.begin(), layers.end(), [&](const auto & layer) {
+                     return hparams.has_rope(layer.il);
+                 })) {
++            // a previous compute may still read the graph inputs that set_inputs below overwrites (integrated GPUs
++            // read them from host memory in place); K-shifts are rare, so always wait
++            ggml_backend_sched_synchronize(sched);
+             ggml_backend_sched_reset(sched);
+ 
+             auto * res = lctx->get_gf_res_reserve();
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index a963f24..51c388b 100644
+index a963f24..626eba9 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -1123,6 +1123,34 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+@@ -80,6 +80,38 @@ const char * llama_ftype_name(llama_ftype ftype) {
+ 
+ // return a list of splits for a given path
+ // for example, given "<name>-00002-of-00004.gguf", returns list of all 4 splits
++// copy one key/value pair, replacing the key in dst
++static void llama_gguf_copy_kv(gguf_context * dst, const gguf_context * src, int64_t i) {
++    const char * key = gguf_get_key(src, i);
++    switch (gguf_get_kv_type(src, i)) {
++        case GGUF_TYPE_UINT8:   gguf_set_val_u8  (dst, key, gguf_get_val_u8  (src, i)); break;
++        case GGUF_TYPE_INT8:    gguf_set_val_i8  (dst, key, gguf_get_val_i8  (src, i)); break;
++        case GGUF_TYPE_UINT16:  gguf_set_val_u16 (dst, key, gguf_get_val_u16 (src, i)); break;
++        case GGUF_TYPE_INT16:   gguf_set_val_i16 (dst, key, gguf_get_val_i16 (src, i)); break;
++        case GGUF_TYPE_UINT32:  gguf_set_val_u32 (dst, key, gguf_get_val_u32 (src, i)); break;
++        case GGUF_TYPE_INT32:   gguf_set_val_i32 (dst, key, gguf_get_val_i32 (src, i)); break;
++        case GGUF_TYPE_FLOAT32: gguf_set_val_f32 (dst, key, gguf_get_val_f32 (src, i)); break;
++        case GGUF_TYPE_UINT64:  gguf_set_val_u64 (dst, key, gguf_get_val_u64 (src, i)); break;
++        case GGUF_TYPE_INT64:   gguf_set_val_i64 (dst, key, gguf_get_val_i64 (src, i)); break;
++        case GGUF_TYPE_FLOAT64: gguf_set_val_f64 (dst, key, gguf_get_val_f64 (src, i)); break;
++        case GGUF_TYPE_BOOL:    gguf_set_val_bool(dst, key, gguf_get_val_bool(src, i)); break;
++        case GGUF_TYPE_STRING:  gguf_set_val_str (dst, key, gguf_get_val_str (src, i)); break;
++        case GGUF_TYPE_ARRAY: {
++            const size_t n = gguf_get_arr_n(src, i);
++            if (gguf_get_arr_type(src, i) == GGUF_TYPE_STRING) {
++                std::vector<const char *> strs(n);
++                for (size_t j = 0; j < n; ++j) {
++                    strs[j] = gguf_get_arr_str(src, i, j);
++                }
++                gguf_set_arr_str(dst, key, strs.data(), n);
++            } else {
++                gguf_set_arr_data(dst, key, gguf_get_arr_type(src, i), gguf_get_arr_data(src, i), n);
++            }
++        } break;
++        default: GGML_ABORT("unknown GGUF type %d for key %s", (int) gguf_get_kv_type(src, i), key);
++    }
++}
++
+ static std::vector<std::string> llama_get_list_splits(const std::string & path, const int idx, const int n_split) {
+     std::vector<std::string> paths;
+     std::string split_prefix;
+@@ -675,6 +707,54 @@ llama_model_loader::llama_model_loader(
+ 
+             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
+         }
++
++        // LLAMA_MODEL_EXTRA: a GGUF with layers the model file lacks, e.g. the MTP head exported with
++        // convert_hf_to_gguf.py --mtp next to a model converted without it. Its tensors that the model does not have are
++        // added (the rest, e.g. its copies of the embedding and output, are ignored, so the head runs on the model's own),
++        // and its architecture keys replace the model's: they describe the model with the extra layers (block count,
++        // NextN layers, per-layer arrays).
++        if (const char * extra = getenv("LLAMA_MODEL_EXTRA"); extra != nullptr && extra[0] != '\0') {
++            struct gguf_init_params extra_params = {
++                /*.no_alloc = */ true,
++                /*.ctx      = */ &ctx,
++            };
++            gguf_context_ptr ctx_gguf { gguf_init_from_file(extra, extra_params) };
++            if (!ctx_gguf) {
++                throw std::runtime_error(format("%s: failed to load LLAMA_MODEL_EXTRA %s", __func__, extra));
++            }
++            const int kid = gguf_find_key(ctx_gguf.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str());
++            if (kid < 0 || arch_name != gguf_get_val_str(ctx_gguf.get(), kid)) {
++                throw std::runtime_error(format("%s: LLAMA_MODEL_EXTRA %s is not a %s model", __func__, extra, arch_name.c_str()));
++            }
++
++            files.emplace_back(new llama_file(extra, "rb", use_direct_io));
++            contexts.emplace_back(ctx);
++            const uint16_t idx = (uint16_t) (files.size() - 1);
++
++            int n_added = 0, n_ignored = 0;
++            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
++                const std::string tensor_name = ggml_get_name(cur);
++                if (weights_map.find(tensor_name) != weights_map.end()) {
++                    n_ignored++;
++                    continue;
++                }
++                n_elements += ggml_nelements(cur);
++                n_bytes    += ggml_nbytes(cur);
++                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
++                n_added++;
++            }
++
++            const std::string arch_prefix = arch_name + ".";
++            int n_keys = 0;
++            for (int64_t i = 0; i < gguf_get_n_kv(ctx_gguf.get()); ++i) {
++                if (std::string(gguf_get_key(ctx_gguf.get(), i)).rfind(arch_prefix, 0) == 0) {
++                    llama_gguf_copy_kv(metadata, ctx_gguf.get(), i);
++                    n_keys++;
++                }
++            }
++            LLAMA_LOG_INFO("%s: LLAMA_MODEL_EXTRA %s: %d tensors added, %d already in the model ignored, %d %s keys taken\n",
++                __func__, extra, n_added, n_ignored, n_keys, arch_name.c_str());
++        }
+     } else if (file != nullptr) {
+         struct ggml_context * ctx = NULL;
+         struct gguf_init_params params = {
+@@ -1123,6 +1203,34 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
      return true;
  }
  
@@ -2928,7 +3115,7 @@ index a963f24..51c388b 100644
  struct ggml_tensor * llama_model_loader::create_tensor(
          const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
          const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-@@ -1387,6 +1415,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1387,6 +1495,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
  
      const bool duplicated = flags & TENSOR_DUPLICATED;
  
@@ -2945,7 +3132,7 @@ index a963f24..51c388b 100644
      struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
      ggml_set_name(tensor, ggml_get_name(&t_meta));
  
-@@ -1703,6 +1741,44 @@ bool llama_model_loader::load_all_data(
+@@ -1703,6 +1821,44 @@ bool llama_model_loader::load_all_data(
              }
          }
  

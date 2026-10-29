@@ -517,6 +517,33 @@ OOM-killed. `-lv 4` shows where the draft's ≈ 4.2 GB went:
 With the last column the production server (full window, projector, Q4_K_M draft, one draft token) answers a
 3840×2160 image at 33.85 tok/s and text at 33.4–34.0 tok/s, and 2.7 GB stay free after the image.
 
+Two more savings, measured with the server's resident memory (the Normal zone's free memory moves with kswapd):
+
+* **The draft on the model's own embedding and output matrices.** `LLAMA_MODEL_EXTRA=<mtp gguf>` makes the loader add
+  the tensors the model file lacks (the 20 tensors of layer 40) and take the MTP file's `qwen35moe.*` keys (block count
+  41, one NextN layer, the 41-entry recurrent-layer array), so `--spec-type draft-mtp` runs without `-md` on the
+  model's weights, as upstream does for a GGUF converted with the head. −0.69 GB; decode 1.5 % slower than with the
+  draft file (the draft now uses the exact BF16N output matrix, 4.3 ms, instead of a Q6_K copy), acceptance unchanged,
+  greedy text identical on five prompts (two of 16.7K and 20.6K tokens).
+* **Graph inputs read in place.** The model's own attention mask is 1056 MiB in a host buffer at `-ub 2048` plus a
+  device copy in its 1440 MiB compute buffer. On an integrated GPU the device can read the host buffer directly, but
+  upstream keeps the CUDA integrated path off because outputs were corrupted (#15034): `llama_decode` returns before
+  the GPU finishes, and the next micro-batch's `set_inputs` overwrites the mask and KV indices the GPU is still
+  reading (the analysis in upstream #28058 and #29450). The patch turns the path on (`GGML_CUDA_NO_INTEGRATED=1`
+  restores the copies) and synchronizes at the start of `process_ubatch` (before the memory update, a graph rebuild
+  and `set_inputs`) and before a K-shift whenever a GPU reads the host input buffer. The compute buffers shrink from
+  1440 to 406 MiB (model) and 37 to 12 MiB (draft); resident memory 55.35 vs 56.43 GB after loading, 56.05 vs 56.84 GB
+  after five prompts. Greedy text on the five prompts is identical with and without the path, prefill is equal or
+  faster (16.7K tokens: 1059 vs 1029 tok/s). Negative control: the same build without the synchronization changes
+  the text of the 16.7K-token prompt and the draft's acceptance on the 20.6K one, so the test sees the race.
+
+Not taken: `-ub 1024` would halve the mask again, but prefill drops 17 % (pp8192 1093 vs 1322 tok/s) and 13 % at
+depth 32K (885 vs 1014).
+
+Production now (full window, projector, MTP layer in the model, inputs in place): 54.66 GB resident after loading
+against 56.43 GB for the first configuration with the draft (−1.77 GB), 55.86 GB after a 4K image; 33.3 tok/s on the
+image, 33.0 on text.
+
 ## Correctness
 
 * Weights: bit-exact round trip for every tensor (see above).
