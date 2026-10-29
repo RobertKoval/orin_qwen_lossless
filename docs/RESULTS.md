@@ -673,6 +673,62 @@ one warm-up request first (the first requests after loading run 10–30 % slow),
 * Not done: with a window the draft needs only the last `n` prompt positions, so the server could skip the rest of
   the draft's prompt pass (≤ 5 % of prefill at 224K, nothing up to 32K; below the noise of these runs).
 
+## Decode: what a persistent kernel could still win (measured)
+
+Before writing a persistent decode kernel (Roadmap Stage 3) the costs it was meant to remove were measured on the
+production build:
+
+* **Launches cost nothing in the CUDA graph**: the median gap between kernels is 0.1 µs, 0.17 ms per decode step in
+  total. The "≈ 17 µs fixed cost per GEMV" that `moe_prefill` timings suggested was its host launch and synchronisation.
+* **SMs are busy**: Nsight Compute on the `attn_qkv` GEMV (157 µs) shows the SMs active 97–98.6 % of the kernel and
+  `long_scoreboard` (waiting for global loads) as 13.2 of 18.7 stall cycles per issued instruction; `attn_gate` and the
+  experts' gate GEMV look the same. A kernel loses ≈ 5 µs at its start and end.
+* **Real per-kernel times in the decode graph**: `attn_qkv` 22 MB in 159 µs (140 GB/s), `attn_gate` 11 MB in 82.6 µs
+  (136), `ssm_out` 11 MB in 93 µs (120), experts gate / up / down ≈ 77–81 µs (136–140), the output matrix 680 MB in
+  4.25 ms (160 GB/s). A single-tensor benchmark is 20–30 % optimistic for 11 MB matrices: repeating one tensor leaves
+  part of it in the 4 MB L2.
+* **Warming L2 before a GEMV** (a prefetch kernel touching each warp's unit head, the LUT and the first plane rows):
+  1–5 µs per GEMV.
+* **Concurrent graph branches** for independent GEMVs on the same input (upstream's `GGML_CUDA_GRAPH_OPT=1` for q/k/v,
+  and the fan-out raised to 5 for the gated delta net's in-projections), tg64 in two alternating rounds: 31.22 / 31.27
+  without, 31.21 / 31.23 and 31.03 / 31.24 with.
+
+The loss is the ramp and tail inside mid-size GEMVs, where every warp has one unit (≈ 2–2.5 ms per step against the
+output matrix's 160 GB/s). Only a kernel that decodes the next matrix's first units before its input exists (the
+exponents do not depend on it) could recover that: ≤ 4–6 %, several days, uncertain. Parked; the small-kernel fusions
+are each ≤ 1 % ([Where a verification step goes](#speculative-decoding-with-the-mtp-head)).
+
+## Prefill: fragment-order expert layout (prototype)
+
+An `mma.m16n8k16` A fragment is four bf16x2 registers, each a pair of adjacent weights: lane `(g, t)` of a 16×16 tile
+holds rows `g`, `g + 8` and columns `2t, 2t + 1` and `2t + 8, 2t + 9`. Pairs of adjacent weights are exactly what the
+exponent-pair Huffman code codes, so the same code in a different order lets each lane decode its A fragments straight
+into registers: per 16-row band of an expert, a lane's sign|mantissa bytes (16 per tile pair) and its exponent codes
+(4 per tile) come in fragment order, and the existing decoder and `prmt`/`lop3` assembly produce the `mma` operands.
+No shared-memory slab, no barrier between decoding and products; the routed tokens' BF16 activations are staged once
+per block with `cp.async` (rows padded by 16 bytes for conflict-free `ldmatrix`). Ratio unchanged (down 0.6747 vs
+0.6743), bitwise round trip, every kernel within 3·10⁻⁷ of a double-precision CPU reference
+([`bench/fo_moe.cu`](../bench/fo_moe.cu), layer 20, uniform routing):
+
+| | tokens | current layout | fragment order |
+|---|---:|---:|---:|
+| down (K = 512), prefill | 2048 | 9.48 ms | **3.96 ms** |
+| | 512 | 4.84 ms | **3.00 ms** |
+| | 64 | 3.24 ms | **2.64 ms** |
+| gate + up + SwiGLU (K = 2048), prefill | 2048 | 12.39 ms | 14.0 ms |
+| | 512 | 8.07 ms | 6.92 ms |
+| down, decode GEMV (kernel time) | 1 | 64.0 µs | 65.3–67.6 µs |
+| | 2 | 146 µs (15 experts) | 170–173 µs (16 experts) |
+
+* For K = 2048 the activations of 64 tokens (256 KB) do not fit shared memory: they come in 256-column slices with a
+  barrier each, every warp runs two decoders (gate and up), and the kernel sits at 126–128 registers. Not better than
+  the current fused kernel at 2048 tokens yet.
+* The decode GEMV pays for the order: a lane multiplies 128 distinct activations of a K = 512 row (read from shared
+  memory, two 16-byte broadcast loads per tile pair), where the current kernel keeps its 16 in registers.
+* Planned next: the fragment order for the down experts only. Estimate +13–16 % prefill (`-ub 512` and `-ub 2048`,
+  down is 24 % of a forward) for ≈ −0.4 % decode and ≈ −1.3 % with the MTP draft; the GEMV's summation order changes,
+  so greedy text may move within the usual summation-order band.
+
 ## Correctness
 
 * Weights: bit-exact round trip for every tensor (see above).

@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>A 35B mixture-of-experts model in full BF16 precision on a 64 GB Jetson:<br>
-  bit-exact weights, 33 % less memory, ≈ 30 tokens/s.</b>
+  bit-exact weights, 33 % less memory, ≈ 31 tokens/s, ≈ 40 with its own MTP draft.</b>
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-dark.svg">
-    <img alt="Decode speed after a 2048-token context: PyTorch runtime 5.0, BF16N v1 with fused GLU 23.6, pair Huffman 28.4, Huffman for dense tensors 29.3, warm start and nothing on the CPU 30.5, current base with pinned clocks 31.2 tokens per second" src="docs/img/decode-light.svg" width="760">
+    <img alt="Decode speed after a 2048-token context: PyTorch runtime 5.0, BF16N v1 with fused GLU 23.6, pair Huffman 28.4, Huffman for dense tensors 29.3, warm start and nothing on the CPU 30.5, current base with pinned clocks 31.2, with the model's MTP head as a speculative draft 40.2 tokens per second" src="docs/img/decode-light.svg" width="760">
   </picture>
 </p>
 
@@ -89,7 +89,9 @@ Jetson AGX Orin Developer Kit 64GB, MAXN with GPU and CPU clocks pinned at maxim
 |---|---|
 | resident weights | **46.5 GB** of 69.3 GB (ratio 0.671), 472/472 tensors bit-exact |
 | decode | **31.2 tok/s** at context 0 and at 2048 (±0.3 % between processes) |
+| decode with the model's MTP head as a draft (`llama-server`, one draft token, 4 prompts × 400 tokens) | **40.2 tok/s** (+29 %, output unchanged: the model verifies every token) |
 | prefill (8K prompt) | **832 tok/s** with the default `-ub 512`, **1323** with `-ub 2048`, **1481** with `-b 8192 -ub 4096` (2.4–2.7× the dequant + cuBLAS path) |
+| server: full 262,144-token window, vision projector, MTP draft | 56.4–56.7 GB resident after a 3840×2160 image |
 | previous best on this board, PyTorch runtime with a fused lossless format | 5.0 tok/s |
 | BF16 without compression | does not fit |
 
@@ -120,7 +122,8 @@ layers keep a fixed-size state. The step time fits `32.3 ms + 0.118 µs × conte
 
 2K–128K: `llama-bench -p 0 -n 32 -d <context> -ub 2048`, pinned clocks, desktop running. 224K: the server above with a
 224,303-token prompt, which it prefilled at 648 tok/s on average (5.8 min) and answered correctly, with ≥ 3.8 GB free
-throughout.
+throughout. With the MTP draft the server decodes 27.1 tok/s at 64K (free text; 25.1 without) and 22.6 tok/s at 224K
+(a copy task; 16.8 without), and prefills the 224K prompt at 585 tok/s.
 
 Correctness, methodology and the full history of what was tried: [docs/RESULTS.md](docs/RESULTS.md).
 

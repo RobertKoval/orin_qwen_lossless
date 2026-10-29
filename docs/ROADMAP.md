@@ -35,13 +35,12 @@ step a 2048-token forward at `-ub 2048` (≈ 1.65 s) spent 53 % in the MoE kerne
 matrices, 6 % in the gated delta net, 4.3 % in F32→BF16 conversions, 3.3 % in SwiGLU (now fused), 2.8 % in `rms_norm`,
 2.2 % each in the weighted sum of the experts and the broadcast adds, 2.1 % in `ssm_conv`.
 
-1. **MoE kernel** (≈ 50 %): latency-bound, not compute-bound. Nsight Compute and an oracle show that hiding the
-   activation loads would cut a layer by 22–25 % at 2048 tokens, but this kernel shape has no registers (gate: 128 at
-   512 threads) or shared memory (the 64-row slab) left to do it. Planned after the decode work: a layout of the expert
-   tensors in tensor-core fragment order, so each lane decodes exactly its `mma` A-fragment elements and multiplies them
-   at once — no slab, no barrier between decode and products, the activations staged once per block by `cp.async` and
-   shared by all warps (as Marlin does for 4-bit weights). Estimate ≈ 22 → ≈ 14 ms per layer at 2048 tokens; the expert
-   GEMV of the decode path must move to the same layout without losing speed, so it is planned together with decode.
+1. **MoE kernel** (≈ 50 %): latency-bound, not compute-bound. A fragment-order layout of the expert tensors (each lane
+   decodes exactly its `mma` A-fragment elements and multiplies them at once, activations staged once per block) is
+   prototyped ([RESULTS.md](RESULTS.md#prefill-fragment-order-expert-layout-prototype)): down 9.48 → 3.96 ms per layer
+   at 2048 tokens, 4.84 → 3.00 ms at 512; gate/up (K = 2048) not better yet. **Next step (planned for the week of
+   11-02): the fragment order for the down experts** — encoder at load, the batched kernel and the decode GEMV in
+   `bf16n.cu`, then pp8192 / tg64 / MTP and KLD. Estimate +13–16 % prefill for ≈ −0.4 % decode (≈ −1.3 % with the draft).
 2. **Conversions** (≈ 4 %, at bandwidth): every BF16N matmul converts its F32 input again (≈ 300 conversions per
    forward for ≈ 80 distinct tensors). Converting each tensor once is worth ≈ 2 % and needs a BF16 buffer that lives
    across ops and stays valid under CUDA graph replay.
@@ -68,13 +67,14 @@ lossless (user decision 10-28: compress it the way the weights are compressed, n
    first. Memory is no longer the constraint: the MTP draft fits next to the full window and an image.
 2. **Flash-attention efficiency**: at 97 % of the plain-read bandwidth, nothing is left in the kernel itself.
 
-## Stage 3 — fewer, fatter kernels in the decode step (+10–20 %, medium–large)
+## Stage 3 — fewer, fatter kernels in the decode step (measured: ≤ 4–6 %, parked)
 
-The main item is a persistent decode kernel per layer (or per block of it): one launch runs the layer's GEMVs and small
-ops as stages with grid-wide barriers, and the next stage's independent prologue (exponent table, unit offsets, first
-stream words and plane rows) is issued before the barrier, so it overlaps the current stage's tail instead of following
-it. Estimate: ≈ 2 ms of the per-launch cost plus ≈ 2 ms of small kernels, ≈ +12–15 % (31 → ≈ 35 tok/s). The GEMV
-stages should take the expert layout as a parameter, since the prefill plan (Stage 1) wants a fragment-order layout.
+Measured on 10-29 ([RESULTS.md](RESULTS.md#decode-what-a-persistent-kernel-could-still-win-measured)): launches cost
+nothing in the CUDA graph (0.1 µs gaps), concurrent graph branches gain nothing, an L2-warm start saves 1–5 µs per GEMV.
+What is left is the ramp and tail inside mid-size GEMVs (≈ 2–2.5 ms per step), recoverable only by a persistent kernel
+that decodes the next matrix's first units before its input exists: ≤ 4–6 %, several days, uncertain. The small-kernel
+fusions below are ≤ 1 % each (≈ 3 ms per step in ≈ 1000 kernels of a dozen kinds); the 2-token conv-state concat that
+cost 2.7 ms per MTP verification step is fixed.
 
 Smaller graph-level fusions for the patterns this model repeats 30–40 times per token (each ≈ 1 %, worth it only
 bundled or inside the persistent kernel):

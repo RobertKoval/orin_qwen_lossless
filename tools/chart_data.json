@@ -1,9 +1,9 @@
 {
   "decode": {
     "title": "Decode speed, Qwen3.6-35B-A3B on Jetson AGX Orin 64GB",
-    "subtitle": "single sequence, greedy, after a 2048-token context, tokens per second",
+    "subtitle": "single sequence, greedy, tokens per second; MTP row: llama-server, 4 prompts",
     "unit": "tokens / s",
-    "axis_max": 35,
+    "axis_max": 45,
     "ticks": [
       0,
       5,
@@ -12,7 +12,9 @@
       20,
       25,
       30,
-      35
+      35,
+      40,
+      45
     ],
     "reference": {
       "value": 30,
@@ -45,9 +47,14 @@
         "value_label": "30.5"
       },
       {
-        "label": "current: upstream 338fce6, pinned clocks",
+        "label": "upstream 338fce6, pinned clocks",
         "value": 31.2,
-        "value_label": "31.2",
+        "value_label": "31.2"
+      },
+      {
+        "label": "+ the model's MTP head as draft (server, 4 prompts)",
+        "value": 40.2,
+        "value_label": "40.2",
         "highlight": true
       }
     ]
