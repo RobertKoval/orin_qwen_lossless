@@ -58,27 +58,24 @@ def parse(path):
     n_stream, cell_count = struct.unpack_from("<II", buf, off)
     assert n_stream == 1, n_stream
     meta = off + 8
-    # data section: v_trans, n_layer, then per layer (k_type, k_size_row, cells x row)
-    hdr = bytes(buf[meta:meta + 64 * cell_count + 4096])
-    for v_trans in (0, 1):
-        for n_layer in range(1, 129):
-            for row in (512, 1024, 2048, 4096):
-                pat = struct.pack("<IIiQ", v_trans, n_layer, F16, row)
-                i = hdr.find(pat)
-                if i >= 0 and i % cell_count == 0:
-                    data = meta + i
-                    break
-            else:
-                continue
-            break
+    # per-cell metadata (pos, n_seq_id, [cell ext], seq ids) has no length field: try sizes until the data header fits.
+    # data section: v_trans, n_layer, [n_rot_k, n_rot_v in newer files], then per layer (k_type, k_size_row, cells x row)
+    for meta_per_cell in range(12, 68, 4):
+        data = meta + meta_per_cell * cell_count
+        v_trans, n_layer = struct.unpack_from("<II", buf, data)
+        if v_trans > 1 or not 1 <= n_layer <= 128:
+            continue
+        for extra in (0, 8):
+            t, row = struct.unpack_from("<iQ", buf, data + 8 + extra)
+            if t == F16 and row in (512, 1024, 2048, 4096):
+                break
         else:
             continue
         break
     else:
         raise SystemExit("data header not found")
     assert v_trans == 0, "transposed V (run with flash attention)"
-    meta_per_cell = (data - meta) // cell_count
-    off = data + 8
+    off = data + 8 + extra
     layers = []
     for kind in ("K", "V"):
         for il in range(n_layer):
@@ -134,6 +131,34 @@ def analyse(a, head_dim, rope_dims, prefix):
     return r
 
 
+def fixed_rate(a, prefix, code_bits, cap):
+    """Fixed-size rows: per channel, the 2^code_bits - 1 most frequent exponents of the first `prefix` tokens get a code,
+    the last code escapes to the true 5-bit exponent stored in a per-row overflow area of `cap` slots. Rows with more
+    escapes than `cap` must be stored elsewhere (raw). Returns the escape statistics of the tokens after the prefix."""
+    T, C = a.shape
+    e = ((a >> 10) & 31).astype(np.int64)
+    ch = np.broadcast_to(np.arange(C), (T, C))
+    hist = np.bincount((ch[:prefix] * 32 + e[:prefix]).ravel(), minlength=C * 32).reshape(C, 32)
+    top = np.argsort(-hist, axis=1, kind="stable")[:, : (1 << code_bits) - 1]
+    covered = np.zeros((C, 32), dtype=bool)
+    np.put_along_axis(covered, top, True, axis=1)
+    esc = ~covered[np.arange(C)[None, :], e[prefix:]]
+    per_row = esc.sum(1)
+    row_bits = C * (11 + code_bits) + cap * 5
+    return dict(rate=float(esc.mean()), mean=float(per_row.mean()), p99=float(np.percentile(per_row, 99)),
+                max=int(per_row.max()), over_cap=float((per_row > cap).mean()), bits=row_bits / C)
+
+
+def high_byte(a):
+    """Byte planes: the low mantissa byte raw, the high byte (sign, 5-bit exponent, 2 mantissa bits) coded per channel."""
+    T, C = a.shape
+    hb = (a >> 8).astype(np.int64)
+    ch = np.broadcast_to(np.arange(C), (T, C))
+    hc = np.bincount((ch * 256 + hb).ravel(), minlength=C * 256).reshape(C, 256)
+    return dict(H=H_rows(hc), huf=float(np.mean([huffman_len(row) for row in hc])),
+                H_one_table=H(np.bincount(hb.ravel(), minlength=256)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("slot_file")
@@ -141,6 +166,7 @@ def main():
     ap.add_argument("--rope-dims", type=int, default=64)
     ap.add_argument("--prefix", type=int, default=4096)
     ap.add_argument("--lzma-layer", type=int, default=4)
+    ap.add_argument("--formats", action="store_true", help="also evaluate fixed-size and byte-plane formats")
     args = ap.parse_args()
     info, layers = parse(args.slot_file)
     print(info)
@@ -171,6 +197,22 @@ def main():
         print(f"{kind}: mean over layers: " + ", ".join(f"{k} {v:.3f}" for k, v in mean.items()))
         for name, bits in schemes.items():
             print(f"  {kind} {name:45s} {bits:6.3f} bit/value  ratio {bits / 16:.3f}")
+    if args.formats:
+        print()
+        for kind in ("K", "V"):
+            arrs = [a for k, _, a in layers if k == kind]
+            hbs = [high_byte(a) for a in arrs]
+            print(f"{kind} high byte | channel: H {np.mean([h['H'] for h in hbs]):.3f}, Huffman per channel "
+                  f"{np.mean([h['huf'] for h in hbs]):.3f}, one table {np.mean([h['H_one_table'] for h in hbs]):.3f} bit "
+                  f"-> {8 + np.mean([h['huf'] for h in hbs]):.3f} bit/value")
+            for code_bits in (2, 3):
+                for cap in (8, 16, 32, 64):
+                    fr = [fixed_rate(a, args.prefix, code_bits, cap) for a in arrs]
+                    print(f"{kind} fixed {code_bits}-bit exponent codes, {cap:2d} escape slots/row: escape rate "
+                          f"{np.mean([f['rate'] for f in fr]):.4f}, per row mean {np.mean([f['mean'] for f in fr]):.1f} "
+                          f"p99 {np.max([f['p99'] for f in fr]):.0f} max {np.max([f['max'] for f in fr])}, rows over "
+                          f"capacity {np.mean([f['over_cap'] for f in fr]):.5f}, {fr[0]['bits']:.3f} bit/value "
+                          f"(ratio {fr[0]['bits'] / 16:.3f})", flush=True)
     for kind, il, a in layers:
         if il != args.lzma_layer:
             continue

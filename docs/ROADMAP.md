@@ -60,13 +60,12 @@ full-attention layers read 20 KiB of F16 KV cache per token of context at ≈ 17
 from ≈ 64K tokens on the cache traffic dominates; 16.6 tok/s at 224K, ≈ 15.8 predicted at 256K. The KV cache stays
 lossless (user decision 10-28: compress it the way the weights are compressed, no Q8_0).
 
-1. **Lossless KV compression — measured on a real 32K cache** ([RESULTS.md](RESULTS.md#kv-cache-compressibility-measured-not-implemented)):
-   only the F16 exponent is redundant, ≈ −15 % with per-channel Huffman tables (static tables from the first 4K tokens
-   work), −17 % entropy bound: 0.8 GiB less memory at 262K and ≈ +8 % decode at 256K (+3 % at 64K). Memory is now the
-   constraint: the MTP draft (Stage 6) needs ≈ 1.5–2 GB that the full window with an image does not have. Cost: decoding
-   inside the flash-attention kernel, block-wise encoding of the append-only cache. Risk: at 256K a step must decode
-   2.7 G values at ≥ 88 G values/s to hide under the compressed read, alongside the attention math; the weight GEMV
-   reaches ≈ 125 G values/s with the INT datapath to itself.
+1. **Lossless KV compression — dropped (user decision 10-29)** ([RESULTS.md](RESULTS.md#kv-cache-compressibility-measured-dropped)):
+   only the F16 exponent is redundant. Per-channel Huffman reaches 0.848 of F16 but needs variable-size rows; flash
+   attention wants fixed rows, and a 3-bit per-channel exponent code with an escape area gives ≈ 0.89 plus a spill
+   path for the rare rows that overflow. That is ≈ −0.55 GiB at 262K, ≈ +5 % decode at 224K and ≈ +1 % up to 32K, for
+   decoding inside the flash-attention tile loader and an encoder in SET_ROWS. The multi-column GEMV (Stage 6) comes
+   first. Memory is no longer the constraint: the MTP draft fits next to the full window and an image.
 2. **Flash-attention efficiency**: at 97 % of the plain-read bandwidth, nothing is left in the kernel itself.
 
 ## Stage 3 — fewer, fatter kernels in the decode step (+10–20 %, medium–large)

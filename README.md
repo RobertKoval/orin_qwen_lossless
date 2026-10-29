@@ -137,14 +137,14 @@ python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --outtype bf16 --mmproj 
 
 # OpenAI-compatible server (/v1/chat/completions, images included) with the full 262,144-token window and the MTP
 # layer as a speculative draft (+6.6 % decode; the full model verifies every token, so outputs stay its own)
-LLAMA_BF16N=hybrid GGML_CUDA_VMM_POOL_GB=4 ./llama.cpp/build/bin/llama-server \
+LLAMA_BF16N=hybrid GGML_CUDA_VMM_POOL_GB=4 LLAMA_MTP_SWA=32768 ./llama.cpp/build/bin/llama-server \
   -m qwen3.6-35b-a3b-bf16.gguf --mmproj mmproj-bf16.gguf -c 262144 -np 1 -ngl 99 -fa on --fit off \
-  -b 2048 -ub 2048 -cram 0 --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-n-ubatch 64 \
+  -b 2048 -ub 2048 -cram 0 --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-n-ubatch 2048 \
   --alias qwen3-a3b-30b --host 0.0.0.0 --port 8000
 ```
 
 Loading reads the 71 GB GGUF and encodes it (≈ 3 min on the Orin's NVMe and CPU). With the full window, the projector
-and the MTP draft the server process holds 56.1 GB after a 4K image and about 3 GB of the 61.4 GiB stay free (desktop
+and the MTP draft the server process holds 56.4 GB after a 4K image and about 3 GB of the 61.4 GiB stay free (desktop
 running, the kernel keeps 1 GB in reserve), so the server gets one slot (`-np 1`).
 What the flags are for:
 
@@ -156,8 +156,11 @@ What the flags are for:
   per pool fails next to the model.
 * Draft: the MTP layer is part of the GGUF and runs on the model's own weights (embedding and output matrix shared,
   the layer itself BF16N like the rest). One draft token (verifying more costs more than it gains with today's
-  kernels); a 64-token draft micro-batch, because the draft context's attention mask is window × micro-batch (1 GiB at
-  2048); F16 draft KV, because a quantized one makes flash attention keep F16 copies of the whole window.
+  kernels); F16 draft KV, because a quantized one makes flash attention keep F16 copies of the whole window.
+  `LLAMA_MTP_SWA=32768` lets the draft attend to its last 32768 positions only. Its KV and attention mask then stay
+  small, so it takes the prompt in full 2048-token micro-batches: the draft costs 3–6 % of prefill instead of 14–24 %
+  with 64-token ones, the process stays at the same size, and beyond 32K the cheaper draft step outweighs the lower
+  acceptance (224K: 22.6 vs 21.9 tok/s with a full-window draft).
 * The attention mask of the model itself is 1 GiB at `-ub 2048`. On Orin the GPU reads it, like every graph input,
   straight from host memory instead of a device copy (−1.06 GB); upstream switches this off because llama.cpp
   overwrote inputs the GPU was still reading (#15034), which the patch prevents by synchronizing before it writes
@@ -176,6 +179,7 @@ Close desktop applications for best speed: on Orin the compositor and remote des
 | `GGML_CUDA_NO_GDN_ROWS=1` | disable the in-place recurrent-state read |
 | `GGML_CUDA_VMM_POOL_GB=<n>` | virtual address space each CUDA memory pool reserves (default 32); `4` lets the image projector's context start next to the model |
 | `GGML_CUDA_NO_INTEGRATED=1` | copy graph inputs to the device as upstream does, instead of reading them from host memory in place |
+| `LLAMA_MTP_SWA=<n>` | the MTP draft attends to its last `n` positions (sliding window); its KV holds `n` + micro-batch cells |
 | `GGML_BF16N_HP_GLU=1` | fused gate/up/SWIGLU for pair-Huffman experts in decode (measured slower on Orin) |
 | `GGML_BF16N_NO_GLU=1` | no gate/up/SWIGLU fusion at all (decode GEMV and prefill MoE kernel) |
 
@@ -246,7 +250,8 @@ what worked, what did not, and by how much.
 * Tested on one configuration: Qwen3.6-35B-A3B, Jetson AGX Orin 64GB (SM87), CUDA 12.6, llama.cpp `338fce6`.
 * The compressed exponent buffers are allocated outside ggml's buffers, so llama.cpp's automatic memory fitting does not
   see them (≈ 11 GB); run with `--fit off` and set the context size explicitly.
-* Not compressed yet: the vision projector (0.9 GB BF16) and the KV cache (F16).
+* Not compressed: the vision projector (0.9 GB BF16) and the KV cache (F16; a lossless format would save ≈ 11 %, see
+  [docs/RESULTS.md](docs/RESULTS.md#kv-cache-compressibility-measured-dropped)).
 * The multi-token-prediction draft pays only with one draft token (+6.6 %,
   [docs/RESULTS.md](docs/RESULTS.md#speculative-decoding-with-the-mtp-head)): verifying more tokens re-decodes the
   weights once per token.
@@ -266,8 +271,7 @@ matrices, so the practical ceiling with this format is ≈ 40 tok/s and a persis
 there. Prefill is limited by the latency of the MoE kernel's activation loads, which needs a different kernel shape
 (the expert weights decoded straight into tensor-core fragments).
 For serving, the next steps are a matrix–vector kernel that decodes each weight once for several tokens, which would
-let the multi-token-prediction draft verify 3 tokens per step (≈ +35–50 % estimated, from +6.6 % today), and more
-memory headroom at the full window from a losslessly compressed KV cache.
+let the multi-token-prediction draft verify 3 tokens per step (≈ +35–50 % estimated, from +6.6 % today).
 The next research stages, with expected gains and how to measure them, are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License and credits

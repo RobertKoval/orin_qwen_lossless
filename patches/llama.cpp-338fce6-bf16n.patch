@@ -3106,7 +3106,7 @@ index ed59079..f15ee21 100644
      size_t   n_bytes    = 0;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c7b2fcc..e358ad0 100644
+index c7b2fcc..8e3eefd 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1699,6 +1699,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -3120,6 +3120,48 @@ index c7b2fcc..e358ad0 100644
  
      // assign the repeating layers to the devices according to the splits
      pimpl->dev_layer.resize(n_layer_all);
+@@ -3323,6 +3327,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                     } else {
+                         GGML_ASSERT(!hparams.is_swa_any());
+ 
++                        // LLAMA_MTP_SWA=<n>: the MTP draft of a hybrid Qwen attends to its last n positions only. The
++                        // target verifies every drafted token, so the output does not change, while the draft's KV,
++                        // attention mask and attention work stop growing with the context.
++                        uint32_t       kv_size  = cparams.n_ctx_seq;
++                        uint32_t       n_swa    = hparams.n_swa;
++                        llama_swa_type swa_type = hparams.swa_type;
++                        if (const char * env = getenv("LLAMA_MTP_SWA"); env != nullptr && mtp_on_hybrid_qwen) {
++                            char * end = nullptr;
++                            const unsigned long n = strtoul(env, &end, 10);
++                            if (end == env || *end != '\0' || n == 0 || n >= cparams.n_ctx_seq) {
++                                throw std::runtime_error(format("LLAMA_MTP_SWA=%s: expected a window of 1..%u positions",
++                                                                env, cparams.n_ctx_seq - 1));
++                            }
++                            n_swa    = (uint32_t) n;
++                            swa_type = LLAMA_SWA_TYPE_STANDARD;
++                            kv_size  = std::min(kv_size, (uint32_t) GGML_PAD(
++                                n_swa*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch, 256));
++                            LLAMA_LOG_INFO("%s: MTP draft attends to the last %u positions, KV cache of %u cells\n",
++                                           __func__, n_swa, kv_size);
++                        }
++
+                         res = new llama_kv_cache(
+                                 *this,
+                                 params.no_alloc,
+@@ -3332,10 +3357,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                                 !cparams.flash_attn,
+                                 cparams.offload_kqv,
+                                 cparams.kv_unified,
+-                                cparams.n_ctx_seq,
++                                kv_size,
+                                 cparams.n_seq_max,
+-                                hparams.n_swa,
+-                                hparams.swa_type,
++                                n_swa,
++                                swa_type,
+                                 nullptr,
+                                 filter,
+                                 nullptr,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
 index d5133bd..c066e69 100644
 --- a/tests/test-backend-ops.cpp

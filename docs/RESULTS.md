@@ -294,7 +294,7 @@ KL against ebf3f70 (`-ub 2048`, as above): PPL 4.7513 vs 4.7465, mean KLD 0.0025
 summation-order noise as in the table above. Converting each activation only once would save another ≈ 36 ms (≈ 2 %);
 not done.
 
-## KV-cache compressibility (measured, not implemented)
+## KV-cache compressibility (measured, dropped)
 
 32,768 tokens of wikitext-2 (test split) prefilled through `llama-server` (`-fa on -ub 2048`, 402 tok/s), the slot saved
 with `POST /slots/0?action=save` and analysed with [`bench/kv_entropy.py`](../bench/kv_entropy.py): 10 attention layers ×
@@ -328,6 +328,15 @@ K and V, each 32768 × 512 F16 values. Entropies are plug-in estimates (≥ 32K 
 * With the long-context fit above (current build), KV traffic × 0.85 predicts 17.1 instead of 15.8 tok/s at 256K (+8 %),
   ≈ +3 % at 64K, and 0.8 GiB less memory at 262K. A lossy Q8_0 cache would predict ≈ 20.5 tok/s at 256K.
 * Single text domain (English Wikipedia prose); code or other languages may differ.
+
+Second dump (10-29): 49,018 tokens of llama.cpp source followed by Ukrainian notes, current build. Same picture: exponent
+per channel 2.52 bits (K) / 2.52 (V), real per-channel Huffman 0.848, entropy bound 0.833, mantissa 9.96 of 10 bits.
+Flash attention needs random access to rows, so a practical format keeps rows fixed-size: a 3-bit per-channel exponent
+code (the 7 most frequent exponents of the first 4096 tokens) escapes 2.75 % (K) / 3.2 % (V) of the values, 14 / 16 per
+512-value row on average, p99 28 / 32, max 53 / 51; with 32 escape slots per row that is 0.895 of F16 and 0.08 % / 0.26 %
+of rows overflow. A fixed slot smaller than the raw row cannot hold every possible row, so a lossless cache also needs a
+spill path for those. Expected gain ≈ −0.55 GiB at 262K and ≈ +5 % decode at 224K, ≈ +1 % up to 32K; dropped in favour
+of the multi-column GEMV.
 
 ## Where a decode step goes (nsys node-level trace; tracing adds ≈ 10 %, captured with the busy desktop)
 
@@ -542,8 +551,39 @@ Two more savings, measured with the server's resident memory (the Normal zone's 
 Not taken: `-ub 1024` would halve the mask again, but prefill drops 17 % (pp8192 1093 vs 1322 tok/s) and 13 % at
 depth 32K (885 vs 1014).
 
-Production now (full window, projector, MTP layer of the re-converted GGUF, inputs in place): 56.11 GB resident after
-a 4K image; 33.1 tok/s on the image.
+**The draft's share of prefill, and a window for it.** The draft context runs every prompt token through the MTP layer
+(attention over the whole window plus its 256-expert MoE) in its own micro-batches. With 64-token ones that cost 14–24 %
+of prefill, and 20 % on a 224K-token prompt (516.6 vs 648 tok/s). Inputs in place are not the cause: on the 224K prompt
+they are 6 % faster than copied inputs (547.7 vs 516.6 tok/s), and decode at 64K is equal (25.05 vs 24.97 tok/s).
+`LLAMA_MTP_SWA=<n>` (patch) gives the draft a sliding window: its KV becomes a plain cache of `n` + micro-batch cells
+with the standard SWA mask, so the draft's KV, its attention mask and its attention work stop growing with the context.
+The target still verifies every token, so the output does not change; only the acceptance can.
+
+Production config (full window, projector), llama.cpp source as the prompt, a copy task ("repeat the first 40 lines of
+the second file", the file is at the start of the prompt) and a free-text one ("explain the second file"), 300 tokens,
+one warm-up request first (the first requests after loading run 10–30 % slow), GPU and CPU clocks pinned:
+
+| draft | prefill 16K / 64K / 224K tok/s | decode 64K copy / free, 224K copy tok/s | acceptance 64K copy / free, 224K | resident after load |
+|---|---|---|---|---:|
+| none | 1197 / 1027–1030 / 616 | 25.05 / 25.05 / 16.78 | — | 52.7–53.0 GB |
+| full window, micro-batch 64 | 914 / 886–889 / 548 ¹ | 29.63 / 27.37 / — | 0.993 / 0.817 / — | 54.4 GB |
+| full window, micro-batch 512 | 1035 / 954–957 / — | 29.61 / 27.37 / — | 0.993 / 0.817 / — | 54.3 GB |
+| full window, micro-batch 2048 | 1129 / 883–969 / 599 | 29.61 / 27.24–27.26 / 21.89 | 0.993 / 0.817 / 0.993 | 55.4 GB |
+| **window 32768**, micro-batch 2048 | — / 894–897 / 585 | 29.74 / 27.12 / **22.63** | 0.980 / 0.784 / 0.948 | 54.8 GB |
+| window 4096, micro-batch 2048 | 1008 / 875–895 / — | 29.19 / 20.45 ² / — | 0.954 / 0.784 / — | 54.0 GB |
+| window 1024, micro-batch 2048 | — / 987 / — | 28.98 / 27.46 / — | 0.904 / 0.784 / — | 54.0 GB |
+
+¹ the earlier 224K run (inputs in place, slightly different prompt). ² single slow run.
+
+* Repeated runs of one config spread by up to 10 % in prefill (883 vs 969 tok/s at 64K), so differences of a few per cent
+  between the large-micro-batch rows are noise; the 64-token micro-batch is clearly worse.
+* A full-window draft with 2048-token micro-batches costs +1.4 GB (the window × micro-batch mask again, 1 GiB). The 32K
+  window keeps the size of the old configuration, is identical to the full window up to 32K tokens of context, and
+  at 224K decodes faster despite the lower acceptance, because each draft step no longer reads 224K positions of KV.
+* Production since 10-29: `LLAMA_MTP_SWA=32768 --spec-draft-n-ubatch 2048`. Greedy text of the four standard prompts is
+  identical to the previous configuration (same accepted-draft counts); 56.4 GB resident after a 4K image.
+* Not done: with a window the draft needs only the last `n` prompt positions, so the server could skip the rest of
+  the draft's prompt pass (≤ 5 % of prefill at 224K, nothing up to 32K; below the noise of these runs).
 
 ## Correctness
 

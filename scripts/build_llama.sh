@@ -12,10 +12,14 @@ if [ ! -d "$dir/.git" ]; then
 fi
 cd "$dir"
 git checkout --quiet "$commit"
-if git apply --check "$here/patches/llama.cpp-338fce6-bf16n.patch" 2>/dev/null; then
-    git apply "$here/patches/llama.cpp-338fce6-bf16n.patch"
-else
-    git apply --reverse --check "$here/patches/llama.cpp-338fce6-bf16n.patch" # already applied, else fail loudly
+patch="$here/patches/llama.cpp-338fce6-bf16n.patch"
+if git apply --check "$patch" 2>/dev/null; then
+    git apply "$patch"
+elif ! git apply --reverse --check "$patch" 2>/dev/null; then
+    # an older version of the patch: the tree is this script's, reset it to the commit and apply the current one
+    git checkout --quiet --force "$commit"
+    git clean -fdq
+    git apply "$patch"
 fi
 
 cmake -B build \
