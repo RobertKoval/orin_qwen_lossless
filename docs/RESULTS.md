@@ -294,6 +294,36 @@ KL against ebf3f70 (`-ub 2048`, as above): PPL 4.7513 vs 4.7465, mean KLD 0.0025
 summation-order noise as in the table above. Converting each activation only once would save another ≈ 36 ms (≈ 2 %);
 not done.
 
+**Multi-column GEMV.** The draft's gain was capped by verification: the GEMV launched one grid column per token, so
+every column decoded the whole matrix again. `k_hp_mmv_mc<C, NC>` (dense HUFPAIR matrices, no `ids`) stages the
+activations of up to 4 columns in shared memory, decodes each row once and multiplies it with every column; each column
+keeps the single-column summation order, so results are bitwise the old ones (equal output hashes in `moe_prefill` for
+every shape and column count, identical greedy text end to end). Plane chunks of a row are loaded up to 4 ahead
+(all of a row at K = 2048; 2 at K = 4096, where 4 spills). Per call, median of 50, real weights:
+
+| matrix | 1 column | 2 columns old → new | 3 columns old → new | 4 columns old → new |
+|---|---:|---:|---:|---:|
+| GDN `attn_qkv` 8192×2048 | 0.165–0.171 ms | 0.247 → **0.179** | 0.455 → 0.203 | 0.456 → 0.244 |
+| GDN `attn_gate` 4096×2048 | 0.087–0.096 | 0.131 → 0.101 | 0.240 → 0.117 | 0.240 → 0.138 |
+| GDN `ssm_out` 2048×4096 | 0.092–0.095 | 0.143 → 0.107 | 0.255 → 0.125 | 0.258 → 0.136 |
+| output 248320×2048 | 4.24–4.25 | 6.47 → **4.48** | 10.27 → 5.20 | 12.90 → 6.45 |
+| 8 experts `ffn_gate_exps` (per token, unchanged) | 0.090 | 0.167 | 0.280 | 0.308 |
+
+End to end (`mtptest.sh`, four prompts × 400 tokens, one warm-up request, `-c 32768`, draft micro-batch 2048):
+
+| draft tokens | GEMV | tok/s | accepted drafts |
+|---|---|---:|---:|
+| none | — | 31.10 | — |
+| 1 | per column (old) | 32.74 | 0.853 |
+| 1 | multi-column | **36.86** (+12.6 % / +18.5 % over no draft) | 0.853 |
+| 2 | multi-column | 34.05 | 0.740 |
+| 3 | multi-column | 34.44 | 0.649 |
+
+Greedy text with one draft token is identical for both kernels and to the earlier runs. More draft tokens still lose:
+the dense part of a 4-token verification now costs ≈ 1.5× one token, but each token reads its own 8 experts (≈ 3.5×
+at 4 tokens), and every extra draft step runs the MTP layer. Production runs the multi-column kernel with one draft
+token since 10-29 (35.8–38.5 tok/s on the warm prompts, 56.4 GB resident after a 4K image).
+
 ## KV-cache compressibility (measured, dropped)
 
 32,768 tokens of wikitext-2 (test split) prefilled through `llama-server` (`-fa on -ub 2048`, 402 tok/s), the slot saved

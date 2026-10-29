@@ -14,10 +14,10 @@ index d62a631..d33aeac 100644
      // [TAG_GGML_PREC]
 diff --git a/ggml/src/ggml-cuda/bf16n.cu b/ggml/src/ggml-cuda/bf16n.cu
 new file mode 100644
-index 0000000..b840254
+index 0000000..181d1cf
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/bf16n.cu
-@@ -0,0 +1,2246 @@
+@@ -0,0 +1,2346 @@
 +// GGML_TYPE_BF16N: lossless BF16 weights resident in compressed form.
 +//
 +// The ggml tensor holds the sign|mantissa byte plane (1 B/weight, 512-weight chunks, lane-major:
@@ -985,6 +985,94 @@ index 0000000..b840254
 +    }
 +}
 +
++// decode the 8 exponent pairs of one 512-column chunk of one row into EX (this lane's 16 weights)
++#define HP_PAIRS(EX)                                                                                 \
++    _Pragma("unroll") for (int q_ = 0; q_ < 8; q_++) {                                               \
++        if (q_ % 2 == 0) {                                                                           \
++            v = v - pa - pb;                                                                         \
++            const uint32_t m_ = __funnelshift_r(0u, 1u, v);                                          \
++            if (!(v & 32u)) {                                                                        \
++                buf += (uint64_t) wq[0] * m_;                                                        \
++                _Pragma("unroll") for (int i_ = 0; i_ + 1 < HP_PF; i_++) { wq[i_] = wq[i_ + 1]; }    \
++                wq[HP_PF - 1] = __ldg(lst + idx);                                                    \
++                idx++;                                                                               \
++            }                                                                                        \
++            v |= 32u;                                                                                \
++        }                                                                                            \
++        const uint32_t ent_ = lut[(uint32_t) (buf >> 32) >> (32 - HP_LP)];                           \
++        buf = shl64w(buf, ent_);                                                                     \
++        (EX)[q_] = ent_;                                                                             \
++        if (q_ % 2 == 0) { pa = ent_; } else { pb = ent_; }                                          \
++    }
++
++// Y = W X for NC columns of one dense matrix (speculative verification, small batches): every row is decoded once and
++// multiplied by all columns. Each column sums in the order of k_hp_mmv, so its result is bitwise the single-column one.
++template <int C, int NC>
++__global__ void __launch_bounds__(HP_NT) k_hp_mmv_mc(const hp_ptrs w, int R, cols_t p) {
++    constexpr int K = C * 512;
++    extern __shared__ float shm[];
++    float * xs = shm; // NC x K activations
++    uint32_t * lut = (uint32_t *) (shm + NC * K);
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int wpb = blockDim.x >> 5;
++    const int64_t units = p.nrows / R;
++    const int64_t gbase = p.row0 / R;
++    const int64_t u0 = blockIdx.x * wpb + warp;
++    HP_UNIT_BEGIN(w, gbase + (u0 < units ? u0 : 0))
++    for (int i = threadIdx.x; i < NC * K / 4; i += blockDim.x) {
++        const int n = i / (K / 4);
++        ((float4 *) xs)[i] = __ldg((const float4 *) (p.x + n * p.x_tok) + (i - n * (K / 4)));
++    }
++    for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += blockDim.x) { ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i); }
++    __syncthreads();
++    for (int64_t u = u0; u < units; u += gridDim.x * wpb) {
++        const int64_t gu = gbase + u;
++        if (u != u0) {
++            HP_UNIT_RESET(w, gu)
++        }
++        for (int rr = 0; rr < R; rr++) {
++            const uint8_t * rp = w.sm + (gu * R + rr) * K;
++            float a[NC][4];
++#pragma unroll
++            for (int n = 0; n < NC; n++) { a[n][0] = a[n][1] = a[n][2] = a[n][3] = 0.f; }
++            constexpr int PF = C <= 4 ? C : 2; // plane chunks in flight (all of a row up to K = 2048; more spills)
++            uint4 ring[PF];
++#pragma unroll
++            for (int c = 0; c < PF; c++) { ring[c] = ld_plane((const uint4 *) (rp + c * 512) + lane); }
++#pragma unroll
++            for (int c = 0; c < C; c++) {
++                const uint4 cur = ring[c % PF];
++                if (c + PF < C) { ring[c % PF] = ld_plane((const uint4 *) (rp + (c + PF) * 512) + lane); }
++                const uint32_t smw[4] = {cur.x, cur.y, cur.z, cur.w};
++                uint32_t ex[8];
++                HP_PAIRS(ex)
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    const uint32_t w0 = sel_bits(prmt(smw[j], 0, 0x9180u), ex[2 * j]);
++                    const uint32_t w1 = sel_bits(prmt(smw[j], 0, 0xB3A2u), ex[2 * j + 1]);
++                    const float f0 = __uint_as_float(w0 << 16), f1 = __uint_as_float(w0 & 0xFFFF0000u);
++                    const float f2 = __uint_as_float(w1 << 16), f3 = __uint_as_float(w1 & 0xFFFF0000u);
++#pragma unroll
++                    for (int n = 0; n < NC; n++) {
++                        const float4 xv = *(const float4 *) (xs + n * K + c * 512 + 128 * j + 4 * lane);
++                        a[n][0] = fmaf(f0, xv.x, a[n][0]);
++                        a[n][1] = fmaf(f1, xv.y, a[n][1]);
++                        a[n][2] = fmaf(f2, xv.z, a[n][2]);
++                        a[n][3] = fmaf(f3, xv.w, a[n][3]);
++                    }
++                }
++            }
++#pragma unroll
++            for (int n = 0; n < NC; n++) {
++                const float sum = warp_sum((a[n][0] + a[n][1]) + (a[n][2] + a[n][3]));
++                if (lane == 0) {
++                    ((float *) (p.dst + n * p.dst_tok))[u * R + rr] = sum;
++                }
++            }
++        }
++    }
++}
++
 +template <int C, int R>
 +__global__ void __launch_bounds__(HP_NT) k_hp_mmv_glu(const hp_ptrs g, const hp_ptrs wu, cols_t p) {
 +    constexpr int K = C * 512;
@@ -1164,26 +1252,6 @@ index 0000000..b840254
 +}
 +
 +// ---------------------------------------------------------------- chunk-major units (expert matrices with K > 512)
-+
-+// decode the 8 exponent pairs of one 512-column chunk of one row into EX (this lane's 16 weights)
-+#define HP_PAIRS(EX)                                                                                 \
-+    _Pragma("unroll") for (int q_ = 0; q_ < 8; q_++) {                                               \
-+        if (q_ % 2 == 0) {                                                                           \
-+            v = v - pa - pb;                                                                         \
-+            const uint32_t m_ = __funnelshift_r(0u, 1u, v);                                          \
-+            if (!(v & 32u)) {                                                                        \
-+                buf += (uint64_t) wq[0] * m_;                                                        \
-+                _Pragma("unroll") for (int i_ = 0; i_ + 1 < HP_PF; i_++) { wq[i_] = wq[i_ + 1]; }    \
-+                wq[HP_PF - 1] = __ldg(lst + idx);                                                    \
-+                idx++;                                                                               \
-+            }                                                                                        \
-+            v |= 32u;                                                                                \
-+        }                                                                                            \
-+        const uint32_t ent_ = lut[(uint32_t) (buf >> 32) >> (32 - HP_LP)];                           \
-+        buf = shl64w(buf, ent_);                                                                     \
-+        (EX)[q_] = ent_;                                                                             \
-+        if (q_ % 2 == 0) { pa = ent_; } else { pb = ent_; }                                          \
-+    }
 +
 +// y = W x with chunk-major units: x chunk c is read once per unit and reused for its R rows
 +template <int C, int R>
@@ -1815,6 +1883,21 @@ index 0000000..b840254
 +    return dim3((unsigned) std::max<int64_t>(1, std::min<int64_t>((work + 7) / 8, cap)), ncols);
 +}
 +
++bool no_multi_col() {
++    static const bool off = getenv("GGML_BF16N_NO_MULTI_COL") != nullptr;
++    return off;
++}
++
++template <int C, int NC>
++void launch_hp_mmv_mc(dim3 grid, int nt, size_t shm, cudaStream_t stream, const hp_ptrs & w, int R, const cols_t & p) {
++    static bool attr = false; // more than the default 48 KiB of dynamic shared memory for 3-4 columns of K = 4096
++    if (!attr) {
++        CUDA_CHECK(cudaFuncSetAttribute(k_hp_mmv_mc<C, NC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm));
++        attr = true;
++    }
++    k_hp_mmv_mc<C, NC><<<grid, nt, shm, stream>>>(w, R, p);
++}
++
 +void launch_mmv(const entry & e, const cols_t & p, int ncols, cudaStream_t stream) {
 +    const int64_t K = e.K;
 +    const dim3 grid = mmv_grid(e, p.nrows, ncols);
@@ -1830,6 +1913,23 @@ index 0000000..b840254
 +                default: GGML_ABORT("bf16n: unsupported chunk-major K/R");
 +            }
 +#undef CM_CASE
++        } else if (!p.ids && ncols > 1 && !no_multi_col()) {
++            // columns in groups of up to 4, each group decodes the matrix once
++            hp_launch_dims(e, p.nrows, 1, g2, nt);
++            for (int c0 = 0; c0 < ncols; c0 += 4) {
++                const int nc = std::min(4, ncols - c0);
++                cols_t q = p;
++                q.x += c0 * p.x_tok;
++                q.dst += c0 * p.dst_tok;
++                const size_t shm_mc = (size_t) nc * K * sizeof(float) + (4u << HP_LP);
++                switch (K / 512 * 10 + nc) {
++#define MC_CASE(CC, NC) case CC * 10 + NC: launch_hp_mmv_mc<CC, NC>(g2, nt, shm_mc, stream, hpp(e), e.R, q); break;
++                    MC_CASE(1, 1) MC_CASE(1, 2) MC_CASE(1, 3) MC_CASE(1, 4) MC_CASE(2, 1) MC_CASE(2, 2) MC_CASE(2, 3) MC_CASE(2, 4)
++                    MC_CASE(4, 1) MC_CASE(4, 2) MC_CASE(4, 3) MC_CASE(4, 4) MC_CASE(8, 1) MC_CASE(8, 2) MC_CASE(8, 3) MC_CASE(8, 4)
++#undef MC_CASE
++                    default: GGML_ABORT("bf16n: unsupported K");
++                }
++            }
 +        } else {
 +#define HP_CASE(CC) case CC: k_hp_mmv<CC><<<g2, nt, shm, stream>>>(hpp(e), e.R, p); break;
 +            switch (K / 512) { HP_CASE(1) HP_CASE(2) HP_CASE(4) HP_CASE(8) default: GGML_ABORT("bf16n: unsupported K"); }

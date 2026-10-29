@@ -103,16 +103,18 @@ The step is bandwidth-bound, so every saved bit is time. Code the exponent joint
 mantissa+sign entropy given the exponent: 7.86 of 8 bits), or use context from the neighbouring pair. Must stay a single
 table lookup per two weights.
 
-## Stage 6 — more tokens per weight pass (+35–50 %, medium–large)
+## Stage 6 — more tokens per weight pass (dense part done: +18.5 % with the MTP draft)
 
-Measured (RESULTS.md, MTP section): the checkpoint's MTP head as a draft accepts 85 % of single drafts and gives
-+6.6–9 % with one draft token; with three it would average 2.87 tokens per step, but verifying 4 tokens costs ≈ 3 decode
-steps because every column re-decodes the weights (dense 2.6× one column at 3–4 columns) and each token brings its own
-experts (3.7× at 4 tokens). A multi-column GEMV that decodes each weight once and multiplies it with all columns (and
-decodes a shared expert once for the tokens routed to it) leaves the experts as the floor: ≈ 42–46 tok/s estimated.
-The draft fits next to the full window and an image: a 64-token draft micro-batch, an F16 draft KV, the MTP layer
-in the model's own GGUF so it shares the embedding and output matrices, and graph inputs read in place on the
-integrated GPU (RESULTS.md). This is the only lever beyond ≈ 45 tok/s on this hardware.
+The checkpoint's MTP head accepts 85 % of single drafts. The multi-column GEMV (RESULTS.md, MTP section) decodes each
+dense row once for up to 4 tokens: verifying 2 tokens costs ≈ 1.1× one on the dense matrices, so one draft token gives
+36.9 tok/s (+18.5 %, was +6.6 %). Two or three draft tokens are slower (34.1 / 34.4) because every verified token
+reads its own 8 experts. What is left here:
+
+* Experts shared by the verified tokens decoded once (the gain is the overlap of consecutive tokens' routing, not
+  measured yet; random routing would share 0.25 of 8 experts).
+* The 4-bit NIBBLE GEMVs (shared expert, small attention projections, ≈ 3 ms per token) still decode per column.
+* The MTP layer as the draft costs one more layer step per draft token; a cheaper draft (fewer experts, a trimmed
+  output vocabulary) would make 2–3 draft tokens pay.
 
 ## Stage 7 — platform
 
