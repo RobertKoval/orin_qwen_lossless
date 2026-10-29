@@ -32,7 +32,7 @@ decodes it inside llama.cpp's CUDA matrix–vector kernels, so a decode step str
   (see [Limitations](#limitations)).
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671): the model's full 262,144-token window
   and its vision projector fit beside the weights.
-* **Fast.** ≈ 31 tok/s single-stream decode (≈ 39 with the checkpoint's own multi-token-prediction layer as a
+* **Fast.** ≈ 31 tok/s single-stream decode (≈ 40 with the checkpoint's own multi-token-prediction layer as a
   speculative draft) and 830–1480 tok/s prefill on a 60 W board. Per matrix, the fused
   decode+GEMV beats raw BF16: the 248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **GPU only.** Embedding, weights and every model op run on the GPU; MoE experts are picked on the GPU, so the decode
@@ -136,7 +136,7 @@ python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --outtype bf16 --outfile
 python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --outtype bf16 --mmproj --outfile mmproj-bf16.gguf
 
 # OpenAI-compatible server (/v1/chat/completions, images included) with the full 262,144-token window and the MTP
-# layer as a speculative draft (+25 % decode; the full model verifies every token, so outputs stay its own)
+# layer as a speculative draft (+29 % decode; the full model verifies every token, so outputs stay its own)
 LLAMA_BF16N=hybrid GGML_CUDA_VMM_POOL_GB=4 LLAMA_MTP_SWA=32768 LLAMA_MTP_VOCAB=65536 ./llama.cpp/build/bin/llama-server \
   -m qwen3.6-35b-a3b-bf16.gguf --mmproj mmproj-bf16.gguf -c 262144 -np 1 -ngl 99 -fa on --fit off \
   -b 2048 -ub 2048 -cram 0 --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-n-ubatch 2048 \
@@ -257,7 +257,7 @@ what worked, what did not, and by how much.
   see them (≈ 11 GB); run with `--fit off` and set the context size explicitly.
 * Not compressed: the vision projector (0.9 GB BF16) and the KV cache (F16; a lossless format would save ≈ 11 %, see
   [docs/RESULTS.md](docs/RESULTS.md#kv-cache-compressibility-measured-dropped)).
-* The multi-token-prediction draft pays only with one draft token (+25 %,
+* The multi-token-prediction draft pays only with one draft token (+29 %,
   [docs/RESULTS.md](docs/RESULTS.md#speculative-decoding-with-the-mtp-head)): every extra verified token reads its own
   8 experts.
 * Dense matrices in prefill are still dequantised to BF16 per micro-batch.
@@ -276,7 +276,7 @@ matrices, so the practical ceiling with this format is ≈ 40 tok/s and a persis
 there. Prefill is limited by the latency of the MoE kernel's activation loads, which needs a different kernel shape
 (the expert weights decoded straight into tensor-core fragments).
 For serving, a matrix–vector kernel that decodes each dense weight once for several tokens made the
-multi-token-prediction draft worth +25 % together with a draft that scores only the 65536 most frequent token ids;
+multi-token-prediction draft worth +29 % together with a draft that scores only the 65536 most frequent token ids;
 more draft tokens need cheaper experts per extra token.
 The next research stages, with expected gains and how to measure them, are in [docs/ROADMAP.md](docs/ROADMAP.md).
 

@@ -347,7 +347,20 @@ change. Same session, `mtptest.sh` as above:
 * Greedy text with one draft token is identical for every vocabulary size and threshold.
 * A confidence threshold does not pay: a skipped good draft loses a whole token, a rejected one only the extra
   verification column. Three draft tokens win only on text the draft predicts well (arithmetic: 46.7 tok/s).
-* Production since 10-29: `LLAMA_MTP_VOCAB=65536`, one draft token, 36.9–40.8 tok/s on the four prompts.
+* Production since 10-29: `LLAMA_MTP_VOCAB=65536`, one draft token, 36.9–40.8 tok/s on the four prompts (38.7–42.4
+  with the concat fix below).
+
+**Where a verification step goes, and a slow concat.** nsys over `llama-server` with the draft (`--cuda-graph-trace=node`,
+three prompts): a step is the target's 2-token graph (1345 kernels), the draft step (52 kernels, 2.0 ms, 1.5 ms of it
+the draft's head over 65536 ids and the MTP layer's matrices) and the draft's pass over the accepted tokens (35
+kernels, 1.1 ms), plus ≈ 1.2 ms of host time between the graphs. The 2-token graph spent 2.67 ms in `concat_non_cont`:
+the gated delta net prepends its conv state to the transposed new tokens, and the patch's tiled transposed concat was
+enabled only from 32 tokens (one token is contiguous), so 2–31 tokens went through upstream's generic kernel (89 µs for a
+5×8192 tensor). Tiled from 2 tokens it takes 12 µs; with one draft token 38.81 → **40.20 tok/s** (same session,
+`mtptest.sh`), greedy text identical. The target's graph is then 41.2 ms: 38.4 ms GEMV (dense 17.8, experts 16.2, NIBBLE
+3.0), 1.0 ms gated delta net, ≈ 2.8 ms in ≈ 1000 small kernels of a dozen kinds (each 0.1–0.5 ms per step).
+(`llama-bench -p 2` also shows 1.2 ms of `scale_f32` per step: the zeroing of a new sequence's recurrent state, which
+every benchmark repetition triggers and a running conversation does not.)
 
 **Experts shared by the verified tokens (measured, dropped).** Consecutive tokens route to many of the same experts: a
 counter in a dev build saw 13.13 distinct experts per 16 (token, slot) columns with one draft token (the two tokens share

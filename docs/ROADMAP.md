@@ -103,7 +103,7 @@ The step is bandwidth-bound, so every saved bit is time. Code the exponent joint
 mantissa+sign entropy given the exponent: 7.86 of 8 bits), or use context from the neighbouring pair. Must stay a single
 table lookup per two weights.
 
-## Stage 6 — more tokens per weight pass (dense part and cheaper draft head done: +25 % with the MTP draft)
+## Stage 6 — more tokens per weight pass (dense part, cheaper draft head, 2-token concat done: +29 % with the MTP draft)
 
 The checkpoint's MTP head accepts 85 % of single drafts. The multi-column GEMV (RESULTS.md, MTP section) decodes each
 dense row once for up to 4 tokens: verifying 2 tokens costs ≈ 1.1× one on the dense matrices, so one draft token gives

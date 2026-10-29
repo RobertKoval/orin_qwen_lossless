@@ -2428,7 +2428,7 @@ index 6b36ca9..fdfedb6 100644
      // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
      // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
 diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
-index f8dcd95..0308949 100644
+index f8dcd95..662fe17 100644
 --- a/ggml/src/ggml-cuda/concat.cu
 +++ b/ggml/src/ggml-cuda/concat.cu
 @@ -139,8 +139,70 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -2488,7 +2488,7 @@ index f8dcd95..0308949 100644
  template <typename T>
  static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
 +    if (dim == 0 && src1->nb[1] == sizeof(T) && src1->nb[0] > sizeof(T) && !ggml_is_quantized(src0->type) &&
-+        src1->ne[0] >= CUDA_CONCAT_TILE && src1->ne[1] >= CUDA_CONCAT_TILE) { // a single token (decode) stays generic
++        src1->ne[0] > 1 && src1->ne[1] >= CUDA_CONCAT_TILE) { // a single token (decode) stays generic (contiguous)
 +        const dim3 grid((src1->ne[0] + CUDA_CONCAT_TILE - 1) / CUDA_CONCAT_TILE, (src1->ne[1] + CUDA_CONCAT_TILE - 1) / CUDA_CONCAT_TILE,
 +                        src1->ne[2] * src1->ne[3]);
 +        concat_dim0_transposed<T><<<grid, dim3(CUDA_CONCAT_TILE, CUDA_CONCAT_TILE_ROWS), 0, stream>>>(
