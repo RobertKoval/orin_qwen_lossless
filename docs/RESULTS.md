@@ -349,6 +349,26 @@ change. Same session, `mtptest.sh` as above:
   verification column. Three draft tokens win only on text the draft predicts well (arithmetic: 46.7 tok/s).
 * Production since 10-29: `LLAMA_MTP_VOCAB=65536`, one draft token, 36.9–40.8 tok/s on the four prompts.
 
+**Experts shared by the verified tokens (measured, dropped).** Consecutive tokens route to many of the same experts: a
+counter in a dev build saw 13.13 distinct experts per 16 (token, slot) columns with one draft token (the two tokens share
+2.87 of 8; random routing would share 0.25) and 21.3 per 32 with three. Decoding a shared expert once for all its tokens
+looked like −18 % / −33 % of the expert work, but the per-column GEMV already gets most of it: blocks that decode the
+same expert at the same time read it from DRAM once and from L2 after that. Same kernel, same 16 columns, 12 instead of
+16 distinct experts: 0.136 vs 0.166 ms (`ffn_gate_exps`; `ffn_down_exps` 0.138 vs 0.166). Explicit grouping only saves
+the duplicate decoding of ≈ 3 experts per layer (≈ 1 ms per step), and every variant tried cost more than that:
+
+| `ffn_gate_exps`, 2 tokens, 16 / 12 distinct experts | ms |
+|---|---:|
+| per-column GEMV (production) | 0.172 / 0.136 |
+| grouped, one kernel, columns per group a runtime count (spills) | 0.427 / 0.294 |
+| grouped, one kernel, 1- and 2-column paths compiled separately | 0.349 / 0.504 |
+| grouped, two launches (1-column groups at 1024 threads, 2-column groups at 512 threads, no spills) | 0.220 / 0.174 |
+| batched MMA prefill kernel (decodes each used expert once, BF16 activations) | 0.258 / 0.196 |
+
+All grouped variants were bitwise equal to the per-column path (equal output hashes). The multi-column NIBBLE GEMV
+(shared expert, small attention projections) is not done either: its extra column costs ≈ 0.8 ms per verify step,
+so a perfect kernel would give ≈ +1.5 %.
+
 ## KV-cache compressibility (measured, dropped)
 
 32,768 tokens of wikitext-2 (test split) prefilled through `llama-server` (`-fa on -ub 2048`, 402 tok/s), the slot saved

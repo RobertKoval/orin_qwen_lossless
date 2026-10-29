@@ -111,9 +111,10 @@ dense row once for up to 4 tokens: verifying 2 tokens costs ≈ 1.1× one on the
 (38.8 tok/s, +25 %). Two or three draft tokens are still slower (36.7 / 37.8) because every verified token reads its
 own 8 experts. What is left here:
 
-* Experts shared by the verified tokens decoded once (the gain is the overlap of consecutive tokens' routing, not
-  measured yet; random routing would share 0.25 of 8 experts).
-* The 4-bit NIBBLE GEMVs (shared expert, small attention projections, ≈ 3 ms per token) still decode per column.
+* Experts shared by the verified tokens: measured and dropped. Consecutive tokens share ≈ 2.9 of 8 experts, but the
+  per-column GEMV already reads a shared expert from DRAM once (L2); explicit grouping only saves its duplicate
+  decoding (≈ 2 %), and every grouped kernel tried cost more (RESULTS.md).
+* The 4-bit NIBBLE GEMVs still decode per column: ≈ +1.5 % at best, below the bar.
 * The MTP layer still runs its full 256-expert MoE per draft token; with the trimmed head that is most of the
   remaining draft cost.
 
