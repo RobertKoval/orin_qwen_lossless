@@ -107,13 +107,13 @@ table lookup per two weights.
 ## Stage 6 — more tokens per weight pass (+35–50 %, medium–large)
 
 Measured (RESULTS.md, MTP section): the checkpoint's MTP head as a draft accepts 85 % of single drafts and gives
-+7–9 % with one draft token; with three it would average 2.87 tokens per step, but verifying 4 tokens costs ≈ 3 decode
++6.6–9 % with one draft token; with three it would average 2.87 tokens per step, but verifying 4 tokens costs ≈ 3 decode
 steps because every column re-decodes the weights (dense 2.6× one column at 3–4 columns) and each token brings its own
 experts (3.7× at 4 tokens). A multi-column GEMV that decodes each weight once and multiplies it with all columns (and
 decodes a shared expert once for the tokens routed to it) leaves the experts as the floor: ≈ 42–46 tok/s estimated.
 The draft fits next to the full window and an image: a 64-token draft micro-batch, an F16 draft KV, the MTP layer
-loaded into the model so it shares the embedding and output matrices, and graph inputs read in place on the integrated
-GPU (RESULTS.md). This is the only lever beyond ≈ 45 tok/s on this hardware.
+in the model's own GGUF so it shares the embedding and output matrices, and graph inputs read in place on the
+integrated GPU (RESULTS.md). This is the only lever beyond ≈ 45 tok/s on this hardware.
 
 ## Stage 7 — platform
 

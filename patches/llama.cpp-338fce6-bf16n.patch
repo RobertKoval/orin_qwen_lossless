@@ -2983,104 +2983,18 @@ index e108f04..31a1541 100644
  
              auto * res = lctx->get_gf_res_reserve();
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index a963f24..626eba9 100644
+index a963f24..ca0b2f7 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -80,6 +80,38 @@ const char * llama_ftype_name(llama_ftype ftype) {
- 
- // return a list of splits for a given path
- // for example, given "<name>-00002-of-00004.gguf", returns list of all 4 splits
-+// copy one key/value pair, replacing the key in dst
-+static void llama_gguf_copy_kv(gguf_context * dst, const gguf_context * src, int64_t i) {
-+    const char * key = gguf_get_key(src, i);
-+    switch (gguf_get_kv_type(src, i)) {
-+        case GGUF_TYPE_UINT8:   gguf_set_val_u8  (dst, key, gguf_get_val_u8  (src, i)); break;
-+        case GGUF_TYPE_INT8:    gguf_set_val_i8  (dst, key, gguf_get_val_i8  (src, i)); break;
-+        case GGUF_TYPE_UINT16:  gguf_set_val_u16 (dst, key, gguf_get_val_u16 (src, i)); break;
-+        case GGUF_TYPE_INT16:   gguf_set_val_i16 (dst, key, gguf_get_val_i16 (src, i)); break;
-+        case GGUF_TYPE_UINT32:  gguf_set_val_u32 (dst, key, gguf_get_val_u32 (src, i)); break;
-+        case GGUF_TYPE_INT32:   gguf_set_val_i32 (dst, key, gguf_get_val_i32 (src, i)); break;
-+        case GGUF_TYPE_FLOAT32: gguf_set_val_f32 (dst, key, gguf_get_val_f32 (src, i)); break;
-+        case GGUF_TYPE_UINT64:  gguf_set_val_u64 (dst, key, gguf_get_val_u64 (src, i)); break;
-+        case GGUF_TYPE_INT64:   gguf_set_val_i64 (dst, key, gguf_get_val_i64 (src, i)); break;
-+        case GGUF_TYPE_FLOAT64: gguf_set_val_f64 (dst, key, gguf_get_val_f64 (src, i)); break;
-+        case GGUF_TYPE_BOOL:    gguf_set_val_bool(dst, key, gguf_get_val_bool(src, i)); break;
-+        case GGUF_TYPE_STRING:  gguf_set_val_str (dst, key, gguf_get_val_str (src, i)); break;
-+        case GGUF_TYPE_ARRAY: {
-+            const size_t n = gguf_get_arr_n(src, i);
-+            if (gguf_get_arr_type(src, i) == GGUF_TYPE_STRING) {
-+                std::vector<const char *> strs(n);
-+                for (size_t j = 0; j < n; ++j) {
-+                    strs[j] = gguf_get_arr_str(src, i, j);
-+                }
-+                gguf_set_arr_str(dst, key, strs.data(), n);
-+            } else {
-+                gguf_set_arr_data(dst, key, gguf_get_arr_type(src, i), gguf_get_arr_data(src, i), n);
-+            }
-+        } break;
-+        default: GGML_ABORT("unknown GGUF type %d for key %s", (int) gguf_get_kv_type(src, i), key);
-+    }
-+}
-+
- static std::vector<std::string> llama_get_list_splits(const std::string & path, const int idx, const int n_split) {
-     std::vector<std::string> paths;
-     std::string split_prefix;
-@@ -675,6 +707,54 @@ llama_model_loader::llama_model_loader(
+@@ -675,6 +675,7 @@ llama_model_loader::llama_model_loader(
  
              LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
          }
 +
-+        // LLAMA_MODEL_EXTRA: a GGUF with layers the model file lacks, e.g. the MTP head exported with
-+        // convert_hf_to_gguf.py --mtp next to a model converted without it. Its tensors that the model does not have are
-+        // added (the rest, e.g. its copies of the embedding and output, are ignored, so the head runs on the model's own),
-+        // and its architecture keys replace the model's: they describe the model with the extra layers (block count,
-+        // NextN layers, per-layer arrays).
-+        if (const char * extra = getenv("LLAMA_MODEL_EXTRA"); extra != nullptr && extra[0] != '\0') {
-+            struct gguf_init_params extra_params = {
-+                /*.no_alloc = */ true,
-+                /*.ctx      = */ &ctx,
-+            };
-+            gguf_context_ptr ctx_gguf { gguf_init_from_file(extra, extra_params) };
-+            if (!ctx_gguf) {
-+                throw std::runtime_error(format("%s: failed to load LLAMA_MODEL_EXTRA %s", __func__, extra));
-+            }
-+            const int kid = gguf_find_key(ctx_gguf.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str());
-+            if (kid < 0 || arch_name != gguf_get_val_str(ctx_gguf.get(), kid)) {
-+                throw std::runtime_error(format("%s: LLAMA_MODEL_EXTRA %s is not a %s model", __func__, extra, arch_name.c_str()));
-+            }
-+
-+            files.emplace_back(new llama_file(extra, "rb", use_direct_io));
-+            contexts.emplace_back(ctx);
-+            const uint16_t idx = (uint16_t) (files.size() - 1);
-+
-+            int n_added = 0, n_ignored = 0;
-+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-+                const std::string tensor_name = ggml_get_name(cur);
-+                if (weights_map.find(tensor_name) != weights_map.end()) {
-+                    n_ignored++;
-+                    continue;
-+                }
-+                n_elements += ggml_nelements(cur);
-+                n_bytes    += ggml_nbytes(cur);
-+                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
-+                n_added++;
-+            }
-+
-+            const std::string arch_prefix = arch_name + ".";
-+            int n_keys = 0;
-+            for (int64_t i = 0; i < gguf_get_n_kv(ctx_gguf.get()); ++i) {
-+                if (std::string(gguf_get_key(ctx_gguf.get(), i)).rfind(arch_prefix, 0) == 0) {
-+                    llama_gguf_copy_kv(metadata, ctx_gguf.get(), i);
-+                    n_keys++;
-+                }
-+            }
-+            LLAMA_LOG_INFO("%s: LLAMA_MODEL_EXTRA %s: %d tensors added, %d already in the model ignored, %d %s keys taken\n",
-+                __func__, extra, n_added, n_ignored, n_keys, arch_name.c_str());
-+        }
      } else if (file != nullptr) {
          struct ggml_context * ctx = NULL;
          struct gguf_init_params params = {
-@@ -1123,6 +1203,34 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+@@ -1123,6 +1124,34 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
      return true;
  }
  
@@ -3115,7 +3029,7 @@ index a963f24..626eba9 100644
  struct ggml_tensor * llama_model_loader::create_tensor(
          const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
          const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-@@ -1387,6 +1495,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1387,6 +1416,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
  
      const bool duplicated = flags & TENSOR_DUPLICATED;
  
@@ -3132,7 +3046,7 @@ index a963f24..626eba9 100644
      struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
      ggml_set_name(tensor, ggml_get_name(&t_meta));
  
-@@ -1703,6 +1821,44 @@ bool llama_model_loader::load_all_data(
+@@ -1703,6 +1742,44 @@ bool llama_model_loader::load_all_data(
              }
          }
  

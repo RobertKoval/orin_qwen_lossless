@@ -32,7 +32,7 @@ decodes it inside llama.cpp's CUDA matrix–vector kernels, so a decode step str
   (see [Limitations](#limitations)).
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671): the model's full 262,144-token window
   and its vision projector fit beside the weights.
-* **Fast.** ≈ 31 tok/s single-stream decode (≈ 34 with the checkpoint's own multi-token-prediction head as a
+* **Fast.** ≈ 31 tok/s single-stream decode (≈ 33 with the checkpoint's own multi-token-prediction layer as a
   speculative draft) and 830–1480 tok/s prefill on a 60 W board. Per matrix, the fused
   decode+GEMV beats raw BF16: the 248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **GPU only.** Embedding, weights and every model op run on the GPU; MoE experts are picked on the GPU, so the decode
@@ -130,25 +130,21 @@ Correctness, methodology and the full history of what was tried: [docs/RESULTS.m
 git clone https://github.com/RobertKoval/orin_qwen_lossless && cd orin_qwen_lossless
 scripts/build_llama.sh        # clones llama.cpp 338fce6, applies the patch, builds for SM87
 
-# BF16 GGUFs of Qwen/Qwen3.6-35B-A3B: the language model and the vision projector
+# BF16 GGUFs of Qwen/Qwen3.6-35B-A3B: the language model (with its multi-token-prediction layer, 71 GB) and the
+# vision projector
 python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --outtype bf16 --outfile qwen3.6-35b-a3b-bf16.gguf
 python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --outtype bf16 --mmproj --outfile mmproj-bf16.gguf
 
-# OpenAI-compatible server (/v1/chat/completions, images included) with the full 262,144-token window
+# OpenAI-compatible server (/v1/chat/completions, images included) with the full 262,144-token window and the MTP
+# layer as a speculative draft (+6.6 % decode; the full model verifies every token, so outputs stay its own)
 LLAMA_BF16N=hybrid GGML_CUDA_VMM_POOL_GB=4 ./llama.cpp/build/bin/llama-server \
   -m qwen3.6-35b-a3b-bf16.gguf --mmproj mmproj-bf16.gguf -c 262144 -np 1 -ngl 99 -fa on --fit off \
-  -b 2048 -ub 2048 -cram 0 --alias qwen3-a3b-30b --host 0.0.0.0 --port 8000
-
-# optional: the checkpoint's multi-token-prediction head as a speculative draft (+7–9 % decode; the full model still
-# verifies every token, so the head may be quantized)
-python3 llama.cpp/convert_hf_to_gguf.py Qwen3.6-35B-A3B --mtp --outtype bf16 --outfile mtp-bf16.gguf
-./llama.cpp/build/bin/llama-quantize mtp-bf16.gguf mtp-Q4_K_M.gguf Q4_K_M
-# then start the server with LLAMA_MODEL_EXTRA=mtp-Q4_K_M.gguf and add
-#   --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-n-ubatch 64
+  -b 2048 -ub 2048 -cram 0 --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-n-ubatch 64 \
+  --alias qwen3-a3b-30b --host 0.0.0.0 --port 8000
 ```
 
-Loading reads the 69 GB GGUF and encodes it (≈ 3 min on the Orin's NVMe and CPU). With the full window, the projector
-and the MTP draft the server process holds 55.9 GB after a 4K image and about 3 GB of the 61.4 GiB stay free (desktop
+Loading reads the 71 GB GGUF and encodes it (≈ 3 min on the Orin's NVMe and CPU). With the full window, the projector
+and the MTP draft the server process holds 56.1 GB after a 4K image and about 3 GB of the 61.4 GiB stay free (desktop
 running, the kernel keeps 1 GB in reserve), so the server gets one slot (`-np 1`).
 What the flags are for:
 
@@ -158,11 +154,10 @@ What the flags are for:
 * `-cram 0`: no prompt cache in RAM, which the unified memory cannot spare.
 * `GGML_CUDA_VMM_POOL_GB=4`: the projector's CUDA context needs its own pool; the default 32 GB address reservation
   per pool fails next to the model.
-* Draft: `LLAMA_MODEL_EXTRA` loads the MTP layer into the model itself, so the draft runs on the model's own
-  embedding and output matrices instead of the draft file's copies (0.7 GB). One draft token (verifying more costs
-  more than it gains with today's kernels); a 64-token draft micro-batch, because the draft context's attention mask
-  is window × micro-batch (1 GiB at 2048); F16 draft KV, because a quantized one makes flash attention keep F16 copies
-  of the whole window.
+* Draft: the MTP layer is part of the GGUF and runs on the model's own weights (embedding and output matrix shared,
+  the layer itself BF16N like the rest). One draft token (verifying more costs more than it gains with today's
+  kernels); a 64-token draft micro-batch, because the draft context's attention mask is window × micro-batch (1 GiB at
+  2048); F16 draft KV, because a quantized one makes flash attention keep F16 copies of the whole window.
 * The attention mask of the model itself is 1 GiB at `-ub 2048`. On Orin the GPU reads it, like every graph input,
   straight from host memory instead of a device copy (−1.06 GB); upstream switches this off because llama.cpp
   overwrote inputs the GPU was still reading (#15034), which the patch prevents by synchronizing before it writes
@@ -181,7 +176,6 @@ Close desktop applications for best speed: on Orin the compositor and remote des
 | `GGML_CUDA_NO_GDN_ROWS=1` | disable the in-place recurrent-state read |
 | `GGML_CUDA_VMM_POOL_GB=<n>` | virtual address space each CUDA memory pool reserves (default 32); `4` lets the image projector's context start next to the model |
 | `GGML_CUDA_NO_INTEGRATED=1` | copy graph inputs to the device as upstream does, instead of reading them from host memory in place |
-| `LLAMA_MODEL_EXTRA=<gguf>` | add the layers a model file lacks from a second GGUF, e.g. the MTP head from `convert_hf_to_gguf.py --mtp` |
 | `GGML_BF16N_HP_GLU=1` | fused gate/up/SWIGLU for pair-Huffman experts in decode (measured slower on Orin) |
 | `GGML_BF16N_NO_GLU=1` | no gate/up/SWIGLU fusion at all (decode GEMV and prefill MoE kernel) |
 
@@ -253,7 +247,7 @@ what worked, what did not, and by how much.
 * The compressed exponent buffers are allocated outside ggml's buffers, so llama.cpp's automatic memory fitting does not
   see them (≈ 11 GB); run with `--fit off` and set the context size explicitly.
 * Not compressed yet: the vision projector (0.9 GB BF16) and the KV cache (F16).
-* The multi-token-prediction draft pays only with one draft token (+7–9 %,
+* The multi-token-prediction draft pays only with one draft token (+6.6 %,
   [docs/RESULTS.md](docs/RESULTS.md#speculative-decoding-with-the-mtp-head)): verifying more tokens re-decodes the
   weights once per token.
 * Dense matrices in prefill are still dequantised to BF16 per micro-batch.
@@ -272,9 +266,8 @@ matrices, so the practical ceiling with this format is ≈ 40 tok/s and a persis
 there. Prefill is limited by the latency of the MoE kernel's activation loads, which needs a different kernel shape
 (the expert weights decoded straight into tensor-core fragments).
 For serving, the next steps are a matrix–vector kernel that decodes each weight once for several tokens, which would
-let the multi-token-prediction draft verify 3 tokens per step (≈ +35–50 % estimated, from +7–10 % today), and more
-memory headroom at the full window (a losslessly compressed KV cache, the draft sharing the model's embedding and
-output matrices).
+let the multi-token-prediction draft verify 3 tokens per step (≈ +35–50 % estimated, from +6.6 % today), and more
+memory headroom at the full window from a losslessly compressed KV cache.
 The next research stages, with expected gains and how to measure them, are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License and credits

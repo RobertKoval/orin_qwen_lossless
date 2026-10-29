@@ -519,12 +519,14 @@ With the last column the production server (full window, projector, Q4_K_M draft
 
 Two more savings, measured with the server's resident memory (the Normal zone's free memory moves with kswapd):
 
-* **The draft on the model's own embedding and output matrices.** `LLAMA_MODEL_EXTRA=<mtp gguf>` makes the loader add
-  the tensors the model file lacks (the 20 tensors of layer 40) and take the MTP file's `qwen35moe.*` keys (block count
-  41, one NextN layer, the 41-entry recurrent-layer array), so `--spec-type draft-mtp` runs without `-md` on the
-  model's weights, as upstream does for a GGUF converted with the head. −0.69 GB; decode 1.5 % slower than with the
-  draft file (the draft now uses the exact BF16N output matrix, 4.3 ms, instead of a Q6_K copy), acceptance unchanged,
-  greedy text identical on five prompts (two of 16.7K and 20.6K tokens).
+* **The draft on the model's own embedding and output matrices.** The first conversion of the model left the MTP
+  layer out; re-converted with `convert_hf_to_gguf.py` of `338fce6` (which exports it by default, 71.07 GB, block count
+  41, one NextN layer), the GGUF gives greedy text identical to the old one without the draft (four prompts × 400
+  tokens), and `--spec-type draft-mtp` runs the layer on the model's weights without `-md`: the draft shares the
+  embedding and output matrix, and its own layer is BF16N like the rest. Same four prompts: 32.77 tok/s against 30.74
+  without the draft (+6.6 %), acceptance 0.853 (a separate Q4_K_M draft file: 33.20, it has its own Q6_K output matrix,
+  which is cheaper to read than the exact one); resident 56.11 GB after a 4K image. Before the re-conversion a loader
+  hook added the layer from the MTP-only file (−0.69 GB against the separate draft, same greedy text); it is gone now.
 * **Graph inputs read in place.** The model's own attention mask is 1056 MiB in a host buffer at `-ub 2048` plus a
   device copy in its 1440 MiB compute buffer. On an integrated GPU the device can read the host buffer directly, but
   upstream keeps the CUDA integrated path off because outputs were corrupted (#15034): `llama_decode` returns before
@@ -540,9 +542,8 @@ Two more savings, measured with the server's resident memory (the Normal zone's 
 Not taken: `-ub 1024` would halve the mask again, but prefill drops 17 % (pp8192 1093 vs 1322 tok/s) and 13 % at
 depth 32K (885 vs 1014).
 
-Production now (full window, projector, MTP layer in the model, inputs in place): 54.66 GB resident after loading
-against 56.43 GB for the first configuration with the draft (−1.77 GB), 55.86 GB after a 4K image; 33.3 tok/s on the
-image, 33.0 on text.
+Production now (full window, projector, MTP layer of the re-converted GGUF, inputs in place): 56.11 GB resident after
+a 4K image; 33.1 tok/s on the image.
 
 ## Correctness
 
