@@ -103,18 +103,19 @@ The step is bandwidth-bound, so every saved bit is time. Code the exponent joint
 mantissa+sign entropy given the exponent: 7.86 of 8 bits), or use context from the neighbouring pair. Must stay a single
 table lookup per two weights.
 
-## Stage 6 — more tokens per weight pass (dense part done: +18.5 % with the MTP draft)
+## Stage 6 — more tokens per weight pass (dense part and cheaper draft head done: +25 % with the MTP draft)
 
 The checkpoint's MTP head accepts 85 % of single drafts. The multi-column GEMV (RESULTS.md, MTP section) decodes each
 dense row once for up to 4 tokens: verifying 2 tokens costs ≈ 1.1× one on the dense matrices, so one draft token gives
-36.9 tok/s (+18.5 %, was +6.6 %). Two or three draft tokens are slower (34.1 / 34.4) because every verified token
-reads its own 8 experts. What is left here:
+36.9 tok/s (+18.5 %, was +6.6 %); a draft head over the first 65536 token ids instead of all 248,320 adds 5 % more
+(38.8 tok/s, +25 %). Two or three draft tokens are still slower (36.7 / 37.8) because every verified token reads its
+own 8 experts. What is left here:
 
 * Experts shared by the verified tokens decoded once (the gain is the overlap of consecutive tokens' routing, not
   measured yet; random routing would share 0.25 of 8 experts).
 * The 4-bit NIBBLE GEMVs (shared expert, small attention projections, ≈ 3 ms per token) still decode per column.
-* The MTP layer as the draft costs one more layer step per draft token; a cheaper draft (fewer experts, a trimmed
-  output vocabulary) would make 2–3 draft tokens pay.
+* The MTP layer still runs its full 256-expert MoE per draft token; with the trimmed head that is most of the
+  remaining draft cost.
 
 ## Stage 7 — platform
 

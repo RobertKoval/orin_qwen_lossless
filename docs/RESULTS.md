@@ -324,6 +324,31 @@ the dense part of a 4-token verification now costs ≈ 1.5× one token, but each
 at 4 tokens), and every extra draft step runs the MTP layer. Production runs the multi-column kernel with one draft
 token since 10-29 (35.8–38.5 tok/s on the warm prompts, 56.4 GB resident after a 4K image).
 
+**A smaller vocabulary for the draft.** With one draft token a step costs ≈ 50 ms, ≈ 5 ms of it the draft, and
+≈ 4.2 ms of that the draft's head: full 248,320-token logits through the shared output matrix (the target needs no
+logits from the draft beyond its top candidates). BPE token ids run roughly from frequent to rare, so
+`LLAMA_MTP_VOCAB=<n>` (patch) computes the draft's logits for ids below `n` only (a row view of the output matrix) and
+sets the rest to −∞. A token outside never gets drafted; the target still verifies every token, so the output does not
+change. Same session, `mtptest.sh` as above:
+
+| draft vocabulary | draft tokens | tok/s | accepted drafts |
+|---|---:|---:|---:|
+| all 248,320 | 1 | 36.85 | 0.853 |
+| 32,768 | 1 | 38.56 | 0.796 (English 0.712) |
+| **65,536** | 1 | **38.81** | 0.831 |
+| 131,072 | 1 | 38.26 | 0.848 |
+| 65,536 | 2 | 36.72 | 0.722 |
+| 65,536 | 3 | 37.82 | 0.629 |
+| 65,536, `--spec-draft-p-min 0.5` | 1 | 37.56 | 0.909 |
+| 65,536, `--spec-draft-p-min 0.75` | 1 | 35.36 | 0.955 |
+| 65,536, `--spec-draft-p-min 0.5` | 3 | 38.01 | 0.797 |
+| 65,536, `--spec-draft-p-min 0.75` / `0.9` | 3 | 37.05 / 35.32 | 0.924 / 0.972 |
+
+* Greedy text with one draft token is identical for every vocabulary size and threshold.
+* A confidence threshold does not pay: a skipped good draft loses a whole token, a rejected one only the extra
+  verification column. Three draft tokens win only on text the draft predicts well (arithmetic: 46.7 tok/s).
+* Production since 10-29: `LLAMA_MTP_VOCAB=65536`, one draft token, 36.9–40.8 tok/s on the four prompts.
+
 ## KV-cache compressibility (measured, dropped)
 
 32,768 tokens of wikitext-2 (test split) prefilled through `llama-server` (`-fa on -ub 2048`, 402 tok/s), the slot saved
