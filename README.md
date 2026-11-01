@@ -10,7 +10,7 @@ This is not lower-precision weight quantization. Exact weight reconstruction doe
 
 Historical engine-specific builds achieved roughly one-third smaller weight storage, about31–33 tokens/s without a draft, and about40–41 tokens/s with the model's MTP draft on this board. **Those serving baselines are not measurements of a deployed shared-core release.**
 
-The current shared-core candidate passes substantial numerical and loading checks but retains measured performance tradeoffs, including about1.8–3.5% lower vLLM MTP-off decode interval rates in a bounded comparison. It has **not replaced the earlier production baseline**. See [results](docs/RESULTS.md), [vLLM measurements](docs/vllm/RESULTS.md) and [llama.cpp measurements](docs/llamacpp/RESULTS.md).
+The shared-core vLLM release is now deployed. A final matched warm MTP-on comparison measured **40.88 → 41.21 tokens/s (+0.80%)**, with all four texts/token counts matching. This single pair is not a universal speedup claim. The earlier bounded MTP-off comparison still showed about1.8–3.5% lower decode interval rates; that tradeoff is not erased by the MTP-on result. See [results](docs/RESULTS.md), [vLLM measurements](docs/vllm/RESULTS.md) and [llama.cpp measurements](docs/llamacpp/RESULTS.md).
 
 Historical prefill and long-context figures are workload-specific. The public prompt corpus differs from the historical corpus; new public-client results require a fresh baseline, not an assertion of exact historical reproduction.
 

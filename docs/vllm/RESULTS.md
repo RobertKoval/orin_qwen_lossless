@@ -35,7 +35,11 @@ The server span includes GPU work **and engine-host pacing**, not pure kernel ti
 
 Static inspection found changed BF16-input NIBBLE address generation and output-specialized shared-expert/MC kernels, alongside unchanged HP scalar/CM, routed-MoE and routing/dequantization instruction streams in the compared binaries. Smaller instruction/register counts are not a measured speedup; unchanged instructions shift investigation toward runtime placement/cache/launch behavior rather than a compiler-body explanation for those kernels. No single cause of the whole-model gap was established.
 
-**Release status:** correctness checks passed for the tested cases, but the MTP-off loss remains a measured tradeoff. The shared-core candidate has not replaced the earlier production baseline. Native-engine MTP measurements cannot waive a vLLM MTP-off regression.
+## Final shared-core deployment
+
+The shared-core release is deployed in the full-window BF16-KV, vision-enabled, three-draft-token MTP configuration. One matched warm old/new pair measured **40.88 → 41.21 tokens/s (+0.80%)**; all four texts and completion-token counts matched. Health, tool calling, reasoning and vision checks passed. A single pair does not establish a universal gain, and the public-corpus caveat above still applies.
+
+The MTP-off loss remains a measured tradeoff. This default-MTP deployment result does not establish MTP-off performance parity or replace the separate earlier observations.
 
 ## Interpretation
 

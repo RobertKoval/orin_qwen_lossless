@@ -11,7 +11,9 @@ Measured on Jetson AGX Orin64GB, SM87, CUDA12.6/L4T R36.5, Qwen3.6-35B-A3B, sing
 
 These are earlier engine-specific baselines, **not a deployed shared-core release**. Draft settings, approximate candidate heads and any sampler interventions are separate from lossless target weights. Full methodology and scope: [llama.cpp](llamacpp/RESULTS.md), [vLLM](vllm/RESULTS.md).
 
-The shared-core candidate passed the tested encoded-weight/per-operation/serving comparisons but retains performance tradeoffs. Native generation was near the earlier baseline in limited paired measurements; native prefill changed by roughly−0.2 to−0.6%. A bounded vLLM MTP-off comparison observed32.220→31.641/s nonstream and32.199→31.087/s SSE post-first-token interval rates (−1.8% /−3.45%). Those spans include engine-host pacing. No universal regression waiver or complete cause is established; the candidate has not replaced the earlier production baseline.
+The shared-core candidate passed the tested encoded-weight/per-operation/serving comparisons but retains performance tradeoffs. Native generation was near the earlier baseline in limited paired measurements; native prefill changed by roughly−0.2 to−0.6%. A bounded vLLM MTP-off comparison observed32.220→31.641/s nonstream and32.199→31.087/s SSE post-first-token interval rates (−1.8% /−3.45%). Those spans include engine-host pacing. No universal performance parity or complete cause is established.
+
+**Shared-core vLLM deployment:** one final matched warm comparison of the default MTP-on configuration measured **40.88 → 41.21 tokens/s (+0.80%)** with matching texts/token counts on four prompts. The shared-core release is now serving; health, tools, reasoning and vision checks passed. The MTP-off tradeoff above remains, and one pair is not a general speedup guarantee.
 
 ## Prefill and long-context measurements
 
