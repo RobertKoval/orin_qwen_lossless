@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Robert Koval <kovalrobert@me.com>
+Date: Thu, 29 Oct 2026 19:59:37 +0200
+Subject: [PATCH] llama: convert BF16 weights to BF16N at load (LLAMA_BF16N)
+
+Policy (hybrid / huffman / nibble, LLAMA_BF16N_DENSE_MIN), the F32-router exactness check, conversion through
+the CUDA backend proc address, and the embedding on the GPU for a fully offloaded model (LLAMA_BF16N_INPUT_CPU).
+---
+ src/llama-model-loader.cpp | 77 ++++++++++++++++++++++++++++++++++++++
+ src/llama-model-loader.h   |  3 ++
+ src/llama-model.cpp        |  4 ++
+ 3 files changed, 84 insertions(+)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index a963f24801214f9a2d8de3e48ac7af27b6aa4a12..b180a6e482c37d610c061e7247d81ec895ef8671 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -675,6 +675,7 @@ llama_model_loader::llama_model_loader(
+ 
+             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
+         }
++
+     } else if (file != nullptr) {
+         struct ggml_context * ctx = NULL;
+         struct gguf_init_params params = {
+@@ -1123,6 +1124,34 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+     return true;
+ }
+ 
++// LLAMA_BF16N=hybrid|huffman|nibble: keep BF16 weights resident in lossless compressed form (GGML_TYPE_BF16N).
++// hybrid: routed experts use the Huffman exponent format (max compression), dense weights the nibble format (fast).
++static int llama_bf16n_format_for(const ggml_tensor & t, ggml_backend_buffer_type_t buft) {
++    static const char * mode = getenv("LLAMA_BF16N");
++    if (mode == nullptr || *mode == 0 || strcmp(mode, "0") == 0) {
++        return 0;
++    }
++    const std::string name = ggml_get_name(&t);
++    // the router is stored as F32 but holds BF16 values (exactness is checked at load)
++    const bool router = t.type == GGML_TYPE_F32 && name.size() > 19 && name.compare(name.size() - 19, 19, "ffn_gate_inp.weight") == 0;
++    if ((t.type != GGML_TYPE_BF16 && !router) || ggml_n_dims(&t) < 2 || t.ne[0] % 512 != 0 || t.ne[0] > 4096) {
++        return 0;
++    }
++    if (ggml_backend_buft_is_host(buft)) {
++        return 0;
++    }
++    static const int64_t dense_min = getenv("LLAMA_BF16N_DENSE_MIN") ? atoll(getenv("LLAMA_BF16N_DENSE_MIN")) : (8ll << 20);
++    const bool expert = name.find("_exps") != std::string::npos;
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++    using choose_t = int (*)(int64_t, int64_t, int64_t, const char *, int64_t, bool);
++    auto choose = (choose_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
++                                                             "ggml_backend_cuda_bf16n_choose");
++    if (choose == nullptr) {
++        throw std::runtime_error("LLAMA_BF16N requires a backend with BF16N policy support");
++    }
++    return choose(t.ne[1], t.ne[0], t.ne[2], mode, dense_min, expert);
++}
++
+ struct ggml_tensor * llama_model_loader::create_tensor(
+         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+@@ -1387,6 +1416,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+ 
+     const bool duplicated = flags & TENSOR_DUPLICATED;
+ 
++    const int bf16n_fmt = duplicated || is_lazy ? 0 : llama_bf16n_format_for(t_meta, buft);
++    if (bf16n_fmt) {
++        t_meta.type  = GGML_TYPE_BF16N;
++        t_meta.nb[0] = ggml_type_size(GGML_TYPE_BF16N);
++        t_meta.nb[1] = ggml_row_size(GGML_TYPE_BF16N, t_meta.ne[0]);
++        t_meta.nb[2] = t_meta.nb[1]*t_meta.ne[1];
++        t_meta.nb[3] = t_meta.nb[2]*t_meta.ne[2];
++        bf16n_formats[tn.str()] = bf16n_fmt;
++    }
++
+     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+     ggml_set_name(tensor, ggml_get_name(&t_meta));
+ 
+@@ -1703,6 +1742,44 @@ bool llama_model_loader::load_all_data(
+             }
+         }
+ 
++        if (cur->type == GGML_TYPE_BF16N) {
++            const size_t src_size = ggml_nbytes(weight->tensor);
++            std::vector<uint8_t> host;
++            const void * src;
++            if (use_mmap) {
++                src = (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs;
++            } else {
++                host.resize(src_size);
++                const auto & file = files.at(weight->idx);
++                file->seek(weight->offs, SEEK_SET);
++                file->read_raw(host.data(), src_size);
++                src = host.data();
++            }
++            std::vector<uint16_t> bf16;
++            if (weight->tensor->type == GGML_TYPE_F32) {
++                const uint32_t * f = (const uint32_t *) src;
++                bf16.resize(ggml_nelements(weight->tensor));
++                for (size_t i = 0; i < bf16.size(); i++) {
++                    if (f[i] & 0xFFFF) {
++                        throw std::runtime_error(format("BF16N: F32 tensor %s is not exactly representable in BF16", ggml_get_name(cur)));
++                    }
++                    bf16[i] = (uint16_t) (f[i] >> 16);
++                }
++                src = bf16.data();
++            }
++            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
++            using convert_t = bool (*)(ggml_tensor *, const void *, int);
++            auto convert = (convert_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_bf16n_convert");
++            if (convert == nullptr) {
++                throw std::runtime_error("LLAMA_BF16N requires the CUDA backend");
++            }
++            if (!convert(cur, src, bf16n_formats.at(ggml_get_name(cur)))) {
++                throw std::runtime_error(format("BF16N round-trip mismatch for tensor '%s'", ggml_get_name(cur)));
++            }
++            size_done += src_size;
++            continue;
++        }
++
+         size_t n_size = ggml_nbytes(cur);
+ 
+         const bool from_mapping = use_mmap || lazy.has(cur);
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079a4eadd8a310c013de20a87d782d490377..f15ee210048d30b2dd272279955b062b5b722633 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -73,6 +73,9 @@ struct llama_model_loader {
+     int n_tensors = 0;
+     int n_created = 0;
+ 
++    // tensors converted at load time to GGML_TYPE_BF16N (name -> aux format)
++    std::map<std::string, int> bf16n_formats;
++
+     uint64_t n_elements = 0;
+     size_t   n_bytes    = 0;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index c7b2fcc93b0df3ed4b993de6c32743b1bb8faf99..e358ad0495c488e7bef2bc0c862ad7cee21d8218 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1699,6 +1699,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // assign the input layer
+     // there is very little benefit to offloading the input layer, so always keep it on the CPU
+     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    // ... except with LLAMA_BF16N: the compressed embedding lives on the GPU with the rest of a fully offloaded model
++    if (getenv("LLAMA_BF16N") != nullptr && getenv("LLAMA_BF16N_INPUT_CPU") == nullptr && act_gpu_layers > n_layer_all) {
++        pimpl->dev_input = get_layer_buft_list(n_layer_all);
++    }
+ 
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);

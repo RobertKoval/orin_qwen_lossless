@@ -1,0 +1,543 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Robert Koval <kovalrobert@me.com>
+Date: Thu, 29 Oct 2026 19:59:37 +0200
+Subject: [PATCH] ggml-cuda: thin BF16N adapter over the shared core
+
+---
+ ggml/src/ggml-cuda/CMakeLists.txt |  12 ++
+ ggml/src/ggml-cuda/bf16n.cu       | 286 ++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/bf16n.cuh      |  50 ++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu   |  74 +++++++-
+ 4 files changed, 420 insertions(+), 2 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/bf16n.cu
+ create mode 100644 ggml/src/ggml-cuda/bf16n.cuh
+
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 297d9ffc9d4afeac2ee0eb93f1775ce0f0c6e308..7592d41ce54f00cf67cab5d840b6d0d9d57701f4 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -132,6 +132,18 @@ if (CUDAToolkit_FOUND)
+                              ${GGML_SOURCES_CUDA}
+                             )
+ 
++    # BF16N is supplied by the engine-independent core, never copied into this patch series.
++    set(BF16N_CORE_DIR "" CACHE PATH "Path to the shared BF16N core directory")
++    if (NOT EXISTS "${BF16N_CORE_DIR}/include/bf16n/encode.h")
++        message(FATAL_ERROR "BF16N requires -DBF16N_CORE_DIR=/path/to/bf16n/core")
++    endif()
++    target_sources(ggml-cuda PRIVATE
++        "${BF16N_CORE_DIR}/src/encode.cpp"
++        "${BF16N_CORE_DIR}/src/policy.cpp"
++        "${BF16N_CORE_DIR}/src/launch.cu"
++        "${BF16N_CORE_DIR}/src/mmid_helper.cu")
++    target_include_directories(ggml-cuda PRIVATE "${BF16N_CORE_DIR}/include")
++
+     if (GGML_CUDA_GRAPHS)
+         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
+     endif()
+diff --git a/ggml/src/ggml-cuda/bf16n.cu b/ggml/src/ggml-cuda/bf16n.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffaa4fd5dc990c27639e3b2e6cd7c3b3547990f8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bf16n.cu
+@@ -0,0 +1,286 @@
++// SPDX-License-Identifier: MIT
++// ggml ownership, views, environment switches and workspace glue for the shared BF16N core.
++#include "bf16n.cuh"
++#include "convert.cuh"
++#include "bf16n/encode.h"
++#include "bf16n/launch.h"
++#include "bf16n/policy.h"
++
++#include <algorithm>
++#include <cstring>
++#include <functional>
++#include <mutex>
++#include <optional>
++#include <vector>
++
++namespace {
++
++static_assert(GGML_BF16N_NIBBLE == bf16n::FMT_NIBBLE && GGML_BF16N_HUFFMAN == bf16n::FMT_HUFFMAN &&
++              GGML_BF16N_HUFPAIR == bf16n::FMT_HUFPAIR, "ggml conversion tags must match the core format");
++
++struct entry : bf16n::weight {
++    size_t nbytes = 0;
++    ggml_backend_buffer_t owner = nullptr;
++};
++
++std::mutex g_mutex;
++std::vector<entry> g_entries;
++
++// Return metadata by value: loading/unloading another model can move the registry's entries.
++std::optional<entry> lookup(const void * p, int64_t & row0) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const auto q = static_cast<const uint8_t *>(p);
++    const auto less = std::less<const uint8_t *>{};
++    auto it = std::upper_bound(g_entries.begin(), g_entries.end(), q,
++        [&](const uint8_t * a, const entry & e) { return less(a, e.plane); });
++    if (it == g_entries.begin()) {
++        return std::nullopt;
++    }
++    --it;
++    if (!less(q, it->plane + it->nbytes)) {
++        return std::nullopt;
++    }
++    const size_t off = q - it->plane;
++    GGML_ASSERT(off % it->K == 0);
++    row0 = off / it->K;
++    return *it;
++}
++
++bf16n::mmv_args make_cols(const ggml_tensor * src0, int64_t row0, const ggml_tensor * src1,
++        const ggml_tensor * ids, const ggml_tensor * dst) {
++    bf16n::mmv_args p;
++    p.x = src1->data;
++    p.y = dst->data;
++    p.rows_per_matrix = src0->ne[1];
++    p.row0 = row0;
++    p.nrows = src0->ne[1];
++    if (ids) {
++        p.ids = ids->data;
++        p.ids_s0 = ids->nb[0]; p.ids_s1 = ids->nb[1];
++        p.n_used = (int) ids->ne[0];
++        p.x_per_slot = (int) src1->ne[1];
++        p.x_slot = src1->nb[1]; p.x_tok = src1->nb[2];
++        p.y_slot = dst->nb[1]; p.y_tok = dst->nb[2];
++        p.ncols = (int) (ids->ne[0] * ids->ne[1]);
++    } else {
++        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
++        p.x_tok = src1->nb[1];
++        p.y_tok = dst->nb[1];
++        p.ncols = (int) src1->ne[1];
++    }
++    return p;
++}
++
++} // namespace
++
++// Called before the owning CUDA buffer is freed; views do not own auxiliary storage.
++void ggml_cuda_bf16n_free(ggml_backend_buffer_t buffer) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (auto it = g_entries.begin(); it != g_entries.end();) {
++        if (it->owner == buffer) {
++            CUDA_CHECK(cudaFree(const_cast<uint8_t *>(it->aux)));
++            it = g_entries.erase(it);
++        } else {
++            ++it;
++        }
++    }
++}
++
++bool ggml_cuda_bf16n_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
++        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++    int64_t row0 = 0;
++    const auto e = lookup(src0->data, row0);
++    GGML_ASSERT(e && "BF16N tensor without registered aux data");
++    GGML_ASSERT(src0->ne[0] == e->K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src1->nb[0] == sizeof(float));
++    auto p = make_cols(src0, row0, src1, ids, dst);
++    static const bool no_multi_col = getenv("GGML_BF16N_NO_MULTI_COL") != nullptr;
++    bf16n::mmv(*e, p, ctx.stream(), !no_multi_col);
++    return true;
++}
++
++bool ggml_cuda_bf16n_can_fuse_glu(const ggml_tensor * gate_w, const ggml_tensor * up_w,
++        const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
++    if (gate_w->type != GGML_TYPE_BF16N || up_w->type != GGML_TYPE_BF16N ||
++            src1->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
++        return false;
++    }
++    static const bool no_glu = getenv("GGML_BF16N_NO_GLU") != nullptr;
++    if (no_glu || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
++            !ggml_are_same_shape(gate_w, up_w) || src1->nb[0] != sizeof(float)) {
++        return false;
++    }
++    const int64_t ncols = ids ? ids->ne[0] * ids->ne[1] : src1->ne[1];
++    if ((ids ? ids->ne[1] : src1->ne[1]) > 8 || ncols > 64) {
++        return false;
++    }
++    int64_t rg = 0, ru = 0;
++    const auto g = lookup(gate_w->data, rg);
++    const auto u = lookup(up_w->data, ru);
++    if (!g || !u || g->format != u->format || g->K != u->K || rg != 0 || ru != 0 || g->cm || u->cm) {
++        return false;
++    }
++    if (g->format == GGML_BF16N_NIBBLE) {
++        return true;
++    }
++    if (g->R != u->R) {
++        return false;
++    }
++    static const bool hp_glu = getenv("GGML_BF16N_HP_GLU") != nullptr;
++    if (g->format == GGML_BF16N_HUFPAIR && !hp_glu) {
++        return false;
++    }
++    return g->format == GGML_BF16N_HUFPAIR ? (g->R & (g->R - 1)) == 0 && g->R <= 16 : (g->R == 8 || g->R == 16);
++}
++
++void ggml_cuda_bf16n_mul_mat_vec_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w,
++        const ggml_tensor * up_w, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu) {
++    int64_t rg = 0, ru = 0;
++    const auto g = lookup(gate_w->data, rg);
++    const auto u = lookup(up_w->data, ru);
++    GGML_ASSERT(g && u);
++    bf16n::mmv_glu(*g, *u, make_cols(up_w, 0, src1, ids, glu), ctx.stream());
++}
++
++bool ggml_cuda_bf16n_mul_mat_id_supported(const ggml_tensor * src0, const ggml_tensor * src1,
++        const ggml_tensor * ids, const ggml_tensor * dst) {
++    static const bool off = getenv("GGML_BF16N_NO_MMA") != nullptr;
++    if (off || ggml_cuda_bf16n_reference()) {
++        return false;
++    }
++    int64_t row0 = 0;
++    const auto e = lookup(src0->data, row0);
++    return e && bf16n::mm_ids_supported(*e, nullptr) && row0 == 0 && e->rows == src0->ne[1] * src0->ne[2] &&
++        src0->ne[1] % e->R == 0 && src0->ne[3] == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t);
++}
++
++static void ggml_cuda_bf16n_mul_mat_id_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
++        const entry * u, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++    int64_t row0 = 0;
++    const auto e = lookup(src0->data, row0);
++    GGML_ASSERT(e);
++    cudaStream_t stream = ctx.stream();
++    const int n_used = (int) ids->ne[0], n_tok = (int) ids->ne[1], n_experts = (int) src0->ne[2];
++    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), (size_t) n_used * n_tok);
++    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), (size_t) n_used * n_tok);
++    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1);
++    bf16n::mm_ids_route(ids->data, false, ids->nb[1] / sizeof(int32_t), ids_src1.get(), ids_dst.get(), bounds.get(),
++        n_experts, n_tok, n_used, (int) src1->ne[1], (int) (src1->nb[2] / src1->nb[1]), stream);
++    ggml_cuda_pool_alloc<nv_bfloat16> x(ctx.pool(), ggml_nelements(src1));
++    ggml_get_to_bf16_cuda(GGML_TYPE_F32)(src1->data, x.get(), ggml_nelements(src1), stream);
++    bf16n::mm_ids(*e, u, x.get(), src1->ne[0], ids_src1.get(), ids_dst.get(), bounds.get(), dst->data, false,
++        dst->ne[0], n_experts, n_tok, n_used, stream);
++}
++
++void ggml_cuda_bf16n_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
++        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++    ggml_cuda_bf16n_mul_mat_id_impl(ctx, src0, nullptr, src1, ids, dst);
++}
++
++bool ggml_cuda_bf16n_mul_mat_id_glu_supported(const ggml_tensor * gate_w, const ggml_tensor * up_w,
++        const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
++    static const bool no_glu = getenv("GGML_BF16N_NO_GLU") != nullptr;
++    if (no_glu || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 || ids->ne[1] <= 8 ||
++            gate_w->type != GGML_TYPE_BF16N || up_w->type != GGML_TYPE_BF16N || !ggml_are_same_shape(gate_w, up_w) ||
++            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || glu->ne[0] != gate_w->ne[1] ||
++            !ggml_cuda_bf16n_mul_mat_id_supported(gate_w, src1, ids, glu) ||
++            !ggml_cuda_bf16n_mul_mat_id_supported(up_w, src1, ids, glu)) {
++        return false;
++    }
++    int64_t rg = 0, ru = 0;
++    const auto g = lookup(gate_w->data, rg);
++    const auto u = lookup(up_w->data, ru);
++    return bf16n::mm_ids_supported(*g, &*u);
++}
++
++void ggml_cuda_bf16n_mul_mat_id_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w,
++        const ggml_tensor * up_w, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu) {
++    int64_t ru = 0;
++    const auto u = lookup(up_w->data, ru);
++    GGML_ASSERT(u);
++    ggml_cuda_bf16n_mul_mat_id_impl(ctx, gate_w, &*u, src1, ids, glu);
++}
++
++void ggml_cuda_bf16n_dequant_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, void * out) {
++    int64_t row0 = 0;
++    const auto e = lookup(src0->data, row0);
++    GGML_ASSERT(e && ggml_is_contiguous(src0));
++    bf16n::dequant(*e, row0, ggml_nrows(src0), static_cast<uint16_t *>(out), ctx.stream());
++}
++
++void ggml_cuda_bf16n_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    int64_t row0 = 0;
++    const auto e = lookup(src0->data, row0);
++    GGML_ASSERT(e && !e->cm);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && dst->nb[0] == sizeof(float));
++    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1);
++    bf16n::get_rows(*e, src1->data, src1->nb[0], src1->ne[0], dst->data, false, dst->nb[1], ctx.stream(), row0);
++}
++
++bool ggml_cuda_bf16n_is_registered(const ggml_tensor * t) {
++    int64_t row0 = 0;
++    return lookup(t->data, row0).has_value();
++}
++
++extern "C" int ggml_backend_cuda_bf16n_choose(int64_t rows, int64_t K, int64_t n_matrices,
++        const char * mode, int64_t dense_min, bool expert) {
++    const auto requested = strcmp(mode, "nibble") == 0 ? bf16n::policy_mode::nibble :
++        strcmp(mode, "huffman") == 0 ? bf16n::policy_mode::huffman : bf16n::policy_mode::hybrid;
++    const auto c = bf16n::choose(rows, K, n_matrices,
++        {bf16n::policy_engine::llama, requested, dense_min, expert});
++    // Keep the existing conversion ABI: 2 means pair Huffman with single-symbol fallback.
++    return !c ? 0 : c->format == bf16n::FMT_NIBBLE ? GGML_BF16N_NIBBLE : GGML_BF16N_HUFFMAN;
++}
++
++extern "C" bool ggml_backend_cuda_bf16n_convert(ggml_tensor * tensor, const void * bf16_host, int format) {
++    GGML_ASSERT(tensor->type == GGML_TYPE_BF16N && ggml_is_contiguous(tensor) && tensor->buffer);
++    const int64_t K = tensor->ne[0], rows = ggml_nrows(tensor);
++    const auto * w = static_cast<const uint16_t *>(bf16_host);
++    // The explicit format is part of ggml's conversion ABI; choose tuning with the llama shape policy.
++    const auto policy = bf16n::choose(tensor->ne[1], K, tensor->ne[2],
++        {bf16n::policy_engine::llama,
++         format == GGML_BF16N_NIBBLE ? bf16n::policy_mode::nibble : bf16n::policy_mode::huffman});
++    GGML_ASSERT(policy.has_value());
++    auto encoded = bf16n::encode(w, rows, K, policy->format, policy->R, policy->chunk_major);
++    CUDA_CHECK(cudaMemcpy(tensor->data, encoded.plane.data(), encoded.plane.size(), cudaMemcpyHostToDevice));
++    void * aux_dev = nullptr;
++    CUDA_CHECK(cudaMalloc(&aux_dev, encoded.aux.size()));
++    CUDA_CHECK(cudaMemcpy(aux_dev, encoded.aux.data(), encoded.aux.size(), cudaMemcpyHostToDevice));
++    const auto & h = *reinterpret_cast<const bf16n::aux_header *>(encoded.aux.data());
++    entry e;
++    e.plane = static_cast<const uint8_t *>(tensor->data);
++    e.aux = static_cast<const uint8_t *>(aux_dev);
++    e.nbytes = encoded.plane.size(); e.owner = tensor->buffer;
++    e.format = encoded.format; e.K = K; e.rows = rows; e.R = encoded.R;
++    e.cm = (h.flags & bf16n::FLAG_CHUNK_MAJOR) != 0;
++    e.off_a = h.off_a; e.off_b = h.off_b; e.off_c = h.off_c; e.off_d = h.off_d;
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        const auto less = std::less<const uint8_t *>{};
++        auto it = std::upper_bound(g_entries.begin(), g_entries.end(), e.plane,
++            [&](const uint8_t * p, const entry & v) { return less(p, v.plane); });
++        g_entries.insert(it, e);
++    }
++    // Exhaustive bitwise roundtrip, bounded to a 64 MiB device workspace.
++    const int R = std::max(e.R, 1);
++    const int64_t chunk_rows = std::max<int64_t>((64ll << 20) / (K * 2) / R * R, R);
++    uint16_t * d_out = nullptr;
++    CUDA_CHECK(cudaMalloc(&d_out, chunk_rows * K * 2));
++    std::vector<uint16_t> back(chunk_rows * K);
++    bool ok = true;
++    for (int64_t r0 = 0; r0 < rows && ok; r0 += chunk_rows) {
++        const int64_t nr = std::min(chunk_rows, rows - r0);
++        bf16n::dequant(e, r0, nr, d_out, 0);
++        CUDA_CHECK(cudaMemcpy(back.data(), d_out, nr * K * 2, cudaMemcpyDeviceToHost));
++        ok = memcmp(back.data(), w + r0 * K, nr * K * 2) == 0;
++    }
++    CUDA_CHECK(cudaFree(d_out));
++    const double ratio = double(encoded.plane.size() + encoded.aux.size()) / double(rows * K * 2);
++    fprintf(stderr, "bf16n: %-32s %s K=%5lld rows=%7lld R=%2d ratio=%.4f roundtrip=%s\n", tensor->name,
++        e.format == GGML_BF16N_HUFPAIR ? "hufpair" : e.format == GGML_BF16N_HUFFMAN ? "huffman" : "nibble ",
++        (long long) K, (long long) rows, e.R, ratio, ok ? "OK" : "FAIL");
++    return ok;
++}
+diff --git a/ggml/src/ggml-cuda/bf16n.cuh b/ggml/src/ggml-cuda/bf16n.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..340f34b66851fb42893fcbae8b1a8fe4890786cf
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bf16n.cuh
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++
++#include "common.cuh"
++
++// aux formats of GGML_TYPE_BF16N tensors (see bf16n.cu)
++#define GGML_BF16N_NIBBLE  1
++#define GGML_BF16N_HUFFMAN 2
++#define GGML_BF16N_HUFPAIR 3 // Huffman over exponent pairs (chosen automatically when the pair alphabet fits)
++
++// GGML_BF16N_REFERENCE=1: route every BF16N product through exact dequant + the stock BF16 cuBLAS path
++static inline bool ggml_cuda_bf16n_reference() {
++    static const bool on = getenv("GGML_BF16N_REFERENCE") != nullptr;
++    return on;
++}
++
++// y = W x for up to 8 columns; ids != nullptr for MUL_MAT_ID
++bool ggml_cuda_bf16n_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                                 const ggml_tensor * ids, ggml_tensor * dst);
++
++// fused gate/up + SWIGLU (MUL_MAT, MUL_MAT, GLU or MUL_MAT_ID, MUL_MAT_ID, GLU)
++bool ggml_cuda_bf16n_can_fuse_glu(const ggml_tensor * gate_w, const ggml_tensor * up_w, const ggml_tensor * src1,
++                                  const ggml_tensor * ids, const ggml_tensor * glu);
++void ggml_cuda_bf16n_mul_mat_vec_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
++                                     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
++
++// MUL_MAT_ID with more than 8 tokens (prefill): decode in shared memory + BF16 tensor cores, routing on the GPU (no sync)
++bool ggml_cuda_bf16n_mul_mat_id_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
++                                          const ggml_tensor * dst);
++void ggml_cuda_bf16n_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                                const ggml_tensor * ids, ggml_tensor * dst);
++// the same for gate and up of MUL_MAT_ID, MUL_MAT_ID, GLU(SWIGLU) in one kernel: dst = the GLU output
++bool ggml_cuda_bf16n_mul_mat_id_glu_supported(const ggml_tensor * gate_w, const ggml_tensor * up_w, const ggml_tensor * src1,
++                                              const ggml_tensor * ids, const ggml_tensor * glu);
++void ggml_cuda_bf16n_mul_mat_id_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
++                                    const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
++
++// GET_ROWS with a BF16N source (token embedding), F32 destination
++void ggml_cuda_bf16n_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// exact BF16 reconstruction of a (row-aligned, contiguous) BF16N tensor or view into `out`
++void ggml_cuda_bf16n_dequant_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, void * out);
++
++// Release auxiliary buffers with their ggml allocation (not individual tensor views).
++void ggml_cuda_bf16n_free(ggml_backend_buffer_t buffer);
++
++extern "C" int ggml_backend_cuda_bf16n_choose(int64_t rows, int64_t K, int64_t n_matrices,
++                                             const char * mode, int64_t dense_min, bool expert);
++
++extern "C" bool ggml_backend_cuda_bf16n_convert(struct ggml_tensor * tensor, const void * bf16_host, int format);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index aba21524f6d25a8a0c1916c24cc1465cf155b9f9..7dd8d456d74c1f32c6ac009dea2ee6e28ec61fb8 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3,6 +3,7 @@
+ #include "ggml-backend-impl.h"
+ 
+ #include "ggml-cuda/allreduce.cuh"
++#include "ggml-cuda/bf16n.cuh"
+ #include "ggml-cuda/common.cuh"
+ #include "ggml-cuda/acc.cuh"
+ #include "ggml-cuda/add-id.cuh"
+@@ -783,6 +784,8 @@ struct ggml_backend_cuda_buffer_context {
+ 
+ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
++    ggml_cuda_set_device(ctx->device);
++    ggml_cuda_bf16n_free(buffer);
+     delete ctx;
+ }
+ 
+@@ -1881,6 +1884,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+ 
++    if (src0->type == GGML_TYPE_BF16N) {
++        return false;
++    }
++
+     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                    src0->view_src;
+@@ -2019,6 +2026,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         return;
+     }
+ 
++    if (src0->type == GGML_TYPE_BF16N) {
++        if (!ggml_cuda_bf16n_reference() && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne11 <= 8 && ne12 == 1 && ne13 == 1) {
++            ggml_cuda_bf16n_mul_mat_vec(ctx, src0, src1, nullptr, dst);
++            return;
++        }
++        // batched: exact BF16 reconstruction, then the regular BF16 cuBLAS path
++        ggml_cuda_pool_alloc<nv_bfloat16> w(ctx.pool(), ggml_nelements(src0));
++        ggml_cuda_bf16n_dequant_bf16(ctx, src0, w.get());
++        ggml_tensor w_bf16 = *src0;
++        w_bf16.type  = GGML_TYPE_BF16;
++        w_bf16.nb[0] = sizeof(nv_bfloat16);
++        w_bf16.nb[1] = w_bf16.nb[0]*w_bf16.ne[0];
++        w_bf16.nb[2] = w_bf16.nb[1]*w_bf16.ne[1];
++        w_bf16.nb[3] = w_bf16.nb[2]*w_bf16.ne[2];
++        w_bf16.data  = w.get();
++        ggml_cuda_mul_mat_cublas(ctx, &w_bf16, src1, dst);
++        return;
++    }
++
+     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
+     // Therefore, in such cases use cuBLAS.
+@@ -2073,6 +2099,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
++    if (src0->type == GGML_TYPE_BF16N) {
++        return ggml_cuda_bf16n_reference() ||
++            (dst->ne[2] > 8 && !ggml_cuda_bf16n_mul_mat_id_supported(src0, src1, dst->src[2], dst));
++    }
++
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+ 
+     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+@@ -2113,10 +2144,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+ 
++    if (src0->type == GGML_TYPE_BF16N && ne2 <= 8 && !ggml_cuda_bf16n_reference()) {
++        ggml_cuda_bf16n_mul_mat_vec(ctx, src0, src1, ids, dst);
++        return;
++    }
++    if (src0->type == GGML_TYPE_BF16N && ggml_cuda_bf16n_mul_mat_id_supported(src0, src1, ids, dst)) {
++        ggml_cuda_bf16n_mul_mat_id(ctx, src0, src1, ids, dst);
++        return;
++    }
++
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
++        if (ne2 <= MMVQ_MAX_BATCH_SIZE && src0->type != GGML_TYPE_BF16N) {
+             if (ggml_is_quantized(src0->type)) {
+                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                 if (ne2 <= mmvq_mmid_max) {
+@@ -2274,7 +2314,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+             ggml_cuda_op_repeat_back(ctx, dst);
+             break;
+         case GGML_OP_GET_ROWS:
+-            ggml_cuda_op_get_rows(ctx, dst);
++            if (dst->src[0]->type == GGML_TYPE_BF16N) {
++                ggml_cuda_bf16n_get_rows(ctx, dst);
++            } else {
++                ggml_cuda_op_get_rows(ctx, dst);
++            }
+             break;
+         case GGML_OP_GET_ROWS_BACK:
+             ggml_cuda_op_get_rows_back(ctx, dst);
+@@ -4399,6 +4443,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const ggml_tensor * src1 = up->src[1];
+             const ggml_tensor * ids  = up->src[2];
+ 
++            if (src0->type == GGML_TYPE_BF16N && !ggml_cuda_bf16n_reference() && ids && gate->src[1] == src1 && gate->src[2] == ids &&
++                    ggml_cuda_bf16n_mul_mat_id_glu_supported(gate->src[0], src0, src1, ids, glu)) {
++                ggml_cuda_bf16n_mul_mat_id_glu(*cuda_ctx, gate->src[0], src0, src1, ids, glu);
++                fused_mul_mat_vec = true;
++                fused_node_count  = 3;
++                break;
++            }
++
++            if (src0->type == GGML_TYPE_BF16N && !ggml_cuda_bf16n_reference() && gate->src[1] == src1 && gate->src[2] == ids &&
++                    ggml_cuda_bf16n_can_fuse_glu(gate->src[0], src0, src1, ids, glu)) {
++                ggml_cuda_bf16n_mul_mat_vec_glu(*cuda_ctx, gate->src[0], src0, src1, ids, glu);
++                fused_mul_mat_vec = true;
++                fused_node_count  = 3;
++                break;
++            }
++
+             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate->src[0];
+@@ -5768,6 +5828,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ4_XS:
+                     case GGML_TYPE_BF16:
+                         return true;
++                    case GGML_TYPE_BF16N:
++                        return b->type == GGML_TYPE_F32;
+                     default:
+                         return false;
+                 }
+@@ -5807,6 +5869,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                         // 32-value sub-blocks, the row size does not guarantee
+                         // the QK_K super-blocks the get_rows kernel iterates on
+                         return op->src[0]->ne[0] % QK_K == 0;
++                    case GGML_TYPE_BF16N:
++                        return op->type == GGML_TYPE_F32 && op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 1;
+                     default:
+                         return false;
+                 }
+@@ -6296,6 +6360,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++    if (strcmp(name, "ggml_backend_cuda_bf16n_choose") == 0) {
++        return (void *)ggml_backend_cuda_bf16n_choose;
++    }
++    if (strcmp(name, "ggml_backend_cuda_bf16n_convert") == 0) {
++        return (void *)ggml_backend_cuda_bf16n_convert;
++    }
+     return nullptr;
+ }
+ 

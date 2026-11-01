@@ -4,3 +4,8 @@ out/
 *.sqlite
 __pycache__/
 .agent/
+build/
+*.egg-info/
+engines/vllm/vllm_bf16n/*.so
+engines/vllm/vllm_bf16n/_keysrc/
+engines/llamacpp/src/

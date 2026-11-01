@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Robert Koval <kovalrobert@me.com>
+Date: Thu, 29 Oct 2026 19:59:37 +0200
+Subject: [PATCH] ggml-cuda, llama: integrated-GPU graph inputs in place; VMM
+ pool size
+
+On integrated GPUs the GPU reads graph inputs from host memory instead of device copies (upstream disabled this
+for #15034): llama_context synchronizes before writing inputs (sync_host_inputs), also before K-shifts.
+GGML_CUDA_NO_INTEGRATED=1 restores the copies. GGML_CUDA_VMM_POOL_GB sets the per-pool address reservation.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 23 +++++++++++++++++++++--
+ src/llama-context.cpp           | 26 ++++++++++++++++++++++++++
+ src/llama-context.h             |  4 ++++
+ src/llama-kv-cache.cpp          |  3 +++
+ 4 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 5beadace8435801fbaf29fc54c0f1b89e5bb1629..6c6c2ca534f723814c0ac386541ccb4135581845 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -337,7 +337,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
+ 
+         info.default_tensor_split[id] = total_vram;
+         total_vram += device_vram;
+-        info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
++        // an integrated GPU reads host buffers in place, so the scheduler skips the device copies of graph inputs (on
++        // Orin the attention mask alone is window x micro-batch, 1 GiB at 262144 x 2048). Upstream disables this because
++        // llama.cpp overwrote inputs still in use by the previous graph (#15034); llama_context synchronizes for it
++        // (sync_host_inputs). GGML_CUDA_NO_INTEGRATED=1 restores the copies.
++        info.devices[id].integrated = prop.integrated && getenv("GGML_CUDA_NO_INTEGRATED") == nullptr;
+         info.devices[id].nsm        = prop.multiProcessorCount;
+         info.devices[id].smpb       = prop.sharedMemPerBlock;
+         info.devices[id].warp_size  = prop.warpSize;
+@@ -577,8 +581,23 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+ 
+ // pool with virtual memory
+ #if defined(GGML_USE_VMM)
++// Virtual address space each pool reserves up front (32 GB). Every backend context has its own pools, and on a
++// unified-memory board a second 32 GB reservation can fail next to a large model (e.g. the multimodal projector's
++// context), although a pool maps only what it uses: GGML_CUDA_VMM_POOL_GB lowers it.
++static size_t ggml_cuda_pool_vmm_max_size() {
++    const char * env = getenv("GGML_CUDA_VMM_POOL_GB");
++    if (env == nullptr) {
++        return 1ull << 35;
++    }
++    const long long gb = atoll(env);
++    if (gb < 1 || gb > 1024) {
++        GGML_ABORT("GGML_CUDA_VMM_POOL_GB must be 1..1024, got '%s'", env);
++    }
++    return (size_t) gb << 30;
++}
++
+ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+-    static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
++    static inline const size_t CUDA_POOL_VMM_MAX_SIZE = ggml_cuda_pool_vmm_max_size();
+ 
+     int device;
+     int physical_device;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 455f5198e431c125efefcfbb79bda9f50f945cca..d5d4b900cec9c940736ac7307b18077cc7f0536d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -523,6 +523,23 @@ llama_context::llama_context(
+ 
+         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+ 
++        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++            if (ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++                continue;
++            }
++            for (auto * backend : backend_ptrs) {
++                auto * dev = ggml_backend_get_device(backend);
++                const auto type = ggml_backend_dev_type(dev);
++                if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
++                        ggml_backend_dev_supports_buft(dev, backend_buft[i])) {
++                    sync_host_inputs = true;
++                }
++            }
++        }
++        if (sync_host_inputs) {
++            LLAMA_LOG_INFO("%s: the GPU reads graph inputs from host memory in place, synchronizing before writing them\n", __func__);
++        }
++
+         // TODO: move these checks to ggml_backend_sched
+         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+         bool pipeline_parallel =
+@@ -1523,6 +1540,12 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    // the previous graph_compute_async may still be reading inputs that the memory update, a graph rebuild or
++    // set_inputs below overwrite (llama.cpp #15034, #28056)
++    if (sync_host_inputs) {
++        ggml_backend_sched_synchronize(sched.get());
++    }
++
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -3916,6 +3939,9 @@ void llama_context::opt_epoch_iter(
+             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+             ggml_opt_alloc(opt_ctx, train);
+ 
++            if (sync_host_inputs) {
++                ggml_backend_sched_synchronize(sched.get());
++            }
+             res->set_inputs(&ubatch);
+             {
+                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb103cdefc5f742c5672bb2627e48fd11740..21e6a1f9da006526b64e5d10f2789a2a47cadd12 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -428,6 +428,10 @@ private:
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+ 
++    // a GPU backend reads the CPU backend's (host) buffer in place (integrated GPUs): nothing orders the next write of
++    // graph inputs after the previous, still running, compute, so process_ubatch synchronizes first
++    bool sync_host_inputs = false;
++
+     // true after the prism.hadamard coverage check passes on a reserved graph
+     bool hadamard_verified = false;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index e108f0423bf4262d05e109b483fa1adc71849a90..31a154117ea4012bf18c0a1903a6bccaf29dccb4 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -858,6 +858,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
+                 std::any_of(layers.begin(), layers.end(), [&](const auto & layer) {
+                     return hparams.has_rope(layer.il);
+                 })) {
++            // a previous compute may still read the graph inputs that set_inputs below overwrites (integrated GPUs
++            // read them from host memory in place); K-shifts are rare, so always wait
++            ggml_backend_sched_synchronize(sched);
+             ggml_backend_sched_reset(sched);
+ 
+             auto * res = lctx->get_gf_res_reserve();

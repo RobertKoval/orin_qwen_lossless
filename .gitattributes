@@ -1,0 +1,2 @@
+# Frozen public benchmark inputs must not be normalised.
+bench/prompts/corpus/** -text linguist-vendored

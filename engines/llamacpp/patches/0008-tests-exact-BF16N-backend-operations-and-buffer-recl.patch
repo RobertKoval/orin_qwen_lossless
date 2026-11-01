@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bf16n <bf16n@localhost>
+Date: Sat, 31 Oct 2026 10:05:27 +0200
+Subject: [PATCH] tests: exact BF16N backend operations and buffer reclamation
+
+---
+ tests/test-backend-ops-bf16n.h | 196 +++++++++++++++++++++++++++++++++
+ tests/test-backend-ops.cpp     |   9 ++
+ 2 files changed, 205 insertions(+)
+ create mode 100644 tests/test-backend-ops-bf16n.h
+
+diff --git a/tests/test-backend-ops-bf16n.h b/tests/test-backend-ops-bf16n.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9015b08e05e1c322ff0588c060ef58b04b482091
+--- /dev/null
++++ b/tests/test-backend-ops-bf16n.h
+@@ -0,0 +1,196 @@
++// SPDX-License-Identifier: MIT
++// BF16N's auxiliary CUDA state cannot be copied to the generic CPU comparator.
++// Dedicated exact tests use one-hot products with independently known answers, raw
++// BF16 row gathering, and native-BF16 SWIGLU graphs. Unsupported cases FAIL, never skip.
++#pragma once
++#include <charconv>
++#include <cmath>
++#include <stdexcept>
++
++namespace bf16n_tests {
++static void check(bool ok, const char * message) {
++    if (!ok) { throw std::runtime_error(message); }
++}
++static float unpack(uint16_t h) {
++    uint32_t bits = uint32_t(h) << 16;
++    float f;
++    memcpy(&f, &bits, 4);
++    return f;
++}
++static void exact(ggml_tensor * tensor, const std::vector<float> & expected) {
++    check(tensor->type == GGML_TYPE_F32 && size_t(ggml_nelements(tensor)) == expected.size(), "output shape/type");
++    std::vector<float> actual(expected.size());
++    ggml_backend_tensor_get(tensor, actual.data(), 0, ggml_nbytes(tensor));
++    for (size_t i = 0; i < actual.size(); ++i) {
++        if (!std::isfinite(actual[i]) || memcmp(&actual[i], &expected[i], sizeof(float))) {
++            fprintf(stderr, "BF16N mismatch element %zu: %.9g vs %.9g\n", i, actual[i], expected[i]);
++            throw std::runtime_error("bitwise output mismatch");
++        }
++    }
++}
++static size_t memory_cap() {
++    const char * value = getenv("BF16N_TEST_MAX_DEVICE_BYTES");
++    if (!value) { return size_t(1) << 30; }
++    const char * end = value + strlen(value);
++    size_t parsed = 0;
++    const auto result = std::from_chars(value, end, parsed, 10);
++    check(result.ec == std::errc{} && result.ptr == end && parsed > 0, "invalid memory cap: expected positive decimal bytes fitting size_t");
++    return parsed;
++}
++static void run_case(ggml_backend_t backend, size_t baseline_free, int fmt, const std::string & op, int K, int N, int E, int T, bool down, int row0 = -1) {
++    using convert_t = bool (*)(ggml_tensor *, const void *, int);
++    auto convert = (convert_t) ggml_backend_reg_get_proc_address(
++        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_cuda_bf16n_convert");
++    check(convert, "BF16N converter not exported");
++    ggml_context_ptr ctx(ggml_init({32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
++    check(bool(ctx), "context allocation");
++    const bool fallback = op == "GLU_HUFFMAN_FALLBACK";
++    const bool expert = E > 1, glu = op == "GLU" || fallback, rows = op == "GET_ROWS" || op == "GET_ROWS_VIEW";
++    const int used = expert ? 8 : 1, slots = down ? used : 1;
++    auto W = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_BF16N, K, N, E);
++    auto U = glu ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_BF16N, K, N, E) : nullptr;
++    auto R = glu ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_BF16, K, N, E) : nullptr;
++    auto V = glu ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_BF16, K, N, E) : nullptr;
++    ggml_set_name(W, "bf16n-test-gate");
++    if (U) { ggml_set_name(U, "bf16n-test-up"); }
++    auto X = rows ? nullptr : expert ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, K, slots, T)
++                                            : ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, K, T);
++    auto I = rows ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, T)
++                 : expert ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, used, T) : nullptr;
++    auto product = [&](ggml_tensor * w) { return expert ? ggml_mul_mat_id(ctx.get(), w, X, I) : ggml_mul_mat(ctx.get(), w, X); };
++    check(row0 < 0 || (rows && E == 1 && row0 < N), "invalid row view");
++    auto row_source = row0 >= 0 ? ggml_view_2d(ctx.get(), W, K, 1, W->nb[1], size_t(row0) * W->nb[1]) : W;
++    auto Y = rows ? ggml_get_rows(ctx.get(), row_source, I)
++                 : glu ? ggml_swiglu_split(ctx.get(), product(W), product(U)) : product(W);
++    auto RG = glu ? product(R) : nullptr;
++    auto RU = glu ? product(V) : nullptr;
++    // ggml_node_has_n_uses refuses fusion for flagged outputs: reference intermediates must remain materialized.
++    if (glu) { ggml_set_output(RG); ggml_set_output(RU); }
++    auto reference = glu ? ggml_swiglu_split(ctx.get(), RG, RU) : nullptr;
++    auto graph = ggml_new_graph(ctx.get());
++    ggml_build_forward_expand(graph, Y);
++    if (reference) { ggml_build_forward_expand(graph, reference); }
++    for (int n = 0; n < ggml_graph_n_nodes(graph); ++n) {
++        check(ggml_backend_supports_op(backend, ggml_graph_node(graph, n)), "required BF16N operation unsupported");
++    }
++    const size_t cap = memory_cap();
++    auto buft = ggml_backend_get_default_buffer_type(backend);
++    size_t tensors = 0;
++    for (auto t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
++        if (!t->view_src) { tensors += ggml_backend_buft_get_alloc_size(buft, t) + ggml_backend_buft_get_alignment(buft); }
++    }
++    const size_t elements = size_t(K) * N * E * (glu ? 2 : 1);
++    // Worst-case NIBBLE escapes, full dequant, input conversion, roundtrip workspace and context/cuBLAS reserve.
++    const size_t estimate = tensors + (elements * 9 + 1) / 2 + size_t(N) * E * 192 +
++                            elements * 2 + (X ? ggml_nbytes(X) : 0) + (size_t(320) << 20);
++    size_t available = 0, total = 0;
++    ggml_backend_dev_memory(ggml_backend_get_device(backend), &available, &total);
++    const size_t consumed = baseline_free > available ? baseline_free - available : 0;
++    check(consumed <= cap && estimate <= cap - consumed && estimate <= available,
++          "cumulative device admission estimate exceeds cap/available memory");
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
++    check(bool(buffer) && W->buffer && (!U || U->buffer), "tensor allocation/owner buffer");
++    check(ggml_backend_buffer_get_size(buffer.get()) <= tensors, "tensor allocation exceeded estimate");
++    std::vector<uint16_t> w(int64_t(K) * N * E), up(glu ? w.size() : 0);
++    // 19 exponents force NIBBLE escape entries; the pair alphabet still fits the Huffman LUT.
++    // All weights and one-hot products are positive normal BF16, avoiding reduction/sign-zero ambiguity.
++    for (size_t i = 0; i < w.size(); ++i) {
++        if (fallback) {
++            // Adjacent pairs enumerate all 65*65=4225 exponent pairs, exceeding the 4096-pair LUT.
++            // K=512/N=8192 chooses R=16, enabling the separate single-symbol HUFFMAN GLU path.
++            const size_t pair = i / 2;
++            const unsigned symbol = unsigned((i & 1) ? (pair / 65) % 65 : pair % 65);
++            w[i] = uint16_t(((64 + symbol) << 7) | ((i * 13 + i / K) & 127));
++            // Complementary up exponents retain 4225 pairs without tiny gate*up subnormal products.
++            up[i] = uint16_t(((128 - symbol) << 7) | ((i * 3 + 17) & 127));
++        } else {
++            w[i] = uint16_t(((118 + ((i * 7 + i / K) % 19)) << 7) | ((i * 13 + i / K) & 127));
++            if (glu) { up[i] = uint16_t(((119 + ((i * 11 + i / K) % 17)) << 7) | ((i * 3 + 17) & 127)); }
++        }
++    }
++    check(convert(W, w.data(), fmt), "gate conversion/roundtrip");
++    if (glu) {
++        check(convert(U, up.data(), fmt), "up conversion/roundtrip");
++        ggml_backend_tensor_set(R, w.data(), 0, ggml_nbytes(R));
++        ggml_backend_tensor_set(V, up.data(), 0, ggml_nbytes(V));
++    }
++    std::vector<int32_t> ids(I ? ggml_nelements(I) : 0);
++    for (size_t i = 0; i < ids.size(); ++i) {
++        ids[i] = rows ? (row0 >= 0 ? 0 : i == 0 ? 0 : i == 1 ? N - 1 : (i * 17) % N) : (i + i / used) % E;
++    }
++    if (I) { ggml_backend_tensor_set(I, ids.data(), 0, ggml_nbytes(I)); }
++    std::vector<float> x(X ? ggml_nelements(X) : 0, 0.0f);
++    for (int t = 0; !rows && t < T; ++t) for (int s = 0; s < slots; ++s) {
++        int k = (t * 131 + s * 17) % K;
++        x[(int64_t(t) * slots + s) * K + k] = std::ldexp(1.0f, (t + s) % 3 - 1);
++    }
++    if (X) { ggml_backend_tensor_set(X, x.data(), 0, ggml_nbytes(X)); }
++    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "graph computation");
++    std::vector<float> expected(ggml_nelements(Y)), expected_up(glu ? expected.size() : 0);
++    for (int t = 0; t < T; ++t) for (int s = 0; s < used; ++s) {
++        const int input_slot = down ? s : 0;
++        const int k = (t * 131 + input_slot * 17) % K;
++        const float scale = std::ldexp(1.0f, (t + input_slot) % 3 - 1);
++        const int expert_id = expert ? ids[t * used + s] : 0;
++        for (int n = 0; n < (rows ? K : N); ++n) {
++            size_t out = (int64_t(t) * used + s) * (rows ? K : N) + n;
++            size_t in = rows ? int64_t(ids[t] + (row0 >= 0 ? row0 : 0)) * K + n : (int64_t(expert_id) * N + n) * K + k;
++            expected[out] = unpack(w[in]) * (rows ? 1.0f : scale);
++            if (glu) { expected_up[out] = unpack(up[in]) * scale; }
++        }
++    }
++    if (glu) {
++        // First independently verify the reference products; then compare the nonlinear result bitwise.
++        exact(RG, expected);
++        exact(RU, expected_up);
++        ggml_backend_tensor_get(reference, expected.data(), 0, ggml_nbytes(reference));
++    }
++    exact(Y, expected);
++    printf("BF16N EXACT %s fmt=%d K=%d N=%d E=%d T=%d down=%d row0=%d\n", op.c_str(), fmt, K, N, E, T, down, row0);
++    // buffer is destroyed before ctx. Repeated cases exercise allocator reuse and aux ownership.
++}
++static int run(const char * backend_name) {
++    try {
++        (void) memory_cap(); // Validate limits before backend loading or CUDA initialization.
++        ggml_backend_load_all();
++        ggml_backend_ptr backend(ggml_backend_init_by_name(backend_name, nullptr));
++        check(bool(backend), "requested backend unavailable");
++        size_t baseline_free = 0, total = 0;
++        ggml_backend_dev_memory(ggml_backend_get_device(backend.get()), &baseline_free, &total);
++        int count = 0;
++        auto test = [&](int fmt, const std::string & op, int K, int N, int E, int T, bool down = false, int row0 = -1) {
++            run_case(backend.get(), baseline_free, fmt, op, K, N, E, T, down, row0);
++            ++count;
++        };
++        for (int fmt : {1, 2}) {
++            for (int K : {512, 1024, 2048, 4096}) {
++                for (int T : {1, 2, 3, 4, 5, 7, 8, 9}) { test(fmt, "MUL_MAT", K, 32, 1, T); }
++                for (int T : {1, 2, 3}) { test(fmt, "GET_ROWS", K, 32, 1, T); }
++            }
++            for (int T : {1, 2, 7, 8, 9, 512}) {
++                test(fmt, "MUL_MAT_ID", 2048, 64, 8, T);
++                test(fmt, "MUL_MAT_ID", 512, 2048, 8, T, true);
++                test(fmt, "GLU", 2048, 64, 8, T);
++            }
++            test(fmt, "GLU", 2048, 32, 1, 1);
++            // N=8192 selects pair-Huffman R=16: row0=1 and N-1 are deliberately not unit-aligned.
++            test(fmt, "GET_ROWS_VIEW", 512, 8192, 1, 1, false, 1);
++            test(fmt, "GET_ROWS_VIEW", 512, 8192, 1, 1, false, 8191);
++            // Down kernel interleave guards: routed <=24*E and <=48*E, used=E=8.
++            for (int T : {23, 24, 25, 47, 48, 49}) { test(fmt, "MUL_MAT_ID", 512, 2048, 8, T, true); }
++            // Explicit repeated allocation/convert/gather/free with changed shapes.
++            for (int repeat = 0; repeat < 3; ++repeat) {
++                test(fmt, "GET_ROWS", 512, 32, 1, 3);
++                test(fmt, "GET_ROWS", 2048, 64, 1, 3);
++            }
++        }
++        // This dataset mathematically forces single-symbol fallback; never use its unsupported GET_ROWS path.
++        test(2, "GLU_HUFFMAN_FALLBACK", 512, 8192, 1, 1);
++        printf("BF16N PASS: %d exact cases (no skips)\n", count);
++        return 0;
++    } catch (const std::exception & e) {
++        fprintf(stderr, "BF16N FAIL: %s\n", e.what());
++        return 1;
++    }
++}
++} // namespace bf16n_tests
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c066e69430ae52ef1cfdeee7b0952151a9ac128f..885a7f1f7a72af2ec068c0359cdee6b8b1b6ee04 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13560,10 +13560,13 @@ static void show_test_coverage() {
+     printf("  Coverage: %.1f%%\n", (double)covered_ops.size() / all_ops.size() * 100.0);
+ }
+ 
++#include "test-backend-ops-bf16n.h"
++
+ static void usage(char ** argv) {
+     printf("Usage: %s [mode] [options]\n\n", argv[0]);
+     printf("Valid modes:\n");
+     printf("  test     (default) compare with CPU backend for correctness\n");
++    printf("  bf16n    exact BF16N MUL_MAT/MUL_MAT_ID/GET_ROWS/GLU checks; only option: -b backend\n");
+     printf("  grad     compare gradients from backpropagation with method of finite differences\n");
+     printf("  perf     performance evaluation\n");
+     printf("  support  probe backend operation support\n\n");
+@@ -13587,6 +13590,12 @@ static void usage(char ** argv) {
+ }
+ 
+ int main(int argc, char ** argv) {
++    if (argc >= 2 && strcmp(argv[1], "bf16n") == 0) {
++        if (argc == 2) { return bf16n_tests::run("CUDA0"); }
++        if (argc == 4 && strcmp(argv[2], "-b") == 0) { return bf16n_tests::run(argv[3]); }
++        usage(argv);
++        return 1;
++    }
+     test_mode mode = MODE_TEST;
+     output_formats output_format = CONSOLE;
+     const char * op_names_filter = nullptr;

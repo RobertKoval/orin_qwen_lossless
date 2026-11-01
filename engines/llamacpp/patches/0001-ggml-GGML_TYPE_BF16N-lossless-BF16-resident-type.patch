@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Robert Koval <kovalrobert@me.com>
+Date: Thu, 29 Oct 2026 19:59:37 +0200
+Subject: [PATCH] ggml: GGML_TYPE_BF16N, lossless BF16 resident type
+
+Type id 43, blck_size = type_size = 512 (one sign|mantissa byte per weight); the exponent streams live in a
+device-side aux buffer. Runtime-only: never written to a GGUF.
+---
+ ggml/include/ggml.h | 3 ++-
+ ggml/src/ggml.c     | 8 ++++++++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index d62a631043a3745882dba3333004cb92cb75a7c6..d33aeacaf4a808139c2e2d4b237a876217b222c9 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -430,7 +430,8 @@ extern "C" {
+         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
+         GGML_TYPE_Q1_0    = 41,
+         GGML_TYPE_Q2_0    = 42,
+-        GGML_TYPE_COUNT   = 43,
++        GGML_TYPE_BF16N   = 43, // lossless BF16: sign|mantissa byte + 4-bit exponent code, per-row LUT/escapes in device-side aux (runtime-only, never in GGUF)
++        GGML_TYPE_COUNT   = 44,
+     };
+ 
+     // [TAG_GGML_PREC]
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 5d8449a883237bdb4afab976ffb39585e0695c77..b6f9f1ebbdbb8a89bcb427a35a36b9aecac8bea5 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -891,6 +891,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .type_size                = sizeof(block_q8_K),
+         .is_quantized             = true,
+     },
++    [GGML_TYPE_BF16N] = {
++        .type_name                = "bf16n",
++        .blck_size                = 512,
++        .type_size                = 512,
++        .is_quantized             = true,
++        .to_float                 = NULL,
++        .from_float_ref           = NULL,
++    },
+     [GGML_TYPE_BF16] = {
+         .type_name                = "bf16",
+         .blck_size                = 1,

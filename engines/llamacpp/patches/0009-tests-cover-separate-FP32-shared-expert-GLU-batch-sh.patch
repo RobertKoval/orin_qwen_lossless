@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Robert Koval <kovalrobert@me.com>
+Date: Sat, 31 Oct 2026 20:54:55 +0200
+Subject: [PATCH] tests: cover separate FP32 shared-expert GLU batch shapes
+
+---
+ tests/test-backend-ops-bf16n.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/tests/test-backend-ops-bf16n.h b/tests/test-backend-ops-bf16n.h
+index 9015b08e05e1c322ff0588c060ef58b04b482091..02cbe9b95ef2033f41b6417dc189a615dfaf39ec 100644
+--- a/tests/test-backend-ops-bf16n.h
++++ b/tests/test-backend-ops-bf16n.h
+@@ -184,6 +184,8 @@ static int run(const char * backend_name) {
+                 test(fmt, "GET_ROWS", 2048, 64, 1, 3);
+             }
+         }
++        // Separate FP32 gate/up tensors at the shared-expert production shape (not merged storage).
++        for (int T : {1, 2, 8}) { test(1, "GLU", 2048, 512, 1, T); }
+         // This dataset mathematically forces single-symbol fallback; never use its unsupported GET_ROWS path.
+         test(2, "GLU_HUFFMAN_FALLBACK", 512, 8192, 1, 1);
+         printf("BF16N PASS: %d exact cases (no skips)\n", count);

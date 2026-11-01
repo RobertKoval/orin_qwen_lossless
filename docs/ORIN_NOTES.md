@@ -15,7 +15,7 @@ Speculation is marked as such.
 * Single-stream decode of a 3B-active MoE moves ≈ 4.0 GB of compressed weights per token here, so ≈ 22 ms is the floor at
   180 GB/s; everything else (≈ 12 ms today) is decode ALU work, small ops and launch gaps.
 * The desktop is not free: the compositor/remote-desktop share GPU time and DRAM. One open GUI window cost ~13 % decode speed
-  in our measurements (see RESULTS.md).
+  in our measurements (see [llamacpp/RESULTS.md](llamacpp/RESULTS.md)).
 
 ## GPU (GA10B, SM87) facts that shaped the kernels
 

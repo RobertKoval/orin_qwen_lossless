@@ -1,0 +1,9 @@
+[build-system]
+# built against the torch of the target venv: pip install -e . --no-build-isolation --no-deps
+requires = ["setuptools>=64", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/serving/*.py are clients run against a live server, not pytest modules
+python_files = ["test_*.py"]
