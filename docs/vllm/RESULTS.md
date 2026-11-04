@@ -41,6 +41,25 @@ The shared-core release is deployed in the full-window BF16-KV, vision-enabled, 
 
 The MTP-off loss remains a measured tradeoff. This default-MTP deployment result does not establish MTP-off performance parity or replace the separate earlier observations.
 
+## Draft attention window (measured, not adopted)
+
+A 32K sliding window for the MTP draft layer's attention cuts the draft's KV-cache reads at long context and never
+changes target outputs. In a one-layer microbenchmark of vLLM's split-KV Triton launch, a full-context call took
+0.92 / 2.49 / 3.07 ms at 64K / 200K / 250K tokens (one query token). A plain window saved only part of that, because
+the kernel still splits the full length into 16 segments. A block table shifted to the window start brought a call
+to 0.55 ms at any length. End to end, in the deployed configuration with identical prompts on both servers:
+
+| Context | Decode tokens/s, full → window | Draft acceptance, full → window |
+|---|---:|---:|
+| Short (4 prompts) | 39.0 → 38.7 | unchanged |
+| 72K | 28.6 → 26.2 | 0.565 → 0.498 |
+| 130K | 24.2 → 23.1 | 0.519 → 0.468 |
+| 197K | 22.6 → 21.5 | 0.570 → 0.473 |
+
+Target texts matched at 72K and 130K; at 197K they diverged near the end at a near-tie. The same window without the
+block-table shift gave the same acceptance (0.493 at 72K), so the loss comes from the window: the draft layer uses
+long-range context. Not adopted.
+
 ## Interpretation
 
 Lossless BF16 weight reconstruction, approximate draft behavior, attention/cache dtype and sampling interventions must be reported separately. These measurements establish neither cross-engine bit-identical logits nor safe memory limits for other machines or contexts. Experimental offline KV compression results are [reported separately](../RESULTS.md#experimental-bf16-kv-reference), with no resident-vLLM or throughput claim.

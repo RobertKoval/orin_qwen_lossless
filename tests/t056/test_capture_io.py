@@ -148,7 +148,7 @@ class CaptureWriterTests(unittest.TestCase):
         writer = self.writer()
         good = descriptor(rows=2, position=10, committed_tokens=12)
         original = self.raw_bytes(writer)
-        mutations = (("layer", 7), ("layer", 0), ("layer", 40), ("head", 2), ("channels", 256),
+        mutations = (("layer", 4), ("layer", 0), ("layer", 40), ("head", 2), ("channels", 256),
                      ("channel_start", 127), ("channel_start", 129), ("capture_stage", "pre_rope"),
                      ("kind", "GDN"), ("rows", 0), ("committed_tokens", 11), ("committed_tokens", 262145),
                      ("position_start", -1), ("rows", True), ("domain", "unknown"))

@@ -4,7 +4,8 @@
   ctx N  - an N-token haystack (frozen docs + llama.cpp sources) with a needle at 50 % depth; one request that asks for
            the needle and then a ~300-word summary: prefill tok/s (TTFT), decode tok/s (streamed tokens after the first,
            counted by logprobs), needle found or not
-After every check prints MemFree + Cached of this machine (the Orin), i.e. the memory margin.
+After every check prints MemFree + Cached of this machine (the Orin), i.e. the memory margin. CTX_SALT=<text> fixes
+           the prompt's leading salt (default random: no prefix-cache hit), so two servers get identical prompts.
   plp N  - an N-token prompt with prompt_logprobs=5 (T-045: must not kill the engine); reports time and entry count
   images K - K 3840x2160 images in one chat request
   long_ctx_test.py <port> image | images <K> | ctx <tokens> [<tokens> ...] | plp <tokens> [...]   (MODEL_NAME, API_KEY env)"""
@@ -16,6 +17,7 @@ key = os.environ.get("API_KEY", "")
 root = pathlib.Path(__file__).resolve().parents[2]  # repo root
 sys.path.insert(0, str(root))
 from bench.prompts.prompts import haystack_docs  # noqa: E402
+from bench.serving.spec_metrics import spec_counters  # noqa: E402
 NEEDLE = "The secret passphrase for the Orin vault is TANGERINE-4471-OBSIDIAN."
 
 
@@ -71,7 +73,8 @@ def ctx_test(n):
     hay = haystack(n)
     q = ("Above is a long collection of documents and source files. Somewhere in it there is a secret passphrase for "
          "the Orin vault. First state the passphrase exactly. Then summarize the collection in about 300 words.")
-    p = f"<|im_start|>user\n[{os.urandom(4).hex()}]\n{hay}\n\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    p = f"<|im_start|>user\n[{os.environ.get('CTX_SALT') or os.urandom(4).hex()}]\n{hay}\n\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    c0 = spec_counters(port)
     t0 = time.time(); times = []; text = ""; usage = None
     for line in post("/v1/completions", {"model": model, "prompt": p, "max_tokens": 400, "temperature": 0,
                                          "logprobs": 1, "stream": True, "stream_options": {"include_usage": True}}):
@@ -89,10 +92,13 @@ def ctx_test(n):
     pt = usage["prompt_tokens"] if usage else n
     dec = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 else 0
     found = "TANGERINE-4471-OBSIDIAN" in text
+    c1 = spec_counters(port)
+    acc = (c1[1] - c0[1]) / (c1[0] - c0[0]) if c0 and c1 and c1[0] > c0[0] else None
     print(f"ctx {pt} tokens: prefill {pt / (times[0] - t0):.0f} tok/s (TTFT {times[0] - t0:.1f} s), decode {dec:.2f} "
-          f"tok/s over {len(times)} tokens, needle {'FOUND' if found else 'MISSING'}; {margin()}", flush=True)
+          f"tok/s over {len(times)} tokens, draft acceptance {acc if acc is None else round(acc, 3)}, "
+          f"needle {'FOUND' if found else 'MISSING'}; {margin()}", flush=True)
     print("  answer start:", repr(text[:160]), flush=True)
-    return dict(prompt_tokens=pt, ttft=times[0] - t0, decode=dec, needle=found, text=text[:2000])
+    return dict(prompt_tokens=pt, ttft=times[0] - t0, decode=dec, draft_acceptance=acc, needle=found, text=text)
 
 
 def plp_test(n):

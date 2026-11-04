@@ -13,6 +13,7 @@ model = "qwen3-a3b-30b"
 root = pathlib.Path(__file__).resolve().parents[2]  # repo root
 sys.path.insert(0, str(root))
 from bench.prompts.prompts import chat, serving_long_doc, serving_prompts  # noqa: E402
+from bench.serving.spec_metrics import spec_counters  # noqa: E402
 
 doc = serving_long_doc()
 prompts = serving_prompts()
@@ -20,18 +21,6 @@ prompts = serving_prompts()
 LP = int(os.environ.get("LOGPROBS", "5"))
 
 
-def spec_counters():
-    """(draft, accepted) totals from vLLM's /metrics (None without speculative decoding or on llama-server)."""
-    try:
-        txt = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=10).read().decode()
-    except Exception:
-        return None
-    v = {}
-    for line in txt.splitlines():
-        for k in ("vllm:spec_decode_num_draft_tokens_total", "vllm:spec_decode_num_accepted_tokens_total"):
-            if line.startswith(k):
-                v[k] = v.get(k, 0.0) + float(line.rsplit(" ", 1)[1])
-    return (v["vllm:spec_decode_num_draft_tokens_total"], v["vllm:spec_decode_num_accepted_tokens_total"]) if len(v) == 2 else None
 
 
 def run(prompt, n, logprobs=LP or None):
@@ -67,9 +56,9 @@ run(prompts[0], 16)  # warm-up
 for _ in range(int(os.environ.get("REPEAT", "1"))):  # REPEAT=2: report the second pass (first-pass stalls excluded)
     res = []
     for p in prompts:
-        c0 = spec_counters()
+        c0 = spec_counters(port)
         r = run(p, ntok)
-        c1 = spec_counters()
+        c1 = spec_counters(port)
         r["draft_acceptance"] = (c1[1] - c0[1]) / (c1[0] - c0[0]) if c0 and c1 and c1[0] > c0[0] else None
         res.append(r)
 long_prompt = chat(f"[{os.urandom(4).hex()}]\n" + doc + "\nSummarize in one sentence.")

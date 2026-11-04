@@ -170,7 +170,7 @@ def _descriptor(value, metadata_limit):
     head = _integer(value["head"], "head")
     channel = _integer(value["channel_start"], "channel_start")
     channels = _integer(value["channels"], "channels")
-    _require(layer in (3, 39), "pilot layer must be 3 or 39, never GDN/MTP")
+    _require(layer in range(3, 40, 4), "pilot layer must be a full-attention layer 3,7,...,39, never GDN/MTP")
     _require(head in (0, 1), "KV head must be 0 or 1")
     _require(channel in (0, 128) and channels == 128, "pilot channel slice must be 0:128 or 128:256")
     kind = value["kind"]

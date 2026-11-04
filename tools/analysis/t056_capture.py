@@ -35,10 +35,9 @@ if str(ANALYSIS) not in sys.path:
 
 MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 REVISION = "995ad96eacd98c81ed38be0c5b274b04031597b0"
-LAYERS = (3, 39)
+LAYERS = tuple(range(3, 40, 4))  # all ten full-attention layers (T-057 gate; the 11-01 pilot read 3 and 39)
 MAX_DEVICE = 64 * 1024**2
 MAX_HOST = 16 * 1024**2
-MAX_OUTPUT = 8 * 1024**2
 MAX_CHUNK_ROWS = 256
 DOMAIN_CHOICES = ("english", "code", "ukrainian")
 PRIVACY_ENV = ("VLLM_NO_USAGE_STATS", "DO_NOT_TRACK", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
@@ -144,12 +143,6 @@ def make_plan(checkpoint, calibration_tokens, evaluation_tokens, output, *, cali
                 for source in (calibration_source, evaluation_source)) and calibration_source != evaluation_source,
             "calibration/evaluation source IDs must be trimmed, bounded and independent")
     require(type(short_pilot) is bool, "invalid pilot profile")
-    raw_bytes = (12 if short_pilot else 5) * 1024**2
-    limit = (16 * 1024**2) if short_pilot else MAX_OUTPUT
-    if max_output_bytes is None:
-        max_output_bytes = limit
-    require(type(max_output_bytes) is int and raw_bytes + 1024**2 <= max_output_bytes <= limit,
-            "pilot quota must cover raw data plus1MiB metadata within the profile limit")
     output = Path(output).absolute()
     require(not output.exists() and not output.is_symlink(), "output must be a NEW private directory")
     require(output.parent.is_dir(), "output parent directory must already exist")
@@ -160,6 +153,13 @@ def make_plan(checkpoint, calibration_tokens, evaluation_tokens, output, *, cali
     row_counts = (1024, 2048) if short_pilot else (256, 256)
     windows = [(len(values) - rows,) if short_pilot else sample_windows(len(values))
                for values, rows in zip((cal, evaluation), row_counts)]
+    # every layer: 2 KV heads x K/V x two 128-channel halves, 256 bytes per row of 128 BF16 values
+    raw_bytes = len(LAYERS) * 8 * 256 * sum(len(w) * rows for w, rows in zip(windows, row_counts))
+    limit = raw_bytes + 8 * 1024**2
+    if max_output_bytes is None:
+        max_output_bytes = limit
+    require(type(max_output_bytes) is int and raw_bytes + 1024**2 <= max_output_bytes <= limit,
+            "pilot quota must cover raw data plus1MiB metadata within the profile limit")
     selected = [{first: token_digest(values[first:first + rows]) for first in starts}
                 for values, rows, starts in zip((cal, evaluation), row_counts, windows)]
     if short_pilot:
@@ -259,7 +259,7 @@ def validate_worker_policy(runner, receipt):
 
 
 def resolve_cache(runner, layer):
-    require(layer in LAYERS, "pilot captures attention layers3/39 only")
+    require(layer in LAYERS, "pilot captures the full-attention layers 3,7,...,39 only")
     context = runner.compilation_config.static_forward_context
     names = [name for name in context if re.search(rf"(?:^|\.)layers\.{layer}\.self_attn\.attn$", name)
              and "mtp" not in name.lower()]
@@ -395,9 +395,9 @@ def verify_runtime():
         require(hashlib.sha256((root / name).read_bytes()).hexdigest() == expected,
                 f"installed API changed since review: {name}; reinspect before capture")
     plugin_root = purelib / "vllm_bf16n"
-    require(importlib.metadata.version("vllm-bf16n") == "0.1.0+g79b0f880cbbc", "pilot requires known-working production wheel, not S5 candidate")
+    require(importlib.metadata.version("vllm-bf16n") == "0.1.0+g09b28236a300", "pilot requires the production wheel (11-01)")
     extension = plugin_root / "_C.cpython-310-aarch64-linux-gnu.so"
-    require(hashlib.sha256(extension.read_bytes()).hexdigest() == "a8a955dee81e44df1aa36f5dee58cbed55ba68101bf3918da042223316add749",
+    require(hashlib.sha256(extension.read_bytes()).hexdigest() == "f8fccb746eac745d6551f848961893d1745ba071672e9707455bbfe4e24e1f0f",
             "production extension payload differs")
     plugin_sources = {name: hashlib.sha256((plugin_root / name).read_bytes()).hexdigest()
                       for name in ("model.py", "triton_spec.py", "async_align.py")}
@@ -485,6 +485,7 @@ def run_pilot(plan, token_lists, *, parent_lease, max_seconds=1500):
                 and core.model_executor.max_concurrent_batches == 1 and not core.async_scheduling,
                 "capture cannot run with background engine/async batches")
         writer = CaptureWriter(Path(plan["output"]), max_output_bytes=plan["max_output_bytes"],
+                               metadata_reserve_bytes=plan["max_output_bytes"] - plan["raw_pilot_bytes"],
                                capture_provenance={"parent_lease": parent_lease, "runtime": runtime,
                                                    "plan": plan, "cuda_tested_before_this_run": False})
         for request_plan, tokens in zip(plan["requests"], token_lists, strict=True):

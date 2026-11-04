@@ -73,8 +73,8 @@ p=sys.argv.pop(1);sys.argv[0]=p;runpy.run_path(p,run_name='__main__')
         plan = json.loads(result.stdout)
         self.assertEqual(plan["status"], "dry_run")
         self.assertFalse(plan["cuda_tested"])
-        self.assertEqual(plan["raw_pilot_bytes"], 5 * 1024**2)
-        self.assertEqual(plan["layers"], [3, 39])
+        self.assertEqual(plan["raw_pilot_bytes"], 25 * 1024**2)  # 10 layers x 8 streams x 5 windows x 256 rows x 256 B
+        self.assertEqual(plan["layers"], [3, 7, 11, 15, 19, 23, 27, 31, 35, 39])
         self.assertEqual([x["windows"] for x in plan["requests"]], [[0, 65280], [0, 65280, 204544]])
         self.assertEqual([x["role"] for x in plan["requests"]], ["calibration", "evaluation"])
         self.assertEqual(self.cli().returncode, 0)  # dry-run did not consume/create its exclusive output
@@ -88,7 +88,7 @@ p=sys.argv.pop(1);sys.argv[0]=p;runpy.run_path(p,run_name='__main__')
         self.assertEqual(plan["profile"]["max_num_batched_tokens"], 2112)
         self.assertEqual(plan["profile"]["kv_cache_bytes"], 1024**3)
         self.assertEqual([(r["windows"], r["window_rows"]) for r in plan["requests"]], [([3072], 1024), ([6144], 2048)])
-        self.assertEqual(plan["raw_pilot_bytes"], 12 * 1024**2)
+        self.assertEqual(plan["raw_pilot_bytes"], 60 * 1024**2)  # 10 layers x 8 streams x (1024 + 2048) rows x 256 B
         for count in (4095, 4097):
             self.cal.write_text(json.dumps([7] * count))
             self.cli(("--short-pilot",), ok=False)
@@ -97,8 +97,8 @@ p=sys.argv.pop(1);sys.argv[0]=p;runpy.run_path(p,run_name='__main__')
             self.evaluation.write_text(json.dumps([8] * count))
             self.cli(("--short-pilot",), ok=False)
         self.evaluation.write_text(json.dumps([8] * 8192))
-        for quota in (13 * 1024**2 - 1, 13 * 1024**2, 13 * 1024**2 + 1):
-            self.cli(("--short-pilot", "--max-output-bytes", str(quota)), ok=quota >= 13 * 1024**2)
+        for quota in (61 * 1024**2 - 1, 61 * 1024**2, 61 * 1024**2 + 1):  # raw 60 MiB + 1 MiB of metadata
+            self.cli(("--short-pilot", "--max-output-bytes", str(quota)), ok=quota >= 61 * 1024**2)
 
     def test_execute_without_parent_lease_fails_before_any_runtime_import(self):
         result = self.cli(("--execute",), ok=False)
@@ -156,8 +156,9 @@ p=sys.argv.pop(1);sys.argv[0]=p;runpy.run_path(p,run_name='__main__')
                 self.assertIn("selected token windows are duplicated", result.stderr)
 
     def test_output_quota_boundary_and_existing_output_fail(self):
-        for quota, ok in ((6 * 1024**2 - 1, False), (6 * 1024**2, True),
-                          (8 * 1024**2, True), (8 * 1024**2 + 1, False)):
+        # raw 25 MiB: at least raw + 1 MiB of metadata, at most raw + 8 MiB
+        for quota, ok in ((26 * 1024**2 - 1, False), (26 * 1024**2, True),
+                          (33 * 1024**2, True), (33 * 1024**2 + 1, False)):
             with self.subTest(quota=quota):
                 self.cli(("--max-output-bytes", str(quota)), ok=ok)
         self.output.mkdir()
@@ -371,7 +372,7 @@ class StreamingProtocolTests(unittest.TestCase):
     def test_short_capture_writes_2048_heldout_rows_per_partition_with_bounded_page_chunks(self):
         from t056_capture_io import CaptureWriter
         with tempfile.TemporaryDirectory() as temporary:
-            writer = CaptureWriter(Path(temporary).resolve() / "short", max_output_bytes=16 * 1024**2,
+            writer = CaptureWriter(Path(temporary).resolve() / "short", max_output_bytes=68 * 1024**2,
                                    capture_provenance={"CPU_FAKE_SOURCE_TEST": True})
             total = 0
             try:
@@ -398,7 +399,7 @@ class StreamingProtocolTests(unittest.TestCase):
                     capture.stream_request(writer, rpc, request, receipt, inspected, "/private/fake-checkpoint")
                 manifest_path = writer.finalize()
                 manifest = json.loads(manifest_path.read_text())
-                self.assertEqual(total, 12 * 1024**2)
+                self.assertEqual(total, 60 * 1024**2)
                 for shard in manifest["shards"]:
                     self.assertEqual(shard["rows"], 2048 if shard["role"] == "evaluation" else 1024)
                     expected = b"".join(struct.pack("<H", p & 65535) * 128
@@ -411,7 +412,8 @@ class StreamingProtocolTests(unittest.TestCase):
         from t056_capture_io import CaptureWriter
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            writer = CaptureWriter(root / "pilot", capture_provenance={"CPU_FAKE_SOURCE_TEST": True})
+            writer = CaptureWriter(root / "pilot", max_output_bytes=33 * 1024**2, metadata_reserve_bytes=8 * 1024**2,
+                                   capture_provenance={"CPU_FAKE_SOURCE_TEST": True})
             try:
                 expected_bytes = 0
                 calls = 0
@@ -448,12 +450,12 @@ class StreamingProtocolTests(unittest.TestCase):
                                 "source_dtype": "bfloat16", "route": route}
 
                     capture.stream_request(writer, rpc, request, receipt, inspected, "/private/approved-checkpoint")
-                    expected_bytes += len(request["windows"]) * 16 * 256 * 128 * 2
+                    expected_bytes += len(request["windows"]) * len(capture.LAYERS) * 8 * 256 * 128 * 2
                 manifest_path = writer.finalize()
                 manifest = json.loads(manifest_path.read_text())
-                self.assertEqual(calls, 1280)
-                self.assertEqual(len(manifest["shards"]), 80)
-                self.assertEqual(expected_bytes, 5 * 1024**2)
+                self.assertEqual(calls, 6400)  # 400 shards of 256 rows in 16-row pages
+                self.assertEqual(len(manifest["shards"]), 400)
+                self.assertEqual(expected_bytes, 25 * 1024**2)
                 observed = 0
                 for shard in manifest["shards"]:
                     raw = (manifest_path.parent / shard["path"]).read_bytes()
@@ -461,7 +463,7 @@ class StreamingProtocolTests(unittest.TestCase):
                     self.assertEqual(raw, bits(shard["position_start"], shard["layer"], shard["head"], shard["kind"],
                                                shard["channel_start"], shard["rows"]))
                 self.assertEqual(observed, expected_bytes)
-                self.assertLessEqual(writer.bytes_written, capture.MAX_OUTPUT)
+                self.assertLessEqual(writer.bytes_written, expected_bytes + 8 * 1024**2)
             finally:
                 writer.close()
 
