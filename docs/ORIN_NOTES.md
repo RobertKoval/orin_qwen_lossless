@@ -12,7 +12,7 @@ Speculation is marked as such.
   1300.5 MHz, CPU `scaling_min_freq` 2.2 GHz) decode was 1–3 % faster and the host-bound old prefill path 16–22 %.
   The measurement scripts print `/sys/devices/platform/bus@0/17000000.gpu/devfreq/17000000.gpu/{min,max}_freq` and
   `/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq` before every run.
-* Single-stream decode of a 3B-active MoE moves ≈ 4.0 GB of compressed weights per token here, so ≈ 22 ms is the floor at
+* Single-stream decode of a 3 B-active MoE moves ≈ 4.0 GB of compressed weights per token here, so ≈ 22 ms is the floor at
   180 GB/s; everything else (≈ 12 ms today) is decode ALU work, small ops and launch gaps.
 * The desktop is not free: the compositor/remote-desktop share GPU time and DRAM. One open GUI window cost ~13 % decode speed
   in our measurements (see [llamacpp/RESULTS.md](llamacpp/RESULTS.md)).

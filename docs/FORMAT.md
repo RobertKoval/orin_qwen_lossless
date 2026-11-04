@@ -107,5 +107,5 @@ as its layer is processed. The llama.cpp log line per tensor is:
 | type | `GGML_TYPE_BF16N` (ggml type id 43); `blck_size = type_size = 512`, the tensor data is the plane | `bf16n_plane` / `bf16n_aux` uint8 tensors registered on the layer, header fields parsed once into Python ints |
 | aux buffer | separate `cudaMalloc` registered against the tensor's data range; views (one expert of a 3-D tensor) find it by address | passed explicitly to every op; a view is `row0` + a row count |
 | conversion | at load, `ggml_backend_cuda_bf16n_convert` (`LLAMA_BF16N`) | at load, layer by layer (`--quantization bf16n`, vLLM's meta-device loading) |
-| kernels | `ggml-cuda/bf16n.cu` in the patch series (`engines/llamacpp/patches`) supplies ggml glue over the shared `core/` kernels | `torch.ops.bf16n` (`core/torch/torch_bindings.cpp` over `core/`) |
+| kernels | `ggml-cuda/bf16n.cu` in the patch series (`engines/llamacpp/patches`), its own copy of the kernels (same decode and summation order, different templates and SASS) until T-034 makes it a thin glue over `core/` | `torch.ops.bf16n` (`core/torch/torch_bindings.cpp` over `core/`) |
 | activations | F32 in, F32 out (GEMV); BF16 for the tensor cores (batched) | BF16 or F32 in and out; FP32 accumulation, same summation order |

@@ -1,46 +1,63 @@
-# Results and limits
+# Results: headline numbers
 
-Measured on Jetson AGX Orin64GB, SM87, CUDA12.6/L4T R36.5, Qwen3.6-35B-A3B, single sequence. Results are BF16-model comparisons. Weight-storage bytes, process RSS, GPU allocation and physical UMA usage are different quantities.
+Jetson AGX Orin Developer Kit 64GB, MAXN with pinned clocks, CUDA 12.6, L4T R36.5, Qwen3.6-35B-A3B, single stream.
+Comparisons are BF16 only: llama.cpp-BF16N vs vLLM-BF16N, plain decode vs the model's MTP draft, and BF16N kernels vs
+the stock BF16 kernels per op. Uncompressed BF16 does not fit the board in either engine (64.6 GiB > 61.4 GiB).
+Benchmark inputs are frozen (`bench/prompts/`). Details and methodology per engine:
+[llamacpp/RESULTS.md](llamacpp/RESULTS.md) (the research history of the format and kernels) and
+[vllm/RESULTS.md](vllm/RESULTS.md) (milestones M1–M6 of the vLLM plugin).
 
-## Historical baselines versus current source
+| metric | engine | value | how |
+|---|---|---|---|
+| weights resident | llama.cpp | 46.5 GB of 69.3 GB (ratio 0.671), 472/472 tensors bit-exact | load log |
+| weights resident | vLLM | 43.5 GiB text model + 1.0 MTP layer (+ 0.9 BF16 vision), every tensor bit-exact | "Model loading took 45.46 GiB" |
+| decode, no draft | llama.cpp | 31.2 tok/s (tg64, ±0.3 %); 28.6 same client | `llama-bench`; `bench_openai.py` |
+| decode, no draft | vLLM | 32.7 tok/s (M2, FlashInfer); 31.1 (M6 config) | `bench_openai.py` |
+| decode, MTP draft | llama.cpp | 40.2 tok/s (1 draft token, 4 × 400 tokens); 35.5 same client | `llama-server`; `bench_openai.py` |
+| decode, MTP draft | vLLM | **41.2 tok/s** (3 draft tokens, without logprobs; shared-core release); 40.4 with logprobs | `bench_openai.py` |
+| prefill 8k | llama.cpp | 832 / 1323 / 1481 tok/s (ub 512 / 2048 / 4096) | `llama-bench` |
+| prefill 8k / 23k | vLLM | 1439 / 1367 tok/s in the production config (1855 / 1756 in the leaner M3 config) | `bench_prefill.py` |
+| prefill 23k | llama.cpp | 1192 tok/s | `llama-server`, same client |
+| long-context decode | llama.cpp | 27.1 @ 64K, 22.6 @ 224K (MTP); 25.1 / 16.6 without | `llama-server` / `llama-bench` |
+| long-context prefill | llama.cpp | 648 tok/s at 224K (585 with the MTP draft) | `llama-server` |
+| long-context prefill | vLLM | 1093 tok/s at 71K, 727 at 193K (production config) | `long_ctx_test.py` |
+| long-context decode | vLLM | 28.0 @ 68.5K, 23.6 @ 200K, 21.7 @ 248K (MTP 3) | `long_ctx_test.py` |
+| free memory, full window + vision | llama.cpp | ≈ 3 GB (process 56.4–56.7 GB after a 4K image) | |
+| free memory, full window + vision | vLLM | ≥ 2.7 GiB after a 4K image and a 248K request | MemFree + Cached |
+| agreement between engines | both | top-1 99.5 %, mean KL ≈ 2e-3 (teacher-forced on llama.cpp's tokens) | `compare_llama.py` |
+| per op: lm_head 248320 × 2048 | both | 4.3 ms fused decode+GEMV vs 5.7 ms cuBLAS BF16 | nsys |
+| per op: prefill MoE | llama.cpp | batched kernel 2.4–2.7× over dequant + cuBLAS | `moe_prefill.cpp` |
+| per op: prefill MoE | vLLM | 22 vs 29.5 ms per layer at 2048 tokens vs dequant + Triton `fused_experts` | nsys |
 
-| Historical engine-specific build | Encoded weights | Short decode | With native MTP |
-|---|---:|---:|---:|
-| llama.cpp | 46.5GB from69.3GB | about31.2 tokens/s | about40.2 tokens/s, one draft token |
-| vLLM | about43.5GiB text weights; vision/MTP extra | about31–33 tokens/s | about40–41 tokens/s, three draft tokens |
-
-These are earlier engine-specific baselines, **not a deployed shared-core release**. Draft settings, approximate candidate heads and any sampler interventions are separate from lossless target weights. Full methodology and scope: [llama.cpp](llamacpp/RESULTS.md), [vLLM](vllm/RESULTS.md).
-
-The shared-core candidate passed the tested encoded-weight/per-operation/serving comparisons but retains performance tradeoffs. Native generation was near the earlier baseline in limited paired measurements; native prefill changed by roughly−0.2 to−0.6%. A bounded vLLM MTP-off comparison observed32.220→31.641/s nonstream and32.199→31.087/s SSE post-first-token interval rates (−1.8% /−3.45%). Those spans include engine-host pacing. No universal performance parity or complete cause is established.
-
-**Shared-core vLLM deployment:** one final matched warm comparison of the default MTP-on configuration measured **40.88 → 41.21 tokens/s (+0.80%)** with matching texts/token counts on four prompts. The shared-core release is now serving; health, tools, reasoning and vision checks passed. The MTP-off tradeoff above remains, and one pair is not a general speedup guarantee.
-
-## Prefill and long-context measurements
-
-Historical8K llama.cpp prefill ranged832–1481 tokens/s across micro-batches512–4096; historical full-feature vLLM prefill was about1439 at8K and1367 at23K tokens/s. Longer-context figures are in the engine result pages.
-
-**The public corpus differs from the historical inputs. New public prefill/haystack runs require a new baseline.** Neither matching token count nor using the same client name establishes exact historical reproduction. No fresh public-client validation is implied by these tables.
-
-The vLLM environment also contained local dependency/model-definition patches. [Version labels alone do not reproduce it](vllm/README.md#compatibility-boundary); compatible external definitions/patch sources remain a reproduction dependency.
+The vLLM numbers are from the production configuration (full 262,144-token window, vision, MTP with 3 draft tokens,
+prefix caching) unless stated otherwise. The shared-core release (one `core/` for both engines, deployed 2026-11-01)
+measured 40.88 → 41.21 tok/s against the earlier vLLM-only plugin with identical texts on the four prompts; without the
+draft it is 1.8–3.5 % slower than that plugin in one bounded comparison. The board's vLLM 0.20 carries local patches
+whose sources are not distributed here ([vllm/README.md](vllm/README.md#compatibility-boundary)).
 
 ## Experimental BF16 KV reference
 
-A CPU reference inspired by [GAAC](https://arxiv.org/abs/2610.38210) was evaluated on **real post-RoPE BF16 K and BF16 V**, not converted lower-precision cache data. It is an independent reference format, not official GAAC code or reproduction.
+A CPU reference codec inspired by [GAAC](https://arxiv.org/abs/2610.38210) (per-channel exponent windows, sign and
+mantissa kept as they are) was run on **real post-RoPE BF16 K and BF16 V** of the model. It is an independent
+reference format, not the authors' code or an official reproduction.
 
-English calibration used4096 input tokens; held-out evaluation used8192. Only attention layers3 and39 were sampled, both KV heads/all256 channels, with2048 held-out rows per128-channel partition. Calibration and evaluation texts were distinct. Raw snapshots are private and are not distributed.
+English calibration used 4096 input tokens; held-out evaluation used 8192. Only attention layers 3 and 39 were sampled
+(both KV heads, all 256 channels), with 2048 held-out rows per 128-channel partition. Calibration and evaluation texts
+were distinct; raw snapshots are not distributed.
 
 | Held-out sample | Raw bytes | Accounted reference capacity |
 |---|---:|---:|
-| Layer3 K | 2,097,152 | 1,555,520 |
-| Layer3 V | 2,097,152 | 1,556,608 |
-| Layer39 K | 2,097,152 | 1,556,608 |
-| Layer39 V | 2,097,152 | 1,555,520 |
+| Layer 3 K | 2,097,152 | 1,555,520 |
+| Layer 3 V | 2,097,152 | 1,556,608 |
+| Layer 39 K | 2,097,152 | 1,556,608 |
+| Layer 39 V | 2,097,152 | 1,555,520 |
 | **Total** | **8,388,608** | **6,224,256** |
 
-**25.80% smaller,1.3477× raw/capacity. All4,194,304 uint16 values reconstructed exactly across2048 blocks.**
-
-Accounting includes6,036,512 used bytes plus187,744 bytes of compressed-slot slack. Metadata totals192,640 bytes:49,152 headers,8,192 block-table entries,4,352 calibration tables and130,944 group tags. Two raw-fallback blocks consume8,240 bytes including their headers, already included in the total. The chosen compressed slot is3032 bytes including its24-byte header; it was not retuned on the evaluation data.
-
-**No per-group offset table exists in this sequential CPU format** (zero such serialized bytes); a future random-access GPU layout would have additional, unmeasured constraints/costs. The block-table/tail capacities are explicit reference-model accounting, not observed vLLM allocations. Audit-file metadata is separate disk provenance, not codec resident storage.
-
-This establishes short-English/two-layer **reference storage** savings only: no all-layer, code/Ukrainian,64K/200K, throughput or resident-vLLM memory claim. There is no production cache integration. Public tools can process an appropriately declared capture, but the historical ratio cannot be reproduced without the original private raw snapshots.
+**25.80 % smaller (1.3477× raw / capacity); all 4,194,304 values reconstructed exactly across 2048 blocks.** The
+accounting includes 6,036,512 used bytes plus 187,744 bytes of compressed-slot slack, 192,640 bytes of metadata
+(49,152 headers, 8,192 block-table entries, 4,352 calibration tables, 130,944 group tags) and two raw-fallback blocks
+(8,240 bytes with headers). The 3032-byte compressed slot (with its 24-byte header) was not tuned on the evaluation
+data. The sequential CPU format has no per-group offset table; a random-access GPU layout would add costs not measured
+here. This is a storage measurement on two layers of short English text, not a resident-memory or throughput result;
+the measurement over all ten layers, positions near 64K and 200K, code and Ukrainian is next
+([ROADMAP](ROADMAP.md)).

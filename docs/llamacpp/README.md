@@ -12,8 +12,8 @@ engines/llamacpp/build.sh [workdir=engines/llamacpp/src]   # clone + checkout th
 ```
 
 `build.sh` refuses a work tree whose history is not exactly the pin plus the series (a stale or hand-edited tree
-must be rebuilt from scratch or exported first, below). The binaries land in `<workdir>/build/bin`.
-Keep any serving installation separate from the development build directory.
+must be rebuilt from scratch or exported first, below). The binaries land in `<workdir>/build/bin`. The production
+copy on the board is a release directory, not a dev tree (`deploy/orin/run_qwen3_a3b_bf16n.sh`, `BF16N_LLAMA_DIR`).
 
 ## Patch series
 
@@ -144,3 +144,4 @@ g++ -O2 -std=c++17 -I $L/ggml/include engines/llamacpp/bench/gdn_check.cpp -o gd
     -L $L/build/bin -lggml -lggml-base -lggml-cuda -Wl,-rpath,$PWD/$L/build/bin
 ./gdn_check qwen3.6-35b-a3b-bf16.gguf 0 2048        # layer 0, 2048 tokens; [reps] [1 = random initial state]
 ```
+
