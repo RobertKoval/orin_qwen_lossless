@@ -58,6 +58,19 @@ accounting includes 6,036,512 used bytes plus 187,744 bytes of compressed-slot s
 (49,152 headers, 8,192 block-table entries, 4,352 calibration tables, 130,944 group tags) and two raw-fallback blocks
 (8,240 bytes with headers). The 3032-byte compressed slot (with its 24-byte header) was not tuned on the evaluation
 data. The sequential CPU format has no per-group offset table; a random-access GPU layout would add costs not measured
-here. This is a storage measurement on two layers of short English text, not a resident-memory or throughput result;
-the measurement over all ten layers, positions near 64K and 200K, code and Ukrainian is next
+here.
+
+**All ten layers at long positions (2026-11-04).** The same codec and slot on real KV of all ten attention layers
+(both KV heads, 256-row samples at positions 0, 65,280 and 204,544 of a 204,800-token text), calibrated once on a
+65,536-token English text:
+
+| Evaluation text | Smaller | K | V | positions ≤ 64K | position ~200K | raw-fallback blocks |
+|---|---:|---:|---:|---:|---:|---:|
+| English (prose) | 25.1 % | 24.4 % | 25.7 % | 25.9 % | 23.9 % | 2.5 % |
+| Code (C/C++ sources) | 25.4 % | 25.0 % | 25.7 % | 25.9 % | 24.7 % | 1.5 % |
+| Ukrainian (Wikipedia) | 25.1 % | 24.5 % | 25.7 % | 25.9 % | 23.9 % | 2.4 % |
+
+Every block round-trips exactly. The weakest layer is K of layer 3 (21–23 %); the fixed 3032-byte slot caps the saving
+at 26.0 %, so most blocks sit at the cap. The saving holds across text types and context positions; what remains
+open is the cost of reconstructing tiles inside the attention kernel on this GPU and the allocator work in vLLM
 ([ROADMAP](ROADMAP.md)).

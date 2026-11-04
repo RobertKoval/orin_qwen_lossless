@@ -73,9 +73,10 @@ vLLM keeps the KV cache in BF16: 20,480 B per token over the 10 full-attention l
    long-range context: at 72K–197K acceptance falls 12–17 % and decode is 4–8 % slower.
 2. **Lossless BF16 KV (GAAC-style, [arXiv 2610.38210](https://arxiv.org/abs/2610.38210))** (next): BF16 has 8 exponent bits
    (F16 has 5, see item 3 below). Per-channel 3-/4-bit exponent windows in groups of 8 keep sign and mantissa as they
-   are. Pilot on real KV (2 of 10 layers, 8K English): 25.8 % smaller, every value exact. Gate before any kernel work:
-   all layers, positions near 64K and 200K, code and Ukrainian. Ceiling if it holds: ≈ +7–10 % decode at 200K, 0 at
-   short context, ≤ 1.5 GiB at the full window with a compressed-page allocator.
+   are. On real KV of all ten layers at positions up to 200K: 25.1–25.4 % smaller for English, code and Ukrainian
+   text, every value exact ([RESULTS](RESULTS.md#experimental-bf16-kv-reference)). Next: the attention kernel reading
+   compressed tiles, microbenchmarked on Orin, which decides the gain: ≈ +2.5 % decode at 64K and ≈ +7 % at 200K if
+   reconstruction is free, 0 at short context, ≈ 1.5 GiB at the full window with a compressed-page allocator.
 
 llama.cpp:
 
