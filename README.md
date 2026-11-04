@@ -267,7 +267,8 @@ what worked, what did not, and by how much.
   see them (≈ 11 GB); run with `--fit off` and set the context size explicitly.
 * Not compressed: the vision encoder (0.9 GB BF16) and the KV cache (llama.cpp F16, where a lossless format would save
   ≈ 11 %, [details](docs/llamacpp/RESULTS.md#kv-cache-compressibility-measured-dropped); vLLM BF16, where an
-  experimental reference codec saves ≈ 25 % on all ten layers up to 200K tokens, [details](docs/RESULTS.md#experimental-bf16-kv-reference)).
+  experimental reference codec saves ≈ 25 % on all ten layers up to 200K tokens, but attention reading it is slower on
+  this GPU, [details](docs/RESULTS.md#experimental-bf16-kv-reference)).
 * More draft tokens do not pay on this board: every extra verified token reads its own 8 experts (≈ 8.3 ms per token
   in vLLM), so llama.cpp gains most with one draft token (+29 %,
   [details](docs/llamacpp/RESULTS.md#speculative-decoding-with-the-mtp-head)) and vLLM with three; a block-diffusion
@@ -285,9 +286,9 @@ what worked, what did not, and by how much.
 ## Roadmap
 
 Short-context decode runs its matrix–vector work at the DRAM limit of its access pattern (≈ 161–170 GB/s), so the
-remaining headroom is at long context and in prefill. Next: a lossless BF16 KV cache (≈ 25 % smaller on all ten
-attention layers up to 200K; the attention kernel reading compressed tiles comes next), then the expert weights decoded straight into tensor-core fragments
-for vLLM's prefill (a standalone prototype runs the down experts 2.4× faster at 2048 tokens). More draft tokens need
+remaining headroom is at long context and in prefill. A lossless BF16 KV cache is ≈ 25 % smaller, but on this GPU
+attention reading it is slower than reading raw BF16, so it is not used. Next: the expert weights decoded straight into
+tensor-core fragments for vLLM's prefill (a standalone prototype runs the down experts 2.4× faster at 2048 tokens). More draft tokens need
 cheaper experts per extra verified token. Expected gains and how each is measured: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License and credits

@@ -8,7 +8,7 @@ hypotheses until measured with alternating A/B runs.
 
 Production runs the vLLM engine (since 10-30; shared-core wheel since 11-01: 41.2 tok/s short decode with MTP 3,
 28.0 @ 68.5K, 23.6 @ 200K, prefill 1439 tok/s at 8k); llama.cpp is the rollback engine. Next, in this order: the
-lossless BF16 KV gate (Stage 2), then the fragment-order down experts in vLLM's prefill (Stage 1).
+fragment-order down experts in vLLM's prefill (Stage 1) and parallel requests on the production server.
 
 ## Ceiling `[core]`
 
@@ -71,12 +71,13 @@ vLLM keeps the KV cache in BF16: 20,480 B per token over the 10 full-attention l
    ([vllm/RESULTS.md](vllm/RESULTS.md#sliding-window-for-the-mtp-draft-layer-2026-11-04-measured-dropped)). Target
    outputs stay unchanged, and attention per draft pass falls to ≈ 0.6 ms at any length. But the draft layer uses
    long-range context: at 72K–197K acceptance falls 12–17 % and decode is 4–8 % slower.
-2. **Lossless BF16 KV (GAAC-style, [arXiv 2610.38210](https://arxiv.org/abs/2610.38210))** (next): BF16 has 8 exponent bits
+2. **Lossless BF16 KV (GAAC-style, [arXiv 2610.38210](https://arxiv.org/abs/2610.38210)) — measured, not adopted for
+   decode:** BF16 has 8 exponent bits
    (F16 has 5, see item 3 below). Per-channel 3-/4-bit exponent windows in groups of 8 keep sign and mantissa as they
    are. On real KV of all ten layers at positions up to 200K: 25.1–25.4 % smaller for English, code and Ukrainian
-   text, every value exact ([RESULTS](RESULTS.md#experimental-bf16-kv-reference)). Next: the attention kernel reading
-   compressed tiles, microbenchmarked on Orin, which decides the gain: ≈ +2.5 % decode at 64K and ≈ +7 % at 200K if
-   reconstruction is free, 0 at short context, ≈ 1.5 GiB at the full window with a compressed-page allocator.
+   text, every value exact ([RESULTS](RESULTS.md#experimental-bf16-kv-reference)). But an attention kernel reading
+   compressed tiles is 1.6–2.1× slower than raw on this GPU (reconstruction is arithmetic-bound), and even free
+   reconstruction would make a 200K decode step only ≈ 2 % faster. Kept as a capacity option (≈ 25 % more tokens).
 
 llama.cpp:
 

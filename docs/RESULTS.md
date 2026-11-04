@@ -71,6 +71,20 @@ here.
 | Ukrainian (Wikipedia) | 25.1 % | 24.5 % | 25.7 % | 25.9 % | 23.9 % | 2.4 % |
 
 Every block round-trips exactly. The weakest layer is K of layer 3 (21–23 %); the fixed 3032-byte slot caps the saving
-at 26.0 %, so most blocks sit at the cap. The saving holds across text types and context positions; what remains
-open is the cost of reconstructing tiles inside the attention kernel on this GPU and the allocator work in vLLM
-([ROADMAP](ROADMAP.md)).
+at 26.0 %, so most blocks sit at the cap. The saving holds across text types and context positions.
+
+**Attention reading compressed KV (2026-11-04, measured, not adopted).** A split-KV decode kernel for one attention
+layer (`bench/micro/kv_gaac_attn.py`) read either raw BF16 or an optimistic coded layout: the sign|mantissa byte plus a
+3-bit exponent code in bit planes and a per-channel base, 70 % of the bytes and the cheapest reconstruction such a
+format can have. A control read the same bytes with no reconstruction. Milliseconds per call for 1 / 4 query tokens:
+
+| Context | vLLM's kernel | raw BF16 | coded | bytes only (free reconstruction) |
+|---|---:|---:|---:|---:|
+| 64K | 0.905 / 0.994 | 0.881 / 0.890 | 1.379 / 1.639 | 0.637 / 0.849 |
+| 200K | 2.446 / 2.736 | 2.419 / 2.429 | 3.937 / 5.160 | 1.712 / 2.297 |
+
+Reconstruction is exact (outputs within 7e-6 of the raw kernel's). On this GPU it is arithmetic-bound: the coded
+kernel is 1.6–2.1× slower than raw. Even free reconstruction helps 4-token verification calls by only 5 %, because
+they are already close to compute-bound, so the whole decode step would gain about 2 % at 200K. Lossless KV
+compression therefore does not pay as a speed measure on the Orin, and reading it in attention costs decode time;
+it remains an option for capacity (about 25 % more tokens in the same cache), not adopted.
