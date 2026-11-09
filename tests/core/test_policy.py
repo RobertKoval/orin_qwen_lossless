@@ -12,7 +12,7 @@ HP, NIB = FMT_HUFPAIR, FMT_NIBBLE
     [
         # Qwen3.6-35B-A3B modules (docs/vllm/README.md)
         ("experts gate / up", 512, 2048, 256, Choice(HP, 8, True)),
-        ("experts down", 2048, 512, 256, Choice(HP, 16, False, False)),  # row-major: FO not chosen (T-023)
+        ("experts down", 2048, 512, 256, Choice(HP, 16, False, True)),  # fragment order (batched prefill kernel)
         ("self_attn.qkv_proj (merged)", 9216, 2048, 1, Choice(HP, 2, False)),  # 576 units of 16 = 2 waves
         ("o_proj / linear_attn.out_proj", 2048, 4096, 1, Choice(HP, 4, False)),
         ("linear_attn.in_proj_qkvz", 12288, 2048, 1, Choice(HP, 8, False)),  # 768 units of 16 = 1.5 waves
@@ -65,7 +65,7 @@ def test_dense_unit_size(rows, K, R):
 )
 def test_expert_unit_size(per, R):
     c = choose(per, 512, 8)
-    assert c == Choice(HP, R, False, False)  # FO is not chosen (T-023: its decode GEMV is slower)
+    assert c == Choice(HP, R, False, R == 16)  # 16-row bands of K = 512 experts: fragment order
     assert per % c.R == 0
 
 
@@ -92,7 +92,16 @@ def test_smallest_and_largest_signed_shapes():
     assert choose((1 << 63) - 1, 4096) == Choice(HP, 1, False)
 
 
-@pytest.mark.parametrize("rows, K, n", [(2048, 512, 256), (2040, 512, 256), (2048, 1024, 256), (16384, 512, 1)])
-def test_frag_order_never_chosen(rows, K, n):
-    # FO's 4-token decode GEMV is 7 % slower than row-major (T-023): the policy keeps row-major everywhere
-    assert choose(rows, K, n).frag_order is False
+@pytest.mark.parametrize(
+    "rows, K, n, frag_order",
+    [
+        (2048, 512, 256, True),    # vLLM down experts
+        (2040, 512, 256, False),   # rows % 16 != 0: R = 8 bands do not exist in fragment order
+        (2048, 1024, 256, False),  # K > 512: chunk-major experts
+        (16384, 512, 1, False),    # dense K = 512 HUFPAIR (R = 16): GEMV only, row-major
+    ],
+)
+def test_frag_order_only_for_k512_experts(rows, K, n, frag_order):
+    c = choose(rows, K, n)
+    assert c.frag_order is frag_order
+    assert not (c.frag_order and c.chunk_major)

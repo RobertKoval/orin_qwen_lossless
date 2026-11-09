@@ -522,3 +522,34 @@ Production wheel `0.1.0+ge2e458f10ab4` against the 11-01 release, same launcher 
   different continuation.
 * **Vision.** The FA2 library that runs the ViT attention on this host is a rebuilt one; at the ViT's shapes (16 heads
   × 72, BF16, 1K–16K tokens) its outputs are bitwise equal to the stock wheel's library.
+
+## 2026-11-09 second release: fragment-order down experts, multi-token split-KV attention (measured)
+
+Production wheel `0.1.0+g3ba0773d302e` against the morning's `0.1.0+ge2e458f10ab4`, same launcher configuration and
+the same long-context haystack and prompt salt:
+
+* **Fragment-order down experts.** The decode GEMV over the fragment-order layout lost 7–10 % to row-major because
+  each band start waited on dependent DRAM round trips: the lane's stream position (unit base + lane offset), then its
+  first stream words (ncu at 4 tokens: 21 % of the stall samples). It now loads the next band's position during the
+  current band and prefetches its first stream line into L1 halfway through; per layer at 4 tokens × 8 experts
+  328 → 290 µs (row-major 298), at 2 tokens 168 → 150 µs (152), outputs bitwise unchanged. Tried and dropped: an L2
+  prefetch of the plane (slower: L2 pressure), a block-queued lane stream (slower: the warp-wide scoreboard waits on
+  the newest load of any lane), the same pipelining on the row-major GEMV (1 token slower). The policy encodes vLLM's
+  down experts in fragment order again, so the batched prefill kernel multiplies them straight on the tensor cores.
+* **Multi-token split-KV attention.** vLLM's split-KV kernel gives a program 2 query tokens (16 rows at 8 query heads
+  per KV head) and 16 context segments. `triton_spec` now gives a multi-token batch one program per sequence
+  (`BLOCK_Q` = next power of two of the query length) and every split-KV launch 32 segments. One attention layer at
+  200K (`bench/micro/spec_attn_blockq.py`): 4 tokens 2.77 → 2.49 ms, 1 token 2.49 → 2.45 ms; at 65K 1.01 → 0.96 ms.
+  The larger block alone at 16 segments is 13–35 % slower (32 programs on 16 SMs). Outputs move only by the order of
+  the FP32 segment combine (≤ 3.1e-5).
+* **Prefill** (`bench_prefill.py`, warm server, median of 3): 8K 1516 → **1762** tok/s, 23K 1488 → **1696**. Long
+  context: 72K 1156 → **1283**, 197K 840 → **892**.
+* **Decode**: **41.5** tok/s without logprobs (41.4), 41.1 with (40.6). Long context: 31.8 tok/s at 72K (draft
+  acceptance 0.59), 28.9 at 197K (0.68). Draft acceptance follows the generated text, and any change of FP32 summation
+  order changes greedy continuations at near ties, so the step time is the comparable figure: tok/s ÷ (1 + 3 ×
+  acceptance) gives 90.0 → 87.4 ms per step at 72K and 109.2 → 104.7 ms at 197K.
+* **Outputs.** Greedy continuations against the morning release (`bench_openai.py` with logprobs): one of four prompts
+  is identical over 256 tokens; the others diverge at near ties (top-2 margin 0–0.375 nats) after top-1 logprob
+  drift of at most 0.19 nats (one BF16 ulp of the logit). Both layouts multiply the exact BF16 weights and accumulate
+  in FP32 (kernel tests: within 1e-5 of Σ|w x| against FP64, 2–3e-7 of it between the two layouts).
+* `tests/serving/state_checks.py` passes on a fresh start; the 72K and 197K needles are found.

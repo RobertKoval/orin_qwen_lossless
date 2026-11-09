@@ -54,10 +54,10 @@ std::optional<policy_choice> choose(int64_t rows, int64_t K, int64_t n_matrices,
     const int R = n_matrices > 1
         ? (rows % 16 == 0 && rows >= 2048 ? 16 : rows % 8 == 0 ? 8 : rows % 4 == 0 ? 4 : 1)
         : dense_R(rows, opts.engine);
-    // Fragment order (FLAG_FRAG_ORDER) halves vLLM's batched prefill down kernel, but its 4-token decode GEMV is 7 %
-    // slower than row-major (T-023, -1.4 % decode): not chosen until that gap is closed. encode(..., frag_order) and
-    // every FO kernel stay available and tested.
-    return policy_choice{FMT_HUFPAIR, R, n_matrices > 1 && K > CHUNK, false};
+    // vLLM's K = 512 experts (down) in fragment order: the batched prefill kernel decodes straight into mma operands
+    // (T-023: down 2048 tokens 9.95 -> 4.34 ms per layer) and the FO decode GEMV is no slower than row-major
+    const bool fo = opts.engine == policy_engine::vllm && n_matrices > 1 && K == CHUNK && R == 16;
+    return policy_choice{FMT_HUFPAIR, R, n_matrices > 1 && K > CHUNK, fo};
 }
 
 } // namespace bf16n

@@ -473,9 +473,12 @@ __device__ __forceinline__ uint64_t shl64w(uint64_t b, uint32_t n) { // {hi:lo} 
 }
 
 // per-warp decoder state for one unit (bit buffer MSB-first; v = valid bits, exact in its low 7 bits)
-#define HP_UNIT_BEGIN(W, GU)                                                                         \
+#define HP_UNIT_BEGIN(W, GU) HP_UNIT_BEGIN_AT(W, __ldg((W).ubase + (GU)) + __ldg((W).lrel + (GU) * 32 + lane))
+
+// HP_UNIT_BEGIN at a lane stream position already known (IDX = ubase[unit] + lrel[unit * 32 + lane])
+#define HP_UNIT_BEGIN_AT(W, IDX)                                                                     \
     const uint32_t * lst = (W).stream;                                                               \
-    uint32_t idx = __ldg((W).ubase + (GU)) + __ldg((W).lrel + (GU) * 32 + lane);                      \
+    uint32_t idx = (IDX);                                                                            \
     uint64_t buf = (uint64_t) __ldg(lst + idx) << 32;                                                \
     uint32_t wq[HP_PF];                                                                              \
     _Pragma("unroll") for (int i_ = 0; i_ < HP_PF; i_++) { wq[i_] = __ldg(lst + idx + 1 + i_); }    \
@@ -1556,11 +1559,16 @@ __device__ __forceinline__ uint32_t fo_split(float v, int n) {
 constexpr int FO_MMV_XB = FO_K / 32 * 3 * 4; // uint4 B-register entries of one column: tile pair, split, t
 inline size_t fo_mmv_shm() { return FO_MMV_XB * 16 + (4u << HP_LP); }
 
+__device__ __forceinline__ void prefetch_l1(const void * p) { asm volatile("prefetch.global.L1 [%0];" :: "l"(p)); }
+
 // GEMV on the tensor cores (one column per blockIdx.y, expert ids as in k_hp_mmv): a warp takes a band and multiplies
 // its A fragments with a B operand whose columns 0, 1, 2 are the hi, mid and lo parts of the column's FP32 activations
 // (fo_split; staged once per block in B-register order, lanes g >= 3 supply zero columns). Products are exact, sums
 // FP32 on the tensor cores; y = D[:, 0] + (D[:, 1] + D[:, 2]). Against the FMA form this drops the per-weight unpack
-// and FMA instructions: two mma per tile pair.
+// and FMA instructions: two mma per tile pair. With so little work between loads a band start is exposed: its stream
+// position (ubase, lrel), then its first stream words, are dependent DRAM round trips (21 % of the stall samples, ncu
+// T=4). The next band's position is therefore loaded at the start of the current one and its first stream line
+// prefetched into L1 halfway through (T-023: 4 tokens 328 -> 290 us per layer, row-major 298; 1 token 64 -> 62).
 template <typename TX>
 __global__ void __launch_bounds__(HP_NT) k_fo_mmv(const hp_ptrs w, cols_t p) {
     constexpr int K = FO_K, NP = K / 32, PF = 2; // tile pairs per band, plane words in flight
@@ -1584,9 +1592,20 @@ __global__ void __launch_bounds__(HP_NT) k_fo_mmv(const hp_ptrs w, cols_t p) {
     for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += blockDim.x) { ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i); }
     __syncthreads();
     const uint4 * xl = xb + 4 * g + t;
-    for (int64_t u = blockIdx.x * wpb + warp; u < p.nrows / 16; u += gridDim.x * wpb) {
+    const int64_t u0 = blockIdx.x * wpb + warp, ustep = (int64_t) gridDim.x * wpb, bands = p.nrows / 16;
+    uint32_t s_next = 0; // this lane's stream position in its warp's next band
+    if (u0 < bands) {
+        s_next = __ldg(w.ubase + rbase / 16 + u0) + __ldg(w.lrel + (rbase / 16 + u0) * 32 + lane);
+    }
+    for (int64_t u = u0; u < bands; u += ustep) {
         const int64_t gu = rbase / 16 + u;
-        HP_UNIT_BEGIN(w, gu)
+        const bool has_next = u + ustep < bands;
+        uint32_t ub_n = 0, lr_n = 0;
+        if (has_next) {
+            ub_n = __ldg(w.ubase + gu + ustep);
+            lr_n = __ldg(w.lrel + (gu + ustep) * 32 + lane);
+        }
+        HP_UNIT_BEGIN_AT(w, s_next)
         const uint4 * pp = (const uint4 *) (w.sm + gu * 16 * K) + lane;
         uint4 ring[PF];
 #pragma unroll
@@ -1594,6 +1613,10 @@ __global__ void __launch_bounds__(HP_NT) k_fo_mmv(const hp_ptrs w, cols_t p) {
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int q = 0; q < NP; q++) {
+            if (q == NP / 2 && has_next) {
+                s_next = ub_n + lr_n;
+                prefetch_l1(lst + s_next);
+            }
             const uint4 pl = ring[q % PF];
             if (q + PF < NP) { ring[q % PF] = ld_plane(pp + (q + PF) * 32); }
             uint32_t ex[8], a[8];

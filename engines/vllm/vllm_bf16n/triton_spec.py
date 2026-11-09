@@ -9,6 +9,13 @@ graphs, no host-side planning, no GPU->CPU syncs), FlashInfer's paged prefill ke
    handled by softmax_step, and reduce_segments runs per query token. Batches of up to SPEC_MAX_Q query tokens per
    sequence now use it when the token count fits the preallocated segment buffers (rows = tokens). The choice depends
    only on shapes, so captured CUDA graphs replay the path they captured. (BF16N_TRITON_3D=0 disables.)
+   vLLM sizes a program's query block from the heads alone (BLOCK_M = 16 rows = 2 tokens at 8 query heads per KV
+   head), so a 4-token verification ran two programs per KV head and segment over the same K/V tiles. For these
+   batches the launch takes BLOCK_Q = next_pow2(max query length) tokens per program (BLOCK_M = 32 for MTP 3), and
+   every 3D launch splits the context into 32 segments instead of 16 (NUM_PAR_SOFTMAX_SEGMENTS, which sizes the
+   builders' partial-softmax buffers): with BLOCK_Q alone 16 segments leave 32 programs on 16 SMs and the call is
+   slower. T-063, bench/micro/spec_attn_blockq.py, one layer: 4 tokens at 200K 2.77 -> 2.49 ms, at 65K 1.01 -> 0.96;
+   1 token at 200K 2.49 -> 2.45. Outputs move within an FP32 reordering of the segment combine (<= 3.1e-5).
 
 2. Prefill chunks (more than SPEC_MAX_Q query tokens) through FlashInfer's BatchPrefillWithPagedKVCacheWrapper on the
    same KV cache: both backends use the [num_blocks, 2, block_size, kv_heads, head_dim] (NHD) layout, and the KV of
@@ -22,11 +29,37 @@ from __future__ import annotations
 import os
 
 import torch
+import triton
 
 SPEC_MAX_Q = 8
+SOFTMAX_SEGMENTS = 32
 FI_WORKSPACE_BYTES = 128 << 20
 _installed = False
 _workspaces: dict = {}
+
+
+class _SpecBlockQ:
+    """kernel_unified_attention with BLOCK_Q tokens per program while `block_q` is set (a spec-decode 3D launch):
+    BLOCK_M = BLOCK_Q * queries per KV head, and the grid's q-block count recomputed as unified_attention does."""
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.block_q = 0
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+        if not self.block_q:
+            return launch
+        bq = self.block_q
+
+        def run(**kw):
+            kw["BLOCK_Q"], kw["BLOCK_M"] = bq, bq * kw["num_queries_per_kv"]
+            return self.kernel[(kw["query_ptr"].shape[0] // bq + kw["num_seqs"], *grid[1:])](**kw)
+
+        return run
+
+    def __getattr__(self, name):
+        return getattr(self.kernel, name)
 
 
 def install() -> None:
@@ -34,16 +67,25 @@ def install() -> None:
     if _installed:
         return
     from vllm.v1.attention.backends import triton_attn
+    from vllm.v1.attention.ops import triton_unified_attention as tua
 
     if os.environ.get("BF16N_TRITON_3D", "1") != "0":
+        triton_attn.NUM_PAR_SOFTMAX_SEGMENTS = SOFTMAX_SEGMENTS  # read when the metadata builders are created
         orig_ua = triton_attn.unified_attention
+        spec_kernel = _SpecBlockQ(tua.kernel_unified_attention)
+        tua.kernel_unified_attention = spec_kernel
 
         def unified_attention(**kw):
             mq, segm, thr = kw["max_seqlen_q"], kw.get("softmax_segm_output"), kw.get("seq_threshold_3D")
-            if (1 < mq <= SPEC_MAX_Q and segm is not None and thr is not None
+            if not (1 < mq <= SPEC_MAX_Q and segm is not None and thr is not None
                     and kw["q"].shape[0] <= segm.shape[0] and kw["seqused_k"].shape[0] <= thr):
-                kw["max_seqlen_q"] = 1  # only selects the 3D launch; the kernel reads query lengths from cu_seqlens_q
-            return orig_ua(**kw)
+                return orig_ua(**kw)
+            kw["max_seqlen_q"] = 1  # only selects the 3D launch; the kernel reads query lengths from cu_seqlens_q
+            spec_kernel.block_q = triton.next_power_of_2(mq)
+            try:
+                return orig_ua(**kw)
+            finally:
+                spec_kernel.block_q = 0
 
         triton_attn.unified_attention = unified_attention
 

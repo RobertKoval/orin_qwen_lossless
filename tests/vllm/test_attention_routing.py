@@ -64,11 +64,11 @@ def triton_attn():
     return triton_attn
 
 
-def run_triton(triton_attn, q, cache, bt, seq_lens, q_lens):
+def run_triton(triton_attn, q, cache, bt, seq_lens, q_lens, segs=16):
     n_tok = q.shape[0]
     cu = torch.tensor([0] + list(torch.tensor(q_lens).cumsum(0)), dtype=torch.int32, device="cuda")
     out = torch.empty_like(q)
-    rows, segs = 64, 16
+    rows = 64
     segm_max = torch.full((rows, HQ, segs), float("nan"), device="cuda")
     k, v = cache.unbind(1)
     triton_attn.unified_attention(
@@ -83,23 +83,27 @@ def run_triton(triton_attn, q, cache, bt, seq_lens, q_lens):
     return out[:n_tok], used_split_kv
 
 
-# 1 query (stock 3D), 2..8 (patched: 3D), 9 (above SPEC_MAX_Q: stock 2D); contexts: short, a few keys past a segment
-# boundary of the decode tile layout, and long
+# 1 query (stock 3D), 2..8 (patched: 3D, BLOCK_Q = next_pow2(L) tokens per program above 2), 9 (above SPEC_MAX_Q:
+# stock 2D); contexts: short, a few keys past a segment boundary of the decode tile layout (16 keys per tile; 2 keys
+# past one at 32 segments), and long; vLLM's 16 segments and the production count (triton_spec.SOFTMAX_SEGMENTS)
+@pytest.mark.parametrize("segs", [16, 32])
 @pytest.mark.parametrize("L", [1, 2, 4, 8, 9])
 @pytest.mark.parametrize("s", [9, 1043, 16 * 32 * 3 + 2, 20000])
-def test_triton_multi_token_decode_matches_reference(triton_attn, L, s):
+def test_triton_multi_token_decode_matches_reference(triton_attn, L, s, segs):
     s = max(s, L)
     cache, bt, dense = paged([s], 1072, seed=L * 7 + s)
     q = torch.randn(L, HQ, D, generator=torch.Generator().manual_seed(s)).to(torch.bfloat16).cuda()
-    out, split = run_triton(triton_attn, q, cache, bt, [s], [L])
+    out, split = run_triton(triton_attn, q, cache, bt, [s], [L], segs)
     check(out, reference(q, dense, [L]))
     assert split == (L <= 8)  # split-KV up to SPEC_MAX_Q query tokens, the stock 2D kernel above
 
 
-def test_triton_two_sequences_mixed_query_lengths(triton_attn):
+@pytest.mark.parametrize("segs", [16, 32])
+def test_triton_two_sequences_mixed_query_lengths(triton_attn, segs):
+    # BLOCK_Q = 4 for the batch: the 2-token sequence fills half of its program's query rows
     cache, bt, dense = paged([3000, 517], 1072, seed=3)
     q = torch.randn(6, HQ, D, generator=torch.Generator().manual_seed(4)).to(torch.bfloat16).cuda()
-    out, split = run_triton(triton_attn, q, cache, bt, [3000, 517], [4, 2])
+    out, split = run_triton(triton_attn, q, cache, bt, [3000, 517], [4, 2], segs)
     check(out, reference(q, dense, [4, 2]))
     assert split
 

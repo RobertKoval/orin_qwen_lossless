@@ -6,9 +6,9 @@ encoder, kernels in `core/`, used by both engines), `[llamacpp]`, `[vllm]`. Numb
 [vllm/RESULTS.md](vllm/RESULTS.md), M6); "gain" estimates come from the measurements in [RESULTS.md](llamacpp/RESULTS.md) and are
 hypotheses until measured with alternating A/B runs.
 
-Production runs the vLLM engine (since 10-30; shared-core wheel since 11-01: 41.2 tok/s short decode with MTP 3,
-28.0 @ 68.5K, 23.6 @ 200K, prefill 1439 tok/s at 8k); llama.cpp is the rollback engine. Next, in this order: the
-fragment-order down experts in vLLM's prefill (Stage 1) and parallel requests on the production server.
+Production runs the vLLM engine (since 10-30; release of 2026-11-09: 41.5 tok/s short decode with MTP 3, 31.8 @ 72K,
+28.9 @ 197K, prefill 1762 tok/s at 8k); llama.cpp is the rollback engine. The fragment-order down experts in vLLM's
+prefill (Stage 1) are done; next: parallel requests on the production server.
 
 ## Ceiling `[core]`
 
@@ -44,12 +44,10 @@ matrices, 6 % in the gated delta net, 4.3 % in F32→BF16 conversions, 3.3 % in 
 1. **MoE kernel** (≈ 50 %): latency-bound, not compute-bound. A fragment-order layout of the expert tensors (each lane
    decodes exactly its `mma` A-fragment elements and multiplies them at once, activations staged once per block) is
    prototyped ([RESULTS.md](llamacpp/RESULTS.md#prefill-fragment-order-expert-layout-prototype)): down 9.48 → 3.96 ms per layer
-   at 2048 tokens, 4.84 → 3.00 ms at 512; gate/up (K = 2048) not better yet. **Next step: the fragment order for the
-   down experts in `core/`, for vLLM's prefill** (the production engine): chunks of ≥ 4096 tokens there dequantise
-   every expert to BF16 (≈ 17 ms per layer per chunk, about a quarter of prefill time) and run Triton's
-   `fused_experts`; smaller chunks use the batched BF16N kernel. First a per-layer nsys breakdown of vLLM's prefill,
-   then encoder, kernel and A/B. Estimate ≈ +5–10 % prefill on long prompts, more at 1–4K tokens (llama.cpp's own
-   estimate was +13–16 % for ≈ −0.4 % decode).
+   at 2048 tokens, 4.84 → 3.00 ms at 512; gate/up (K = 2048) not better yet. **Done for the down experts in vLLM
+   (2026-11-09):** every MoE prefill chunk runs the batched BF16N kernels and the down experts are encoded in fragment
+   order (down 9.95 → 4.34 ms per layer at 2048 tokens; prefill 8K 1439 → 1762 tok/s, 23K 1367 → 1696, 197K → 892);
+   the fragment-order decode GEMV is no slower than row-major (4 tokens 290 vs 298 µs per layer). Open: gate/up.
 2. **Conversions** (≈ 4 %, at bandwidth): every BF16N matmul converts its F32 input again (≈ 300 conversions per
    forward for ≈ 80 distinct tensors). Converting each tensor once is worth ≈ 2 % and needs a BF16 buffer that lives
    across ops and stays valid under CUDA graph replay.

@@ -89,9 +89,11 @@ identical to llama.cpp for llama.cpp's shapes).
   `init`.
 * Dispatch thresholds are llama.cpp's: ≤ 8 tokens → GEMV kernels; more → batched kernels. Every MoE prefill chunk runs
   the batched BF16N kernels (`moe_mm_ids`: gate/up with fused GLU, then down), with no BF16 workspace (T-023: +7–10 %
-  prefill over the former dequant + Triton `fused_experts` path for chunks of ≥ 4096 tokens). The fragment-order
-  layout for down experts (`FLAG_FRAG_ORDER`, halves the batched down kernel) exists and is tested, but the policy does
-  not choose it while its 4-token decode GEMV is slower than row-major.
+  prefill over the former dequant + Triton `fused_experts` path for chunks of ≥ 4096 tokens). Down experts are encoded
+  in fragment order (`FLAG_FRAG_ORDER`): each lane's stream and plane bytes are its `mma` A-fragment elements, so the
+  batched kernel multiplies them straight on the tensor cores (2048 tokens: 9.95 → 4.34 ms per layer), and the
+  tensor-core decode GEMV loads the next band's stream position ahead of the current band (4 tokens: 290 µs per layer,
+  row-major 298).
 * CUDA-graph safety: no `cudaMalloc` (workspaces from the caching allocator), no host sync, no `getenv` in hot paths,
   kernel attributes set once in `init()` before capture.
 * Compile cache: BF16N metadata are baked into compiled graphs and vLLM's cache key does not see them, so launchers
@@ -101,7 +103,10 @@ identical to llama.cpp for llama.cpp's shapes).
 ### Serving path (M6)
 
 * Attention `TRITON_ATTN` with routing (`triton_spec.py`): MTP verification and the first draft step use Triton's
-  split-KV kernel, prefill chunks run FlashInfer's paged prefill on the same KV cache.
+  split-KV kernel, prefill chunks run FlashInfer's paged prefill on the same KV cache. Split-KV launches use 32
+  context segments (vLLM: 16), and a multi-token batch puts all query tokens of a sequence into one program
+  (`BLOCK_Q` = next power of two of the query length; vLLM's block holds 2 tokens at 8 query heads per KV head):
+  one 4-token verification at 200K 2.77 → 2.49 ms per layer (`bench/micro/spec_attn_blockq.py`).
 * Align-mode prefix caching with asynchronous accepted-token bookkeeping (`async_align.py`).
 * GDN state correctness on vLLM 0.20 (`hybrid_state.py`, T-066), three upstream defects that made the target read a
   recurrent state not its own: a prefill of exactly 1 + 3 tokens was dispatched to the FULL spec-decode CUDA graph
