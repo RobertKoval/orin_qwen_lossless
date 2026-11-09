@@ -108,7 +108,7 @@ def test_triton_two_sequences_mixed_query_lengths(triton_attn, segs):
     assert split
 
 
-@pytest.mark.parametrize("seq_lens, q_lens", [([1072], [1072]), ([5000], [4288]), ([2500, 1073], [300, 9])])
+@pytest.mark.parametrize("seq_lens, q_lens", [([1072], [1072]), ([5000], [4288]), ([7000], [6432]), ([2500, 1073], [300, 9])])
 def test_fi_prefill_plan_matches_reference(seq_lens, q_lens):
     """Prefill chunks (with and without a cached prefix, a partial last page, two requests) through fi_plan + run."""
     from flashinfer import BatchPrefillWithPagedKVCacheWrapper

@@ -571,3 +571,23 @@ Production wheel `0.1.0+g4540db4b8cab` against `0.1.0+g3ba0773d302e`:
 * **Production**: decode **42.1** tok/s without logprobs (41.5), 41.6 with (41.1), at identical acceptance; 72K 32.2
   (31.8), 197K 29.5 (28.9) at identical acceptance (0.593 / 0.677), i.e. step 87.4 → 86.4 ms and 104.7 → 102.9 ms;
   prefill unchanged (8K 1766, 23K 1707). `BF16N_DRAFT_HEAD=int4` selects the earlier head, `full` the exact one.
+
+## 2026-11-09 fourth release: 6432-token prefill chunks (measured)
+
+Production wheel `0.1.0+geb8b3e5c7006` against `0.1.0+g4540db4b8cab`; only the launcher default changed
+(`--max-num-batched-tokens` 4288 → 6432, 4 → 6 blocks of 1072).
+
+* **Chunk size** (`:8010`, fresh starts, T-064 / T-074): 2144 / 4288 / 6432 gave 8K 1649 / 1775 / 1904 tok/s, 23K 1521 /
+  1717 / 1749, 72K 1158 / 1288 / 1281; 197K 817 → 823 and 246K 715 → 724 for 4288 → 6432. The KV pool is fixed by
+  `--kv-cache-memory-bytes` (70,752 tokens in every case), so a smaller chunk frees no window. The 72K schedule is
+  16 × 4288 + 2144 + 1249 with 4288 and 11 × 6432 + 1249 with 6432.
+* **Memory at the full window** (MemFree + Cached, 4288 → 6432): lowest during start-up 2.83 → 3.11 GiB, after a 4K
+  image 3.94 → 4.05, after a 246K request 3.16 → **2.44**, idle after all 3.14 → 2.70; prompt logprobs over 237,586
+  tokens: lowest 2.51 GiB (395 s, M7: 456 s). Above the 2 GiB budget, ≈ 0.7 GiB below 4288 after the longest request.
+* **Production**: prefill 8K **1903** tok/s (1766), 23K **1744** (1707), 72K 1269 (1284), 197K 895 (885); decode 42.3
+  without logprobs (42.1), 41.9 with (41.6) at identical acceptance; long-context step 85.0 ms at 72K (86.4) and
+  103.6 ms at 197K (102.9). Raw long-context decode (31.9 / 27.1 tok/s) follows the acceptance of the changed
+  continuation (0.57 / 0.60 instead of 0.59 / 0.68): the chunk boundaries change the prompt's arithmetic.
+* **First request after a start** (T-071, py-spy): the first long prefill pays a one-time ≈ 1–3 s for lazy CUDA module
+  loading — FlashInfer's paged prefill kernels (1.4 s), torch's elementwise / reduction kernels of the accepted-count
+  update (1.6 s), the inductor prefill graph's first call (1.1 s), partly overlapped with the GPU work.

@@ -156,7 +156,7 @@ variables cannot leak in):
 | `VBF16N_MTP` | 3 | MTP draft tokens, 0 = off |
 | `VBF16N_VISION` | 1 | vision tower on (BF16) |
 | `VBF16N_MAX_PIXELS` | 4194304 | longest-edge pixel budget per image |
-| `VBF16N_BATCH` | 4288 | `--max-num-batched-tokens` |
+| `VBF16N_BATCH` | 6432 | `--max-num-batched-tokens` (6 blocks of 1072) |
 | `VBF16N_ATTN` | TRITON_ATTN | attention backend |
 | `VBF16N_PREFIX_CACHE` | 1 | 0 = no prefix caching (GDN cache mode `none`) |
 | `VBF16N_UTIL` | 0.55 | `--gpu-memory-utilization` (only satisfies vLLM's start check on unified memory) |

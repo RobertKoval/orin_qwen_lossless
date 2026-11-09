@@ -29,8 +29,8 @@ One implementation of the format and kernels (`core/`) runs in two engines: **ll
   flip (see [Limitations](#limitations)).
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671): the model's full 262,144-token window
   and its vision encoder fit beside the weights.
-* **Fast.** ≈ 31 tok/s single-stream decode, 42.1 with the checkpoint's own multi-token-prediction layer as a
-  speculative draft (vLLM; 40.2 in llama.cpp), 830–1760 tok/s prefill on a 60 W board. Per matrix, the fused decode+GEMV beats raw BF16: the
+* **Fast.** ≈ 31 tok/s single-stream decode, 42.3 with the checkpoint's own multi-token-prediction layer as a
+  speculative draft (vLLM; 40.2 in llama.cpp), 830–1900 tok/s prefill on a 60 W board. Per matrix, the fused decode+GEMV beats raw BF16: the
   248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **Two engines, one format.** llama.cpp: an ordinary BF16 GGUF and `LLAMA_BF16N=hybrid`; vLLM: the original
   safetensors and `--quantization bf16n`. Both serve the OpenAI-compatible API with text, images, tools and reasoning.
@@ -53,10 +53,10 @@ Both engines with BF16N on the same board (MAXN, pinned clocks). Decode is singl
 |---|---|---|
 | weights resident | 46.5 GB (0.671), 472/472 tensors bit-exact at load | 43.5 GiB text model + 1.0 MTP layer (+ 0.9 BF16 vision), every tensor bit-exact at load |
 | decode, no draft, same client | 28.6 | 32.7 (FlashInfer, M2); 31.1 in the M6 configuration |
-| decode with the MTP draft, same client | 35.5 (1 draft token) | 41.6 (3 draft tokens); **42.1** without logprobs |
+| decode with the MTP draft, same client | 35.5 (1 draft token) | 41.9 (3 draft tokens); **42.3** without logprobs |
 | decode, `llama-bench` tg64 / `llama-server` MTP (4 × 400 tokens) | 31.2 / 40.2 | — |
-| prefill 8k / 23k tokens | 832–1481 (`llama-bench`, ub 512–4096) / 1192 (server) | 1762 / 1696 (production config) |
-| long-context decode (MTP) | 27.1 @ 64K, 22.6 @ 224K | 32.2 @ 72K, 29.5 @ 197K (11-09 haystack); 21.7 @ 248K (11-01) |
+| prefill 8k / 23k tokens | 832–1481 (`llama-bench`, ub 512–4096) / 1192 (server) | 1903 / 1744 (production config) |
+| long-context decode (MTP) | 27.1 @ 64K, 22.6 @ 224K | 31.9 @ 72K, 27.1 @ 197K, 23.3 @ 246K (11-09 haystack) |
 | full 262,144 window + images | yes | yes (images capped at 4.19 MP) |
 | uncompressed BF16, either engine | does not fit: 64.6 GiB > 61.4 GiB | same |
 
@@ -153,12 +153,12 @@ Correctness, methodology and the full history of what was tried: [docs/llamacpp/
 ## vLLM results
 
 Production on the board runs vLLM-BF16N with the shared core (since 2026-11-01): 262,144-token window, vision, MTP
-with 3 draft tokens, prefix caching, tool and reasoning parsers. Short-context decode **42.1 tok/s** (41.6 with
-logprobs), 32.2 tok/s at 72K and 29.5 at 197K (step 86.4 / 102.9 ms; draft acceptance varies with the text); prefill
-1762 tok/s at 8K, 1696 at 23K, 1283 at 72K, 892 at 197K (releases of 2026-11-09: batched BF16N kernels for every MoE
+with 3 draft tokens, prefix caching, tool and reasoning parsers. Short-context decode **42.3 tok/s** (41.9 with
+logprobs), 31.9 tok/s at 72K and 27.1 at 197K (step 85.0 / 103.6 ms; draft acceptance varies with the text); prefill
+1903 tok/s at 8K, 1744 at 23K, 1269 at 72K, 895 at 197K in 6432-token chunks (releases of 2026-11-09: batched BF16N kernels for every MoE
 prefill chunk with the down experts in tensor-core fragment order, one split-KV program per multi-token sequence, a
 2-bit draft-only candidate head, GDN state fixes; target sampling unmodified);
-≥ 2.7 GiB free at the full window after a 4K image and a 248K request. Against llama.cpp-BF16N on identical prompts
+≥ 2.4 GiB free at the full window after a 4K image and a 246K request. Against llama.cpp-BF16N on identical prompts
 and its own tokens: top-1 agreement 99.5 %, mean KL ≈ 2e-3.
 The milestones, the step analysis and what did not help: [docs/vllm/RESULTS.md](docs/vllm/RESULTS.md); design and
 settings: [docs/vllm/README.md](docs/vllm/README.md).
@@ -198,7 +198,7 @@ TORCH_CUDA_ARCH_LIST=8.7 MAX_JOBS=4 pip install . --no-build-isolation --no-deps
 export BF16N_CUDA_SCHED=yield VLLM_WORKER_MULTIPROC_METHOD=spawn
 python3 -m vllm.entrypoints.openai.api_server --model /path/to/Qwen3.6-35B-A3B \
   --quantization bf16n --dtype bfloat16 --kv-cache-dtype auto --attention-backend TRITON_ATTN \
-  --max-model-len 262144 --max-num-seqs 1 --max-num-batched-tokens 4288 --enable-chunked-prefill \
+  --max-model-len 262144 --max-num-seqs 1 --max-num-batched-tokens 6432 --enable-chunked-prefill \
   --kv-cache-memory-bytes 6442450944 --gpu-memory-utilization 0.55 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --enable-prefix-caching --mamba-cache-mode align --mamba-block-size 8 \
