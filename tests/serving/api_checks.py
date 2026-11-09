@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """M5 API checks against the production launcher: API key enforcement, /health without key, tool calling
-(qwen3_coder parser), reasoning parser (reasoning_content split), and the MTP loop breaker on a prompt that invites an
-exact repetition loop.   m5_api_checks.py <port>   (API_KEY env = the server's key)"""
+(qwen3_coder parser), reasoning parser (reasoning_content split), and a prompt that asks for exact repetition (target
+sampling is unmodified: the requested lines run until max_tokens).   m5_api_checks.py <port>   (API_KEY env = the server's key)"""
 import json, os, sys, urllib.error, urllib.request
 
 port, key = sys.argv[1], os.environ.get("API_KEY", "")
@@ -43,4 +43,4 @@ st, r = chat([{"role": "user", "content": "Write the exact line 'the cat sat on 
              chat_template_kwargs={"enable_thinking": False})
 text = r["choices"][0]["message"]["content"]
 lines = [l for l in text.splitlines() if l.strip()]
-print("loop prompt:", st, "lines", len(lines), "distinct", len(set(lines)), "| tail:", repr(text[-160:]))
+print("repetition prompt:", st, "lines", len(lines), "distinct", len(set(lines)), "| tail:", repr(text[-160:]))

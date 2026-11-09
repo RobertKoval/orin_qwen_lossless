@@ -38,8 +38,8 @@ def bits(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.int16)
 
 
-def encode_upload(ops, w: torch.Tensor, fmt: int, R: int = 0, cm: bool = False):
-    plane, aux, meta = ops.encode(w, fmt, R, cm)
+def encode_upload(ops, w: torch.Tensor, fmt: int, R: int = 0, cm: bool = False, fo: bool = False):
+    plane, aux, meta = ops.encode(w, fmt, R, cm, fo)
     return ops.upload(plane, aux, meta, "cuda")
 
 

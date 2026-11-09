@@ -30,7 +30,7 @@ setup(
     license="MIT",
     package_dir={"": "engines/vllm"},
     packages=find_packages(where="engines/vllm", include=["vllm_bf16n", "vllm_bf16n.*"]),
-    package_data={"vllm_bf16n": ["_keysrc/*", "configs/fused_moe/*.json"]},
+    package_data={"vllm_bf16n": ["_keysrc/*"]},
     python_requires=">=3.10",
     ext_modules=[
         CUDAExtension(

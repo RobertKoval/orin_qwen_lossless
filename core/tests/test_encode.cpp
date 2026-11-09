@@ -50,8 +50,28 @@ struct bits {
     void skip(int k) { n -= k; acc &= n ? ((1ull << n) - 1) : 0; }
 };
 
-// sign|mantissa byte of the plane for weight (r, col), honouring a chunk-major unit layout
-uint8_t sm_at(const encoded & e, int64_t K, int64_t r, int64_t col, bool cm) {
+// fragment order (format.h): register a_q of lane l in a 16x16 tile holds row l / 4 + 8 (q & 1), columns
+// c, c + 1 with c = 2 (l % 4) + 8 (q / 2)
+void fo_rc(int l, int q, int & r, int & c) {
+    r = l / 4 + 8 * (q & 1);
+    c = 2 * (l % 4) + 8 * (q / 2);
+}
+
+// sign|mantissa byte of the plane for weight (r, col), honouring a chunk-major or fragment-order unit layout
+uint8_t sm_at(const encoded & e, int64_t K, int64_t r, int64_t col, bool cm, bool fo) {
+    if (fo) { // band r / 16, tile pair col / 32: 16 bytes per lane (tile 2p, then 2p + 1; a0..a3, lower column first)
+        const int64_t p = col / 32, kk = (col / 16) % 2, rr = r % 16, cc = col % 16;
+        for (int l = 0; l < 32; l++) {
+            for (int q = 0; q < 4; q++) {
+                int rq, cq;
+                fo_rc(l, q, rq, cq);
+                if (rq == rr && (cc == cq || cc == cq + 1)) {
+                    return e.plane[(r / 16) * 16 * K + p * 512 + 16 * l + 8 * kk + 2 * q + (cc - cq)];
+                }
+            }
+        }
+        return 0; // unreachable: every (row, column) of a tile belongs to one lane and register
+    }
     const int64_t c = col / CHUNK, p = col % CHUNK;
     const int j = (int) (p / 128), l = (int) ((p % 128) / 4), t = (int) (p % 4);
     const int64_t in_chunk = 16 * l + 4 * j + t; // inverse of pos_of
@@ -68,7 +88,7 @@ std::vector<uint16_t> decode(const encoded & e, int64_t rows, int64_t K) {
     const aux_header h = at<aux_header>(e.aux, 0);
     std::vector<int> ex(rows * K, -1);
     const int64_t C = K / CHUNK;
-    const bool cm = h.flags & FLAG_CHUNK_MAJOR;
+    const bool cm = h.flags & FLAG_CHUNK_MAJOR, fo = h.flags & FLAG_FRAG_ORDER;
     if (h.format == (uint32_t) FMT_NIBBLE) {
         for (int64_t r = 0; r < rows; r++) {
             for (int64_t c = 0; c < C; c++) {
@@ -101,7 +121,17 @@ std::vector<uint16_t> decode(const encoded & e, int64_t rows, int64_t K) {
             const uint32_t ub = at<uint32_t>(e.aux, h.off_b + 4 * u);
             for (int l = 0; l < 32; l++) {
                 bits bs{e.aux, ub + at<uint16_t>(e.aux, h.off_c + 2 * (u * 32 + l)), h.off_d};
-                for (int64_t o = 0; o < (int64_t) h.R * C; o++) {
+                for (int64_t kt = 0; fo && kt < K / 16; kt++) { // the lane's pairs tile by tile, in register order
+                    for (int q = 0; q < 4; q++) {
+                        int r, c;
+                        fo_rc(l, q, r, c);
+                        const uint32_t v = at<uint32_t>(e.aux, h.off_a + 4 * bs.peek(HP_LP));
+                        bs.skip((int) (v & 0x7F));
+                        ex[(u * 16 + r) * K + kt * 16 + c]     = (int) ((v >> 7) & 0xFF);
+                        ex[(u * 16 + r) * K + kt * 16 + c + 1] = (int) ((v >> 23) & 0xFF);
+                    }
+                }
+                for (int64_t o = 0; !fo && o < (int64_t) h.R * C; o++) {
                     const int64_t r = u * h.R + (cm ? o % h.R : o / C), c = cm ? o / h.R : o % C;
                     for (int s = 0; s < 16; s += 2) {
                         const uint32_t v = at<uint32_t>(e.aux, h.off_a + 4 * bs.peek(HP_LP));
@@ -116,7 +146,7 @@ std::vector<uint16_t> decode(const encoded & e, int64_t rows, int64_t K) {
     std::vector<uint16_t> w(rows * K);
     for (int64_t r = 0; r < rows; r++) {
         for (int64_t k = 0; k < K; k++) {
-            w[r * K + k] = join(sm_at(e, K, r, k, cm), ex[r * K + k]);
+            w[r * K + k] = join(sm_at(e, K, r, k, cm, fo), ex[r * K + k]);
         }
     }
     if (h.format == (uint32_t) FMT_NIBBLE) { // escapes: column | sign|mantissa << 12 | exponent << 20
@@ -165,12 +195,13 @@ bool throws(const std::function<void()> & f) {
 }
 
 void round_trip(const char * name, const std::vector<uint16_t> & w, int64_t rows, int64_t K, int fmt, int R, bool cm,
-                int want_fmt) {
-    const encoded e = encode(w.data(), rows, K, fmt, R, cm);
+                int want_fmt, bool fo = false) {
+    const encoded e = encode(w.data(), rows, K, fmt, R, cm, fo);
     const aux_header h = at<aux_header>(e.aux, 0);
     CHECK(h.magic == MAGIC && h.K == K && h.rows == (uint64_t) rows, "%s: header", name);
     CHECK(e.format == want_fmt && (int) h.format == want_fmt, "%s: format %d, want %d", name, e.format, want_fmt);
     CHECK(((h.flags & FLAG_CHUNK_MAJOR) != 0) == (cm && want_fmt == FMT_HUFPAIR), "%s: chunk-major flag", name);
+    CHECK(((h.flags & FLAG_FRAG_ORDER) != 0) == (fo && want_fmt == FMT_HUFPAIR), "%s: fragment-order flag", name);
     const std::vector<uint16_t> d = decode(e, rows, K);
     int64_t bad = 0, first = -1;
     for (int64_t i = 0; i < rows * K; i++) {
@@ -213,12 +244,20 @@ int main() {
         }
     }
 
+    // fragment order: K = 512 bands of 16 rows
+    for (int64_t rows : {16, 48}) {
+        const std::vector<uint16_t> w = model_like(rows * CHUNK, (uint32_t) rows);
+        round_trip(("hufpair fo rows=" + std::to_string(rows)).c_str(), w, rows, CHUNK, FMT_HUFPAIR, 16, false, FMT_HUFPAIR, true);
+    }
+
     // HUFPAIR falls back to HUFFMAN (still lossless) above HP_MAX_PAIRS distinct exponent pairs, not at it
     for (int n : {HP_MAX_PAIRS - 1, HP_MAX_PAIRS, HP_MAX_PAIRS + 1}) {
         const int want = n <= HP_MAX_PAIRS ? FMT_HUFPAIR : FMT_HUFFMAN;
         const std::vector<uint16_t> w = with_pairs(16, 1024, n);
         round_trip(("pairs=" + std::to_string(n)).c_str(), w, 16, 1024, FMT_HUFPAIR, 4, false, want);
         round_trip(("pairs cm=" + std::to_string(n)).c_str(), w, 16, 1024, FMT_HUFPAIR, 4, true, want);
+        round_trip(("pairs fo=" + std::to_string(n)).c_str(), with_pairs(32, CHUNK, n), 32, CHUNK, FMT_HUFPAIR, 16,
+                   false, want, true);
     }
 
     // argument boundaries
@@ -248,6 +287,15 @@ int main() {
     CHECK(!throws(enc(16, 1024, FMT_HUFPAIR, 4, true)), "chunk-major at K = 1024 rejected");
     CHECK(throws(enc(16, 1024, FMT_HUFPAIR, 2, true)), "chunk-major with R = 2 accepted");
     CHECK(throws(enc(16, 512, 0, 4, false)) && throws(enc(16, 512, 4, 4, false)), "unknown format accepted");
+    auto enc_fo = [&](int64_t rows, int64_t K, int fmt, int R, bool cm) {
+        return [=, &z]() { encode(z.data(), rows, K, fmt, R, cm, true); };
+    };
+    CHECK(!throws(enc_fo(16, 512, FMT_HUFPAIR, 16, false)), "fragment order at K = 512, R = 16 rejected");
+    CHECK(throws(enc_fo(16, 1024, FMT_HUFPAIR, 16, false)), "fragment order at K = 1024 accepted");
+    CHECK(throws(enc_fo(16, 512, FMT_HUFPAIR, 8, false)), "fragment order with R = 8 accepted");
+    CHECK(throws(enc_fo(32, 1024, FMT_HUFPAIR, 16, true)), "fragment order with chunk-major accepted");
+    CHECK(throws(enc_fo(16, 512, FMT_HUFFMAN, 16, false)), "HUFFMAN fragment order accepted");
+    CHECK(throws(enc_fo(16, 512, FMT_NIBBLE, 0, false)), "NIBBLE fragment order accepted");
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

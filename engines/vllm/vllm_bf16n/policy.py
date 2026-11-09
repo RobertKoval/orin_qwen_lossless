@@ -16,6 +16,7 @@ class Choice:
     format: int
     R: int
     chunk_major: bool
+    frag_order: bool = False
 
 
 def choose(rows_per_matrix: int, K: int, n_matrices: int = 1) -> Choice | None:

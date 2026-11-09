@@ -61,6 +61,36 @@ void encode_sm_plane(const uint16_t * w, int64_t rows, int64_t K, uint8_t * sm) 
     });
 }
 
+// fragment order (FLAG_FRAG_ORDER): (row, column) of the first weight of pair q (0..3, register a_q) of lane l in a
+// 16x16 tile
+inline void fo_pair(int l, int q, int & r, int & c) {
+    r = (l >> 2) + 8 * (q & 1);
+    c = 2 * (l & 3) + 8 * (q >> 1);
+}
+
+// sign|mantissa plane of 16-row bands in fragment order: per band, tile pair p and lane l, 16 bytes (tile 2p, then
+// 2p + 1; pairs a0..a3, lower column first)
+void encode_sm_plane_fo(const uint16_t * w, int64_t rows, int64_t K, uint8_t * sm) {
+    auto smb = [](uint16_t v) { return (uint8_t) (((v >> 15) << 7) | (v & 0x7F)); };
+    parallel_for(rows / 16, [&](int64_t b) {
+        uint8_t * pb = sm + b * 16 * K;
+        for (int64_t p = 0; p < K / 32; p++) {
+            for (int l = 0; l < 32; l++) {
+                uint8_t * o = pb + p * 512 + l * 16;
+                for (int kk = 0; kk < 2; kk++) {
+                    for (int q = 0; q < 4; q++) {
+                        int r, c;
+                        fo_pair(l, q, r, c);
+                        const int64_t i = (b * 16 + r) * K + (2 * p + kk) * 16 + c;
+                        o[8 * kk + 2 * q] = smb(w[i]);
+                        o[8 * kk + 2 * q + 1] = smb(w[i + 1]);
+                    }
+                }
+            }
+        }
+    });
+}
+
 std::vector<uint8_t> encode_nibble(const uint16_t * w, int64_t rows, int64_t K) {
     const int64_t C = K / 512;
     std::vector<uint8_t> nib(rows * K / 2);
@@ -285,8 +315,9 @@ std::vector<uint8_t> encode_huffman(const uint16_t * w, int64_t rows, int64_t K,
 // correlated (pair entropy ~2.05 vs ~2.53 bit/weight). Returns empty if the tensor has > 2^HP_LP distinct pairs.
 // Lane streams of a unit (R rows) are row-major (row 0 over all K, then row 1, ...) or, with cm, chunk-major (512-column
 // chunk 0 of rows 0..R-1, then chunk 1, ...). Chunk-major lets a batched kernel decode a K-slab of many rows at a time;
-// such units also keep their sign|mantissa plane chunk-major (see encode() below).
-std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K, int R, bool cm) {
+// such units also keep their sign|mantissa plane chunk-major (see encode() below). With fo (FLAG_FRAG_ORDER, K = 512,
+// R = 16) a lane's stream holds its pairs of the 16-row band tile by tile, in A-register order (fo_pair).
+std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K, int R, bool cm, bool fo) {
     const int64_t C = K / 512;
     const int64_t units = rows / R;
     auto ex = [&](int64_t i) { return (w[i] >> 7) & 0xFF; };
@@ -342,19 +373,29 @@ std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K
             rel32[u * 32 + l] = (uint32_t) out.size();
             uint64_t acc = 0;
             int nb = 0;
-            for (int64_t o = 0; o < R * C; o++) {
-                const int64_t r = u * R + (cm ? o % R : o / C), c = cm ? o / R : o % C;
-                {
+            auto put = [&](int64_t i) {
+                const int sym = ex(i) | ex(i + 1) << 8;
+                acc = (acc << len[sym]) | code[sym];
+                nb += len[sym];
+                if (nb >= 32) {
+                    out.push_back((uint32_t) (acc >> (nb - 32)));
+                    nb -= 32;
+                    acc &= nb ? ((1ull << nb) - 1) : 0;
+                }
+            };
+            if (fo) {
+                for (int64_t kt = 0; kt < K / 16; kt++) {
+                    for (int q = 0; q < 4; q++) {
+                        int r, c;
+                        fo_pair(l, q, r, c);
+                        put((u * R + r) * K + kt * 16 + c);
+                    }
+                }
+            } else {
+                for (int64_t o = 0; o < R * C; o++) {
+                    const int64_t r = u * R + (cm ? o % R : o / C), c = cm ? o / R : o % C;
                     for (int s = 0; s < 16; s += 2) {
-                        const int64_t i = r * K + c * 512 + pos_of(l, s);
-                        const int sym = ex(i) | ex(i + 1) << 8;
-                        acc = (acc << len[sym]) | code[sym];
-                        nb += len[sym];
-                        if (nb >= 32) {
-                            out.push_back((uint32_t) (acc >> (nb - 32)));
-                            nb -= 32;
-                            acc &= nb ? ((1ull << nb) - 1) : 0;
-                        }
+                        put(r * K + c * 512 + pos_of(l, s));
                     }
                 }
             }
@@ -381,7 +422,7 @@ std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K
     h.off_b = h.off_a + lut.size() * 4;               // unit base (u32)
     h.off_c = h.off_b + unit_base.size() * 4;         // lane offsets relative to unit base (u16)
     h.off_d = (h.off_c + lane_rel.size() * 2 + 15) & ~15ull; // stream
-    h.n_a = units; h.n_b = n_words; h.flags = cm ? 1 : 0;
+    h.n_a = units; h.n_b = n_words; h.flags = (cm ? FLAG_CHUNK_MAJOR : 0) | (fo ? FLAG_FRAG_ORDER : 0);
     std::vector<uint8_t> aux(h.off_d + (n_words + 32) * 4, 0); // +32 words: lookahead of the decoders' prefetch and rings
     memcpy(aux.data(), &h, sizeof(h));
     memcpy(aux.data() + h.off_a, lut.data(), lut.size() * 4);
@@ -397,7 +438,7 @@ std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K
 
 } // namespace
 
-encoded encode(const uint16_t * w, int64_t rows, int64_t K, int format, int R, bool chunk_major) {
+encoded encode(const uint16_t * w, int64_t rows, int64_t K, int format, int R, bool chunk_major, bool frag_order) {
     auto bad = [](const std::string & m) { throw std::invalid_argument("bf16n encode: " + m); };
     if (K % CHUNK != 0 || K < CHUNK || K > K_MAX) {
         bad("K must be a multiple of 512 in [512, 4096], got " + std::to_string(K));
@@ -406,8 +447,8 @@ encoded encode(const uint16_t * w, int64_t rows, int64_t K, int format, int R, b
         bad("rows must be positive");
     }
     if (format == FMT_NIBBLE) {
-        if (R != 0 || chunk_major) {
-            bad("NIBBLE takes R = 0 and no chunk-major layout");
+        if (R != 0 || chunk_major || frag_order) {
+            bad("NIBBLE takes R = 0 and no chunk-major or fragment-order layout");
         }
     } else if (format == FMT_HUFFMAN || format == FMT_HUFPAIR) {
         if (R != 1 && R != 2 && R != 4 && R != 8 && R != 16) {
@@ -422,15 +463,18 @@ encoded encode(const uint16_t * w, int64_t rows, int64_t K, int format, int R, b
         if (chunk_major && (K == CHUNK || (R != 4 && R != 8 && R != 16))) {
             bad("chunk-major units need K > 512 and R in {4, 8, 16} (the chunk-major kernels' instances)");
         }
+        if (frag_order && (format != FMT_HUFPAIR || chunk_major || K != CHUNK || R != 16)) {
+            bad("fragment order exists only for HUFPAIR with K = 512 and R = 16, without chunk-major units");
+        }
     } else {
         bad("unknown format " + std::to_string(format));
     }
 
     encoded out;
     out.plane.resize((size_t) (rows * K));
-    encode_sm_plane(w, rows, K, out.plane.data());
     out.R = format == FMT_NIBBLE ? 0 : R;
     if (format == FMT_NIBBLE) {
+        encode_sm_plane(w, rows, K, out.plane.data());
         out.aux = encode_nibble(w, rows, K);
         out.format = FMT_NIBBLE;
         // escaped weights must read as +0 in the plane so the dense path adds exactly nothing for them
@@ -448,7 +492,7 @@ encoded encode(const uint16_t * w, int64_t rows, int64_t K, int format, int R, b
         return out;
     }
     if (format == FMT_HUFPAIR) {
-        out.aux = encode_huffpair(w, rows, K, R, chunk_major);
+        out.aux = encode_huffpair(w, rows, K, R, chunk_major, frag_order);
     }
     if (!out.aux.empty()) {
         out.format = FMT_HUFPAIR;
@@ -456,7 +500,13 @@ encoded encode(const uint16_t * w, int64_t rows, int64_t K, int format, int R, b
         out.aux = encode_huffman(w, rows, K, R); // more distinct exponent pairs than the pair LUT holds, or forced
         out.format = FMT_HUFFMAN;
     }
-    if (out.format == FMT_HUFPAIR && (((const aux_header *) out.aux.data())->flags & FLAG_CHUNK_MAJOR)) {
+    const uint32_t flags = out.format == FMT_HUFPAIR ? ((const aux_header *) out.aux.data())->flags : 0;
+    if (flags & FLAG_FRAG_ORDER) {
+        encode_sm_plane_fo(w, rows, K, out.plane.data());
+    } else {
+        encode_sm_plane(w, rows, K, out.plane.data());
+    }
+    if (flags & FLAG_CHUNK_MAJOR) {
         // chunk-major units also store their plane chunk-major ([chunk][row][512 B] inside each unit), so a kernel
         // walking chunk c over the unit's rows reads one contiguous block
         std::vector<uint8_t> tmp((size_t) (R * K));

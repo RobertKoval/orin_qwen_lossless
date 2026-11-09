@@ -4,7 +4,7 @@
 // their outputs / workspaces through the caching allocator, never synchronise with the host and never read the aux
 // header on the host, so they can be captured into CUDA graphs. Fake (meta) implementations live in ops.py.
 //
-// meta = [format, K, rows, R, chunk_major, off_a, off_b, off_c, off_d]
+// meta = [format, K, rows, R, flags (aux header: FLAG_CHUNK_MAJOR | FLAG_FRAG_ORDER), off_a, off_b, off_c, off_d]
 #include "bf16n/encode.h"
 #include "bf16n/launch.h"
 #include "bf16n/policy.h"
@@ -44,7 +44,10 @@ bf16n::weight make_weight(const Tensor & plane, const Tensor & aux, c10::IntArra
     w.K = meta[1];
     w.rows = meta[2];
     w.R = (int) meta[3];
-    w.cm = meta[4] != 0;
+    TORCH_CHECK((meta[4] & ~(int64_t) (bf16n::FLAG_CHUNK_MAJOR | bf16n::FLAG_FRAG_ORDER)) == 0,
+                "bf16n: unknown layout flags ", meta[4]);
+    w.cm = (meta[4] & bf16n::FLAG_CHUNK_MAJOR) != 0;
+    w.fo = (meta[4] & bf16n::FLAG_FRAG_ORDER) != 0;
     w.off_a = (uint64_t) meta[5]; w.off_b = (uint64_t) meta[6]; w.off_c = (uint64_t) meta[7]; w.off_d = (uint64_t) meta[8];
     TORCH_CHECK(plane.numel() == w.rows * w.K, "bf16n: plane has ", plane.numel(), " bytes, meta says ", w.rows, " x ", w.K);
     const uint64_t last = std::max({w.off_a, w.off_b, w.off_c, w.off_d});
@@ -71,7 +74,7 @@ void check_ids(const Tensor & ids) {
 
 // ---------------------------------------------------------------- CPU
 
-std::tuple<Tensor, Tensor> encode_cpu(const Tensor & w, int64_t format, int64_t R, bool chunk_major) {
+std::tuple<Tensor, Tensor> encode_cpu(const Tensor & w, int64_t format, int64_t R, bool chunk_major, bool frag_order) {
     TORCH_CHECK(w.device().is_cpu(), "bf16n.encode: weight must be on the CPU");
     TORCH_CHECK(w.scalar_type() == at::kBFloat16, "bf16n.encode: weight must be bfloat16");
     TORCH_CHECK(w.dim() >= 2, "bf16n.encode: weight must be at least 2-D (rows x K)");
@@ -80,7 +83,7 @@ std::tuple<Tensor, Tensor> encode_cpu(const Tensor & w, int64_t format, int64_t 
     const int64_t rows = wc.numel() / std::max<int64_t>(K, 1);
     bf16n::encoded e;
     try {
-        e = bf16n::encode((const uint16_t *) wc.data_ptr(), rows, K, (int) format, (int) R, chunk_major);
+        e = bf16n::encode((const uint16_t *) wc.data_ptr(), rows, K, (int) format, (int) R, chunk_major, frag_order);
     } catch (const std::invalid_argument & ex) {
         TORCH_CHECK_VALUE(false, ex.what());
     }
@@ -356,7 +359,7 @@ Tensor swiglu_cuda(const Tensor & g, const Tensor & u) {
 
 TORCH_LIBRARY(bf16n, m) {
     m.def("init() -> ()", &init_op);
-    m.def("encode(Tensor w, int format, int R, bool chunk_major) -> (Tensor, Tensor)");
+    m.def("encode(Tensor w, int format, int R, bool chunk_major, bool frag_order=False) -> (Tensor, Tensor)");
     m.def("dequant(Tensor plane, Tensor aux, int[] meta, int row0, int nrows) -> Tensor");
     m.def("dequant_into(Tensor(a!) out, Tensor plane, Tensor aux, int[] meta, int row0, int nrows, int group_rows, "
           "int group_stride) -> ()");
@@ -393,11 +396,11 @@ TORCH_LIBRARY_IMPL(bf16n, CUDA, m) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "BF16N lossless BF16 weight ops (registered as torch.ops.bf16n)";
     m.def("choose", [](int64_t rows, int64_t K, int64_t n_matrices)
-            -> std::optional<std::tuple<int, int, bool>> {
+            -> std::optional<std::tuple<int, int, bool, bool>> {
         const auto c = bf16n::choose(rows, K, n_matrices); // vLLM defaults; no CUDA access
         if (!c) {
             return std::nullopt;
         }
-        return std::make_tuple(c->format, c->R, c->chunk_major);
+        return std::make_tuple(c->format, c->R, c->chunk_major, c->frag_order);
     }, pybind11::arg("rows"), pybind11::arg("K"), pybind11::arg("n_matrices") = 1);
 }

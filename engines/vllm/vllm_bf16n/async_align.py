@@ -10,11 +10,14 @@ This module does the same deferral for align mode: the accepted counts are copie
 an event, and the CPU part (wait for the event, set num_accepted_tokens_cpu, the block-state copies) runs at the start
 of the next execute_model, i.e. after the drafts are queued behind the target forward. Inputs of the copy decision
 that the next step's state update changes (per-request computed tokens, state slot, scheduled counts) are captured at
-the original call. Requests that finished or were preempted in between are skipped: their blocks may already belong
-to another request. The GDN states it copies are not touched by the MTP drafter (full attention only), so moving the
-copies after the drafts does not change any value.
+the original call. Requests that finished or were preempted in between are copied too, like the stock
+postprocess_mamba does in their last step: the scheduler has already registered the completed block in the prefix
+cache, so skipping the copy would leave a cached block without its state. The copy runs before any kernel of the next
+step, so a block that the scheduler has meanwhile handed to another request is overwritten by that request afterwards.
+The GDN states it copies are not touched by the MTP drafter (full attention only), so moving the copies after the
+drafts does not change any value.
 
-Enabled by vllm_bf16n.register() unless BF16N_ASYNC_ALIGN=0.
+Installed by model.py for BF16N models unless BF16N_ASYNC_ALIGN=0.
 """
 from __future__ import annotations
 
@@ -64,7 +67,6 @@ def install() -> None:
         num_reqs, snap = pending
         self._bf16n_accepted_event.synchronize()
         acc = self._bf16n_accepted_cpu[:num_reqs].tolist()
-        gone = set(scheduler_output.finished_req_ids) | set(scheduler_output.preempted_req_ids or ())
         nacc = self.input_batch.num_accepted_tokens_cpu
         copy_bufs = self._get_mamba_copy_bufs()
         copy_bufs.offset = 0
@@ -74,8 +76,6 @@ def install() -> None:
         # mamba_utils.postprocess_mamba with the captured inputs (same arithmetic)
         for i, req_id, req_state, num_computed, num_draft, num_sched, src_block_idx in snap:
             nacc[i] = acc[i]
-            if req_id in gone or req_id not in self.requests:
-                continue
             running = num_computed + num_sched - num_draft
             aligned = (running + acc[i] - 1) // block * block
             if aligned >= running:

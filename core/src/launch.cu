@@ -86,6 +86,7 @@ cols_t make_cols(const mmv_args & a) {
 size_t mc_shm(int C, int NC) { return (size_t) NC * C * 512 * sizeof(float) + (4u << HP_LP); }
 
 constexpr int MM_MAX_EXPERTS_INIT = 512;
+constexpr int FO_NTOK = 96, FO_NW = 16; // fragment-order batched kernel: tokens per item, warps (T-023 prototype)
 size_t mm_shm(bool glu, int NW, int IL, int B, int n_experts) {
     return ((glu ? 8u : 4u) << HP_LP) + 64 * HPM_LD * 2 + (size_t) NW * IL * 32 * 16 * B +
            (size_t) (n_experts + 1) * (sizeof(int) + sizeof(uint16_t));
@@ -99,7 +100,9 @@ void launch_mmv_t(const weight & e, const cols_t & p, int ncols, cudaStream_t st
         dim3 g2; int nt;
         hp_launch_dims(e, p.nrows, ncols, g2, nt);
         const size_t shm = K * sizeof(float) + (4u << HP_LP);
-        if (e.cm) {
+        if (e.fo) {
+            k_fo_mmv<TX><<<g2, nt, fo_mmv_shm(), stream>>>(hpp(e), p);
+        } else if (e.cm) {
 #define CM_CASE(CC, RR) case CC * 100 + RR: k_hp_mmv_cm<TX, CC, RR><<<g2, nt, shm, stream>>>(hpp(e), p); break;
             switch (K / 512 * 100 + e.R) {
                 CM_CASE(2, 4) CM_CASE(2, 8) CM_CASE(2, 16) CM_CASE(4, 4) CM_CASE(4, 8) CM_CASE(4, 16)
@@ -199,6 +202,8 @@ void check_weight(const weight & w) {
     BF16N_REQUIRE(w.format == FMT_NIBBLE || w.format == FMT_HUFFMAN || w.format == FMT_HUFPAIR, "unknown format");
     BF16N_REQUIRE(w.format == FMT_NIBBLE || (w.R > 0 && w.rows % w.R == 0), "rows must be a multiple of R");
     BF16N_REQUIRE(!w.cm || w.format == FMT_HUFPAIR, "chunk-major units exist only for HUFPAIR");
+    BF16N_REQUIRE(!w.fo || (w.format == FMT_HUFPAIR && !w.cm && w.K == FO_K && w.R == 16),
+                  "fragment order exists only for HUFPAIR with K = 512 and R = 16, without chunk-major units");
 }
 
 void ensure_init() { std::call_once(g_once, [] {
@@ -217,6 +222,8 @@ void ensure_init() { std::call_once(g_once, [] {
     MC_ATTRS(float) MC_ATTRS(bf16)
 #undef MC_ATTRS
 #undef MC_ATTR
+    BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mm_ids<FO_NTOK, FO_NW>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          (int) std::min<size_t>(g_smem_optin, fo_mm_shm(FO_NTOK, MM_MAX_EXPERTS_INIT))));
 #define MM_ATTR(CC, RR, NW, IL, WT, B, G) BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_hp_mm_ids<CC, RR, NW, IL, WT, B, G>, \
     cudaFuncAttributeMaxDynamicSharedMemorySize, (int) std::min<size_t>(g_smem_optin, mm_shm(G, NW, IL, B, MM_MAX_EXPERTS_INIT))));
     MM_ATTR(4, 8, 16, 1, 2, 2, true) MM_ATTR(4, 8, 16, 1, 2, 2, false) MM_ATTR(1, 16, 8, 1, 4, 2, false)
@@ -271,6 +278,7 @@ void mmv_glu(const weight & gate, const weight & up, const mmv_args & a, cudaStr
     BF16N_REQUIRE(a.row0 >= 0 && a.nrows >= 0 && a.row0 <= gate.rows && a.nrows <= gate.rows - a.row0,
                   "mmv_glu: product rows out of range");
     BF16N_REQUIRE(!gate.cm && !up.cm, "mmv_glu: chunk-major weights require separate mmv launches");
+    BF16N_REQUIRE(!gate.fo && !up.fo, "mmv_glu: fragment-order weights require separate mmv launches");
     BF16N_REQUIRE(gate.format == FMT_NIBBLE || gate.R == up.R, "mmv_glu: gate/up R must match");
     BF16N_REQUIRE(a.ncols > 0 && a.ncols <= 65535, "ncols out of range");
     BF16N_REQUIRE(gate.format == FMT_NIBBLE ||
@@ -310,6 +318,8 @@ void dequant(const weight & e, int64_t row0, int64_t nrows, uint16_t * out, cuda
     case CC:                                                                                                           \
         if (e.format == FMT_NIBBLE) {                                                                                  \
             k_nibble_dequant<CC><<<gx, 256, 0, stream>>>(np.sm, np.nib, np.lut_row, np.esc_off, np.esc, row0, nrows, out, om); \
+        } else if (e.fo) {                                                                                             \
+            k_fo_dequant<<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out, om);                                        \
         } else if (e.format == FMT_HUFPAIR && e.cm) {                                                                  \
             switch (e.R) {                                                                                             \
                 case 4: k_hp_dequant_cm<CC, 4><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out, om); break;              \
@@ -336,6 +346,7 @@ void get_rows(const weight & e, const void * ids, int64_t ids_s0, int64_t n, voi
     BF16N_REQUIRE(n >= 0, "get_rows: n must be nonnegative");
     BF16N_REQUIRE(row0 >= 0 && (n == 0 ? row0 <= e.rows : row0 < e.rows), "get_rows: row0 out of range");
     BF16N_REQUIRE(!e.cm, "get_rows of a chunk-major (expert) matrix");
+    BF16N_REQUIRE(!e.fo, "get_rows of a fragment-order (expert) matrix");
     BF16N_REQUIRE(e.format != FMT_HUFFMAN, "get_rows is not implemented for the single-symbol Huffman format");
     if (n == 0) {
         return;
@@ -363,7 +374,7 @@ bool mm_ids_supported(const weight & w, const weight * up) {
     const int C = (int) (w.K / 512);
     const bool shape = w.format == FMT_HUFPAIR && (w.cm || w.K == 512) && ((C == 4 && w.R == 8) || (C == 1 && w.R == 16));
     if (!up) {
-        return shape;
+        return shape; // K = 512, R = 16: k_hp_mm_ids row-major, k_fo_mm_ids in fragment order
     }
     return shape && w.K == 2048 && w.R == 8 && up->format == FMT_HUFPAIR && up->cm && up->K == w.K && up->R == w.R &&
            up->rows == w.rows;
@@ -411,6 +422,16 @@ void mm_ids(const weight & e, const weight * u, const void * x_bf16, int64_t x_r
                                                   cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm));            \
         }                                                                                                              \
         k_hp_mm_ids<CC, RR, NW, IL, WT, B, G><<<g_sms, NW * 32, shm, stream>>>(hpp(e), hpp(G ? *u : e), a);           \
+    }
+    if (e.fo) {
+        const size_t shm = fo_mm_shm(FO_NTOK, n_experts);
+        BF16N_REQUIRE(shm <= (size_t) g_smem_optin, "too many experts for the fragment-order kernel's shared memory");
+        if (n_experts > MM_MAX_EXPERTS_INIT) {
+            BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mm_ids<FO_NTOK, FO_NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm));
+        }
+        k_fo_mm_ids<FO_NTOK, FO_NW><<<g_sms, FO_NW * 32, shm, stream>>>(hpp(e), a);
+        BF16N_CUDA_CHECK(cudaGetLastError());
+        return;
     }
     // lane-stream rings (RB = 2) where a warp decodes one or two streams, the register queue for down's four (T-019)
     if (u) {

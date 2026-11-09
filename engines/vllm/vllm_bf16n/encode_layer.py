@@ -71,7 +71,7 @@ def encode_matrix(name: str, w: torch.Tensor, choice: policy.Choice):
     torch.cuda.empty_cache()
     device = w.device
     host = w.detach().to("cpu", copy=True).contiguous()
-    plane, aux, meta = ops.encode(host, choice.format, choice.R, choice.chunk_major)
+    plane, aux, meta = ops.encode(host, choice.format, choice.R, choice.chunk_major, choice.frag_order)
     with torch.cuda.use_mem_pool(_weights_pool()):
         enc = ops.Weight(_arena.take(plane, device), _arena.take(aux, device), meta)
     ok = ops.roundtrip_equal(enc, w)

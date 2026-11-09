@@ -20,21 +20,13 @@ FMT_NIBBLE, FMT_HUFFMAN, FMT_HUFPAIR = 1, 2, 3
 FORMAT_NAMES = {FMT_NIBBLE: "nibble", FMT_HUFFMAN: "huffman", FMT_HUFPAIR: "hufpair"}
 MAGIC = 0x4E363142
 HEADER = struct.Struct("<IIIIQQQQQQQII")  # core/include/bf16n/format.h aux_header
-FLAG_CHUNK_MAJOR = 1
+FLAG_CHUNK_MAJOR, FLAG_FRAG_ORDER = 1, 2
 
 # llama.cpp dispatch thresholds: up to 8 tokens through the GEMV kernels, more through the batched MoE kernel /
 # dequant + cuBLAS (the C++ linear op applies the same bound for dense matrices)
 GEMV_MAX_TOKENS = 8
 
 REFERENCE = os.environ.get("BF16N_REFERENCE", "0") not in ("", "0")
-
-# Long prefill chunks (>= MOE_DEQUANT_MIN_TOKENS tokens): exact dequant of the layer's experts into a BF16 workspace +
-# vLLM's Triton fused_experts beats the decode-in-shared-memory kernel (layer 0, 8192 tokens: 17 + 30.6 ms vs 70 ms
-# with vLLM's default Triton config, 17 + 24 ms with the Orin-tuned one in vllm_bf16n/configs/fused_moe; 4096 tokens:
-# 17 + 15 ms vs 38 ms; 3072 tokens: the batched kernel wins). The workspace holds 1/MOE_DEQUANT_SPLIT of the experts
-# (split 2: 0.8 GB; each part masks the others' tokens through expert_map, partial outputs summed in FP32).
-MOE_DEQUANT_MIN_TOKENS = int(os.environ.get("BF16N_MOE_DEQUANT_MIN_TOKENS", "4096"))
-MOE_DEQUANT_SPLIT = int(os.environ.get("BF16N_MOE_DEQUANT_SPLIT", "2"))
 
 _ops = torch.ops.bf16n
 
@@ -48,14 +40,15 @@ class Meta:
     rows: int
     R: int
     chunk_major: bool
+    frag_order: bool
     off_a: int
     off_b: int
     off_c: int
     off_d: int
 
     def as_list(self) -> list[int]:
-        return [self.format, self.K, self.rows, self.R, int(self.chunk_major), self.off_a, self.off_b, self.off_c,
-                self.off_d]
+        flags = (FLAG_CHUNK_MAJOR if self.chunk_major else 0) | (FLAG_FRAG_ORDER if self.frag_order else 0)
+        return [self.format, self.K, self.rows, self.R, flags, self.off_a, self.off_b, self.off_c, self.off_d]
 
 
 def parse_header(aux: torch.Tensor) -> Meta:
@@ -65,7 +58,9 @@ def parse_header(aux: torch.Tensor) -> Meta:
     (magic, fmt, K, R, rows, a, b, c, d, _na, _nb, flags, _pad) = HEADER.unpack(bytes(aux[: HEADER.size].tolist()))
     if magic != MAGIC or fmt not in FORMAT_NAMES:
         raise ValueError(f"bf16n: bad aux header (magic {magic:#x}, format {fmt})")
-    return Meta(fmt, K, rows, R, bool(flags & FLAG_CHUNK_MAJOR), a, b, c, d)
+    if flags & ~(FLAG_CHUNK_MAJOR | FLAG_FRAG_ORDER):
+        raise ValueError(f"bf16n: unknown layout flags {flags:#x}")
+    return Meta(fmt, K, rows, R, bool(flags & FLAG_CHUNK_MAJOR), bool(flags & FLAG_FRAG_ORDER), a, b, c, d)
 
 
 @dataclass
@@ -90,10 +85,11 @@ def init() -> None:
     _ops.init()
 
 
-def encode(w: torch.Tensor, fmt: int, R: int, chunk_major: bool) -> tuple[torch.Tensor, torch.Tensor, Meta]:
+def encode(w: torch.Tensor, fmt: int, R: int, chunk_major: bool, frag_order: bool = False
+           ) -> tuple[torch.Tensor, torch.Tensor, Meta]:
     """Encode a BF16 CPU tensor (..., K) on all host cores. FMT_HUFPAIR falls back to FMT_HUFFMAN when the tensor has
-    more than 4096 distinct exponent pairs; the returned Meta holds the format actually produced."""
-    plane, aux = _ops.encode(w, fmt, R, chunk_major)
+    more than 4096 distinct exponent pairs; the returned Meta holds the format and layout actually produced."""
+    plane, aux = _ops.encode(w, fmt, R, chunk_major, frag_order)
     return plane, aux, parse_header(aux)
 
 
@@ -153,7 +149,8 @@ def embedding(ids: torch.Tensor, w: Weight) -> torch.Tensor:
 
 
 def mm_ids_supported(w: Weight, up: Weight | None = None) -> bool:
-    """Mirror of launch.cu mm_ids_supported: shapes with a batched (prefill) MoE kernel instance."""
+    """Mirror of launch.cu mm_ids_supported: shapes with a batched (prefill) MoE kernel instance (K = 512, R = 16: the
+    row-major or the fragment-order kernel)."""
     m = w.meta
     ok = m.format == FMT_HUFPAIR and ((m.K == 2048 and m.R == 8 and m.chunk_major) or (m.K == 512 and m.R == 16))
     if up is None:
@@ -208,16 +205,15 @@ def moe_experts(x: torch.Tensor, gate: Weight, up: Weight, down: Weight, topk_we
                 topk_ids: torch.Tensor, n_experts: int) -> torch.Tensor:
     """Routed experts of one MoE layer: sum_k w_k * down(silu(gate x) * up x) over the top-k experts, BF16 out.
     Up to GEMV_MAX_TOKENS tokens (or shapes without a batched kernel): expert GEMVs with FP32 activations between
-    them; more: the batched kernel (fused gate/up + SWIGLU written as BF16, then down), as llama.cpp does; from
-    MOE_DEQUANT_MIN_TOKENS on: exact dequant + vLLM's Triton fused_experts (moe_experts_dequant)."""
+    them; more: the batched kernels (fused gate/up + SWIGLU written as BF16, then down: in fragment order for vLLM's
+    policy), as llama.cpp does. Every prefill chunk takes the batched kernels: the exact dequant + Triton fused_experts
+    path that long chunks used before was 7-10 % slower end to end in the production configuration (T-023)."""
     T = x.shape[0]
     N = gate.meta.rows // n_experts
     H = down.meta.rows // n_experts
     if REFERENCE:
         return moe_experts_reference(x, gate, up, down, topk_weights, topk_ids, n_experts)
     x = x.contiguous()
-    if T >= MOE_DEQUANT_MIN_TOKENS and n_experts % MOE_DEQUANT_SPLIT == 0:
-        return moe_experts_dequant(x, gate, up, down, topk_weights, topk_ids, n_experts, MOE_DEQUANT_SPLIT)
     if T > GEMV_MAX_TOKENS and mm_ids_supported(gate, up) and mm_ids_supported(down):
         a = moe_mm_ids(x, topk_ids, gate, n_experts, up=up, out_dtype=torch.bfloat16)
         ys = moe_mm_ids(a, topk_ids, down, n_experts, out_dtype=torch.float32)
@@ -226,51 +222,6 @@ def moe_experts(x: torch.Tensor, gate: Weight, up: Weight, down: Weight, topk_we
         u = mmv(x, up, topk_ids, N)
         ys = mmv(swiglu(g, u), down, topk_ids, H)
     return moe_combine(ys, topk_weights, torch.bfloat16)
-
-
-_workspaces: dict = {}
-
-
-def _workspace(name: str, shape: tuple, device) -> torch.Tensor:
-    """Persistent BF16 buffers of the dequant prefill path, one per (name, shape, device), allocated on first use
-    (prefill chunks run outside CUDA graphs)."""
-    key = (name, shape, str(device))
-    if key not in _workspaces:
-        _workspaces[key] = torch.empty(shape, dtype=torch.bfloat16, device=device)
-    return _workspaces[key]
-
-
-def _expert_map(n_experts: int, e0: int, n: int, device) -> torch.Tensor:
-    """expert_map selecting experts [e0, e0 + n) as local 0..n-1 (others -1), cached per part."""
-    key = ("emap", n_experts, e0, n, str(device))
-    if key not in _workspaces:
-        m = torch.full((n_experts,), -1, dtype=torch.int32, device=device)
-        m[e0:e0 + n] = torch.arange(n, dtype=torch.int32, device=device)
-        _workspaces[key] = m
-    return _workspaces[key]
-
-
-def moe_experts_dequant(x, gate, up, down, topk_weights, topk_ids, n_experts, split=2):
-    """Exact dequant of 1/split of the experts at a time into a BF16 workspace in vLLM's layout (w13 [E][gate; up][K],
-    w2 [E][H][N]) + vLLM's unquantized Triton fused_experts restricted to those experts by expert_map."""
-    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
-
-    N, H, K = gate.meta.rows // n_experts, down.meta.rows // n_experts, gate.meta.K
-    eg = n_experts // split
-    w13 = _workspace("w13", (eg, 2 * N, K), x.device)
-    w2 = _workspace("w2", (eg, H, N), x.device)
-    out = None
-    for g in range(split):
-        e0 = g * eg
-        dequant_into(w13, gate, e0 * N, eg * N, N, 2 * N)
-        dequant_into(w13.view(-1)[N * K:], up, e0 * N, eg * N, N, 2 * N)
-        dequant_into(w2, down, e0 * H, eg * H)
-        if split == 1:
-            return fused_experts(x, w13, w2, topk_weights, topk_ids)
-        emap = _expert_map(n_experts, e0, eg, x.device)
-        y = fused_experts(x, w13, w2, topk_weights, topk_ids, global_num_experts=n_experts, expert_map=emap).float()
-        out = y if out is None else out.add_(y)
-    return out.to(torch.bfloat16)
 
 
 def moe_experts_reference(x, gate, up, down, topk_weights, topk_ids, n_experts):
@@ -292,7 +243,7 @@ def moe_experts_reference(x, gate, up, down, topk_weights, topk_ids, n_experts):
 # ---------------------------------------------------------------- fake (meta) implementations
 
 @torch.library.register_fake("bf16n::encode")
-def _encode_fake(w, fmt, R, chunk_major):
+def _encode_fake(w, fmt, R, chunk_major, frag_order=False):
     ctx = torch.library.get_ctx()
     K = w.shape[-1]
     rows = w.numel() // K

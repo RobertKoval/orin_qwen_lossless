@@ -244,21 +244,45 @@ def test_get_rows_rejects_chunk_major(ops):
         ops.get_rows(torch.zeros(1, dtype=torch.int32, device="cuda"), enc)
 
 
+def test_get_rows_rejects_frag_order(ops):
+    enc = encode_upload(ops, weights_like_model((16, 512)), HP, 16, False, True)
+    with pytest.raises(ValueError, match="fragment-order"):
+        ops.get_rows(torch.zeros(1, dtype=torch.int32, device="cuda"), enc)
+
+
+@pytest.mark.parametrize("T", [1, 2, 4, 9])
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("output_dtype", [torch.float32, torch.bfloat16])
+def test_mmv_dense_frag_order(ops, T, input_dtype, output_dtype):
+    """Fragment-order GEMV without ids (columns = tokens) against the FP64 reference; BF16 output = rounded FP32."""
+    w = weights_like_model((64, 512), seed=T)
+    enc = encode_upload(ops, w, HP, 16, False, True)
+    x = act(T, 512, seed=T, dtype=input_dtype)
+    y = ops.mmv(x, enc)
+    ref, S = gemv_ref(w, x)
+    assert_within(y, ref, S)
+    if output_dtype == torch.bfloat16:
+        assert torch.equal(bits(ops.mmv(x, enc, out_dtype=output_dtype)), bits(y.to(torch.bfloat16)))
+
+
 # ---------------------------------------------------------------- MoE
 
 E, N, H, TOPK = 16, 512, 2048, 8  # production per-expert shapes (gate/up 512 x 2048, down 2048 x 512), 16 experts
 
 
-@pytest.fixture(scope="module")
-def experts(ops):
+@pytest.fixture(scope="module", params=["row_major", "frag_order"])
+def experts(ops, request):
+    """Production expert layouts; down row-major (llama.cpp's) or in fragment order (vLLM's policy)."""
     gate = weights_like_model((E, N, H), seed=31)
     up = weights_like_model((E, N, H), seed=32)
     down = weights_like_model((E, H, N), seed=33)
+    fo = request.param == "frag_order"
     enc = (
         encode_upload(ops, gate, HP, 8, True),
         encode_upload(ops, up, HP, 8, True),
-        encode_upload(ops, down, HP, 16, False),
+        encode_upload(ops, down, HP, 16, False, fo),
     )
+    assert enc[2].meta.frag_order is fo
     return (gate.cuda(), up.cuda(), down.cuda()), enc
 
 
@@ -334,9 +358,23 @@ def test_moe_experts(ops, experts, T, mode, ids_dtype):
 
 @pytest.mark.parametrize("T", [9, 64, 129, 1024])  # down interleave 4 / 2 / 1 / 1 at 16 experts
 def test_moe_mm_ids_down_stage(ops, experts, T):
-    """Batched down kernel alone (per-slot BF16 inputs): FP32 accumulation bound, every routed slot written."""
+    """Batched down kernel alone (per-slot BF16 inputs): FP32 accumulation bound, every routed slot written; the BF16
+    output is the rounding of the FP32 one."""
     (_, _, down), (_, _, ed) = experts
     ids, _ = routing(T, "uniform", seed=T)
+    a = act(T * TOPK, N, seed=T).view(T, TOPK, N)
+    y = ops.moe_mm_ids(a, ids, ed, E)
+    ref, S = per_slot_ref(down, ids, a)
+    assert_within(y, ref, S)
+    assert torch.equal(bits(ops.moe_mm_ids(a, ids, ed, E, out_dtype=torch.bfloat16)), bits(y.to(torch.bfloat16)))
+
+
+@pytest.mark.parametrize("T", [15, 16, 17, 95, 96, 97, 193])
+def test_moe_mm_ids_down_token_tiles(ops, experts, T):
+    """One expert gets every token: below / at / above a 16-token mma pair and the fragment-order kernel's 96-token
+    items (one, two and three items for that expert); every routed slot written."""
+    (_, _, down), (_, _, ed) = experts
+    ids, _ = routing(T, "one_expert_all", seed=T)
     a = act(T * TOPK, N, seed=T).view(T, TOPK, N)
     y = ops.moe_mm_ids(a, ids, ed, E)
     ref, S = per_slot_ref(down, ids, a)
@@ -385,7 +423,7 @@ def test_mmv_ids_down_per_slot(ops, experts, ids_dtype):
     assert_within(y, ref, S)
 
 
-# ---------------------------------------------------------------- M3: dequant + Triton prefill path
+# ---------------------------------------------------------------- dequant into a mapped layout
 
 
 def test_dequant_into_interleaves_gate_and_up(ops, experts):
@@ -402,122 +440,3 @@ def test_dequant_into_interleaves_gate_and_up(ops, experts):
         ops.dequant_into(w13[:half - 1], eg, 0, half * N, N, 2 * N)
     with pytest.raises(ValueError, match="whole units"):
         ops.dequant_into(w13, eg, 0, half * N, 4, 8)  # 4-row groups split the 8-row units
-
-
-@pytest.fixture
-def vllm_ctx():
-    from vllm.config import VllmConfig, set_current_vllm_config
-
-    with set_current_vllm_config(VllmConfig()):
-        yield
-
-
-@pytest.mark.parametrize("split", [1, 2, 4])
-@pytest.mark.parametrize("mode", ["uniform", "half_empty"])
-def test_moe_experts_dequant_path(ops, experts, vllm_ctx, split, mode):
-    """Dequant + Triton fused_experts (whole or in expert parts) against the FP64 reference with the batched-path
-    bound (BF16 activation between gate/up and down)."""
-    (gate, up, down), (eg, eu, ed) = experts
-    T = 300
-    x = act(T, H, seed=split)
-    ids, wts = routing(T, mode, seed=split)
-    y = ops.moe_experts_dequant(x, eg, eu, ed, wts, ids, E, split)
-    assert y.dtype == torch.bfloat16 and y.shape == (T, H)
-    ref, bound = moe_ref(x, ids, wts, gate, up, down, mma=True)
-    worst = ((y.double() - ref).abs() / (bound + BF16_REL * ref.abs() + 1e-30)).max().item()
-    assert worst <= 1.0, f"error {worst:.3g} x the bound"
-
-
-@pytest.mark.parametrize("T, dequant", [(63, False), (64, True), (65, True)])
-def test_moe_experts_switches_to_dequant_path_at_threshold(ops, experts, vllm_ctx, monkeypatch, T, dequant):
-    (_, _, _), (eg, eu, ed) = experts
-    calls = []
-    real = ops.moe_experts_dequant
-    monkeypatch.setattr(ops, "MOE_DEQUANT_MIN_TOKENS", 64)
-    monkeypatch.setattr(ops, "moe_experts_dequant", lambda *a, **k: calls.append(1) or real(*a, **k))
-    ids, wts = routing(T, "uniform")
-    ops.moe_experts(act(T, H), eg, eu, ed, wts, ids, E)
-    assert bool(calls) is dequant
-
-
-# ---------------------------------------------------------------- draft-only 4-bit head (M6)
-
-@pytest.mark.parametrize("T", [1, 2, 4])
-@pytest.mark.parametrize("K", [1024, 2048, 4096])
-def test_int4_gemv_matches_dequantized_reference(ops, T, K):
-    """int4_gemv equals x @ deq(q, s)^T computed independently from the documented layout (value + 8 per nibble, even
-    column low, FP32 scale per 128) up to its half2 partial sums (|err| <= 2e-3 * sum |deq x|), and that dequantized
-    matrix stays within half a step of the BF16 weights."""
-    torch.manual_seed(T * K)
-    rows = 1000
-    w = (torch.randn(rows, K, device="cuda") * 0.02).to(torch.bfloat16)
-    w[3] = 0  # all-zero group: scale must not divide by zero
-    q, s = ops.int4_quantize(w)
-    assert q.shape == (rows, K // 2) and s.shape == (rows, K // 128)
-    lo = (q & 15).to(torch.int32) - 8
-    hi = (q >> 4).to(torch.int32) - 8
-    deq = torch.stack([lo, hi], dim=-1).view(rows, K).float() * s.repeat_interleave(128, dim=1)
-    step = s.repeat_interleave(128, dim=1)
-    assert ((deq - w.float()).abs() <= step / 2 + 1e-6).all()
-    assert torch.equal(deq[3], torch.zeros(K, device="cuda"))
-    x = torch.randn(T, K, device="cuda").to(torch.bfloat16)
-    y = ops.int4_gemv(x, q, s)
-    ref = x.double() @ deq.double().t()
-    scale = x.double().abs() @ deq.double().abs().t()
-    assert ((y.double() - ref).abs() <= 2e-3 * scale + 1e-6).all()
-
-
-def test_int4_gemv_rejects_out_of_range_shapes(ops):
-    w = torch.zeros(16, 1024, device="cuda", dtype=torch.bfloat16)
-    q, s = ops.int4_quantize(w)
-    ok = ops.int4_gemv(torch.zeros(4, 1024, device="cuda", dtype=torch.bfloat16), q, s)  # at the T bound
-    assert ok.shape == (4, 16)
-    with pytest.raises((RuntimeError, ValueError)):
-        ops.int4_gemv(torch.zeros(5, 1024, device="cuda", dtype=torch.bfloat16), q, s)  # just above
-    w5 = torch.zeros(16, 512, device="cuda", dtype=torch.bfloat16)
-    q5, s5 = ops.int4_quantize(w5)
-    with pytest.raises((RuntimeError, ValueError)):
-        ops.int4_gemv(torch.zeros(1, 512, device="cuda", dtype=torch.bfloat16), q5, s5)  # K below 1024
-    with pytest.raises((RuntimeError, ValueError)):
-        ops.int4_quantize(torch.zeros(16, 520, device="cuda", dtype=torch.bfloat16))  # K not a multiple of 128
-
-
-def test_draft_logits_matches_separated_fp32_reference_fixture(ops):
-    """This separated FP32-reference fixture checks candidate scores/masking, not full BF16-head equivalence."""
-    torch.manual_seed(7)
-    rows, K = 4096, 2048
-    w = (torch.randn(rows, K) * 0.05).to(torch.bfloat16)
-    W = encode_upload(ops, w, HP, 16, False)
-    q, s = ops.int4_quantize(w.cuda())
-    h = torch.randn(3, K, device="cuda").to(torch.bfloat16)
-    out = ops.draft_logits(h, W, q, s, rows, candidates=16)
-    full = h.float() @ w.cuda().float().t()
-    assert (torch.isfinite(out).sum(dim=1) == 16).all()
-    fin = torch.isfinite(out)
-    torch.testing.assert_close(out[fin], full[fin], rtol=1e-3, atol=1e-3)
-    assert torch.equal(out.argmax(dim=1), full.argmax(dim=1))
-
-
-@pytest.mark.parametrize("delta,rounded,winner", [
-    (2.0**-8 - 2.0**-16, 1.0, 0),  # closest BF16 weight below the output's half-ULP boundary
-    (2.0**-8, 1.0, 0),             # exact tie rounds to the even BF16 value
-    (2.0**-8 + 2.0**-15, 1.0 + 2.0**-7, 1),  # closest BF16 weight above the boundary
-])
-def test_draft_candidate_fp32_scores_preserve_full_head_rounding_boundary(ops, delta, rounded, winner):
-    """Candidate scores stay FP32; the BF16-output head can tie where those scores do not."""
-    rows, K = 512, 1024
-    w = torch.zeros(rows, K, dtype=torch.bfloat16)
-    w[:2, 0] = 1
-    w[1, 1] = delta
-    W = encode_upload(ops, w, NIB)
-    q, s = ops.int4_quantize(w.cuda())
-    h = torch.zeros(1, K, device="cuda", dtype=torch.bfloat16)
-    h[0, :2] = 1
-    full = ops.linear(h, W)
-    draft = ops.draft_logits(h, W, q, s, rows, candidates=2)
-    assert full.dtype == torch.bfloat16 and draft.dtype == torch.float32
-    assert torch.equal(full[0, :2].float(), torch.tensor([1.0, rounded], device="cuda"))
-    assert torch.equal(draft[0, :2], torch.tensor([1.0, 1.0 + delta], device="cuda"))
-    assert torch.isfinite(draft).sum().item() == 2
-    assert full.argmax().item() == winner
-    assert draft.argmax().item() == 1

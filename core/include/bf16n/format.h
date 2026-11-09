@@ -25,6 +25,11 @@ constexpr int K_MAX         = 4096; // escape records hold a 12-bit column
 constexpr int HEADER_BYTES  = 256;
 
 constexpr uint32_t FLAG_CHUNK_MAJOR = 1; // HUFPAIR: lane streams and plane chunk-major inside a unit
+// HUFPAIR, K = 512, R = 16: a unit is a 16-row band in mma.m16n8k16 A-fragment order. Lane (g = lane / 4, t = lane % 4)
+// of each 16x16 tile holds rows g, g + 8 and columns 2t, 2t + 1 (registers a0 and a1) and 2t + 8, 2t + 9 (a2, a3), each
+// an exponent pair; per tile pair p the plane holds 16 bytes per lane at band + 512 p + 16 lane (tile 2p, then 2p + 1;
+// a0..a3, lower column first), and the lane stream codes the lane's pairs tile by tile in register order.
+constexpr uint32_t FLAG_FRAG_ORDER  = 2;
 
 // The first 256 bytes of every aux buffer. Offsets are bytes from the aux start.
 //   NIBBLE : off_a nibble codes (rows*K/2), off_b per-row LUT (rows*16), off_c esc_off u32[rows+1], off_d escapes u32;

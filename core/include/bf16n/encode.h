@@ -19,9 +19,10 @@ struct encoded {
 // Encode `rows` x `K` BF16 bit patterns (row-major).
 //   format = FMT_NIBBLE : R and chunk_major must be 0 / false
 //   format = FMT_HUFFMAN: single-symbol code, R in {1,2,4,8,16}, rows % R == 0, chunk_major false
-//   format = FMT_HUFPAIR: exponent-pair code (chunk_major: K > 512 and R in {4, 8, 16}); falls back to FMT_HUFFMAN when the tensor has more than HP_MAX_PAIRS
-//                         distinct pairs (chunk_major is then dropped: the single-symbol format has no such layout)
-// K % 512 == 0, 512 <= K <= 4096. Throws std::invalid_argument on bad arguments.
-encoded encode(const uint16_t * w, int64_t rows, int64_t K, int format, int R, bool chunk_major);
+//   format = FMT_HUFPAIR: exponent-pair code (chunk_major: K > 512 and R in {4, 8, 16}; frag_order: K = 512, R = 16,
+//                         FLAG_FRAG_ORDER); falls back to FMT_HUFFMAN when the tensor has more than HP_MAX_PAIRS
+//                         distinct pairs (the layout flag is then dropped: the single-symbol format has no such layout)
+// K % 512 == 0, 512 <= K <= 4096. Throws std::invalid_argument on bad arguments (also chunk_major with frag_order).
+encoded encode(const uint16_t * w, int64_t rows, int64_t K, int format, int R, bool chunk_major, bool frag_order = false);
 
 } // namespace bf16n

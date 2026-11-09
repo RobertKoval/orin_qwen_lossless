@@ -162,6 +162,62 @@ def test_pair_alphabet_fallback_boundary(ops, n_pairs, expected):
     assert torch.equal(bits(back.cpu()), bits(w))
 
 
+@pytest.mark.parametrize("bands", [1, 2, 3])
+def test_frag_order_bitwise(ops, bands):
+    w = weights_like_model((16 * bands, 512), seed=40 + bands)
+    enc = encode_upload(ops, w, HP, 16, False, True)
+    assert enc.meta.format == HP and enc.meta.frag_order and not enc.meta.chunk_major
+    assert torch.equal(bits(ops.dequant(enc).cpu()), bits(w))
+
+
+def test_frag_order_special_values_bitwise(ops):
+    w = special_values(32, 512, seed=5)
+    enc = encode_upload(ops, w, HP, 16, False, True)
+    assert torch.equal(bits(ops.dequant(enc).cpu()), bits(w))
+
+
+def test_frag_order_same_code_as_row_major(ops):
+    """Fragment order reorders the same pair code: identical LUT and stream length up to per-lane word padding."""
+    w = weights_like_model((64, 512), seed=9)
+    rm, fo = encode_upload(ops, w, HP, 16), encode_upload(ops, w, HP, 16, False, True)
+    lut = slice(rm.meta.off_a, rm.meta.off_a + 4 * 4096)
+    assert torch.equal(rm.aux[lut].cpu(), fo.aux[lut].cpu())
+    assert abs(rm.aux.numel() - fo.aux.numel()) <= 4 * 32 * 4  # one padding word per lane and band at most
+
+
+@pytest.mark.parametrize("fmt, K, R, cm, ok", [(HP, 512, 16, False, True), (HP, 1024, 16, False, False),
+                                               (HP, 512, 8, False, False), (HP, 2048, 16, True, False),
+                                               (HUF, 512, 16, False, False), (NIB, 512, 0, False, False)])
+def test_frag_order_shape_limits(ops, fmt, K, R, cm, ok):
+    """Fragment order exists for HUFPAIR K = 512, R = 16 bands only: anything else is rejected at encode time."""
+    w = weights_like_model((32, K))
+    if ok:
+        assert encode_upload(ops, w, fmt, R, cm, True).meta.frag_order
+    else:
+        with pytest.raises(ValueError, match="fragment order|fragment-order"):
+            ops.encode(w, fmt, R, cm, True)
+
+
+def test_frag_order_pair_alphabet_fallback(ops):
+    """More than 4096 exponent pairs: the single-symbol fallback has no fragment order, and says so in its meta."""
+    w = pairs_tensor(4097)  # rows a multiple of 8
+    if w.shape[0] % 16:
+        w = torch.cat([w, w[:8]])
+    enc = encode_upload(ops, w, HP, 16, False, True)
+    assert enc.meta.format == HUF and not enc.meta.frag_order
+    assert torch.equal(bits(ops.dequant(enc).cpu()), bits(w))
+
+
+def test_frag_order_row_ranges_match_full(ops):
+    w = weights_like_model((64, 512), seed=8)
+    enc = encode_upload(ops, w, HP, 16, False, True)
+    full = ops.dequant(enc)
+    for r0, n in [(0, 16), (16, 16), (16, 48)]:
+        assert torch.equal(bits(ops.dequant(enc, r0, n)), bits(full[r0 : r0 + n]))
+    with pytest.raises(ValueError, match="whole units"):
+        ops.dequant(enc, 8, 16)
+
+
 def test_dequant_row_ranges_match_full(ops):
     """Dequant of a unit-aligned row range (an expert view) equals that slice of the full decode."""
     w = weights_like_model((64, 2048), seed=7)

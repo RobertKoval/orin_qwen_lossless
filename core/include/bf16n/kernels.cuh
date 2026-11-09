@@ -1490,5 +1490,250 @@ __global__ void __launch_bounds__(NW * 32, 1) k_hp_mm_ids(const hp_ptrs w, const
     }
 }
 
+// ---------------------------------------------------------------- fragment order (FLAG_FRAG_ORDER)
+//
+// HUFPAIR K = 512, R = 16 units (16-row bands) whose plane and lane streams are in mma.m16n8k16 A-fragment order
+// (format.h): per tile pair a lane decodes 8 exponent pairs and assembles the A registers of two 16x16 tiles, rows g and
+// g + 8, columns 2t, 2t + 1 and 2t + 8, 2t + 9 of each. The batched kernel multiplies them straight on the tensor cores
+// (no shared-memory slab, no barrier between decoding and products); the GEMV sums them in FP32.
+
+constexpr int FO_K = 512;
+
+// A registers of tile pair (plane word pl, exponent entries ex[8]): a[0..3] for the even tile, a[4..7] for the odd one
+__device__ __forceinline__ void fo_a(const uint4 & pl, const uint32_t (&ex)[8], uint32_t (&a)[8]) {
+    a[0] = sel_bits(prmt(pl.x, 0, 0x9180u), ex[0]); a[1] = sel_bits(prmt(pl.x, 0, 0xB3A2u), ex[1]);
+    a[2] = sel_bits(prmt(pl.y, 0, 0x9180u), ex[2]); a[3] = sel_bits(prmt(pl.y, 0, 0xB3A2u), ex[3]);
+    a[4] = sel_bits(prmt(pl.z, 0, 0x9180u), ex[4]); a[5] = sel_bits(prmt(pl.z, 0, 0xB3A2u), ex[5]);
+    a[6] = sel_bits(prmt(pl.w, 0, 0x9180u), ex[6]); a[7] = sel_bits(prmt(pl.w, 0, 0xB3A2u), ex[7]);
+}
+
+// exact BF16 bits of bands [row0 / 16, (row0 + nrows) / 16), one warp per band; a[q] of tile k holds columns c, c + 1
+// of row g + 8 (q & 1), c = 16 k + 2t + 8 (q >> 1)
+__global__ void __launch_bounds__(256) k_fo_dequant(const hp_ptrs w, int64_t row0, int64_t nrows, uint16_t * __restrict__ out, orow_map om) {
+    constexpr int K = FO_K;
+    __shared__ uint32_t lut[1 << HP_LP];
+    for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut[i_] = w.lut[i_]; }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    for (int64_t u = blockIdx.x * 8 + warp; u < nrows / 16; u += gridDim.x * 8) {
+        const int64_t gu = row0 / 16 + u;
+        HP_UNIT_BEGIN(w, gu)
+        uint16_t * o0 = out + om(u * 16 + g) * K + 2 * t;
+        uint16_t * o8 = out + om(u * 16 + g + 8) * K + 2 * t;
+        const uint4 * pp = (const uint4 *) (w.sm + gu * 16 * K) + lane;
+        for (int p = 0; p < K / 32; p++) {
+            const uint4 pl = ld_plane(pp + p * 32);
+            uint32_t ex[8], a[8];
+            HP_PAIRS(ex)
+            fo_a(pl, ex, a);
+#pragma unroll
+            for (int kk = 0; kk < 2; kk++) {
+                const int c = (2 * p + kk) * 16;
+                *(uint32_t *) (o0 + c) = a[4 * kk];
+                *(uint32_t *) (o8 + c) = a[4 * kk + 1];
+                *(uint32_t *) (o0 + c + 8) = a[4 * kk + 2];
+                *(uint32_t *) (o8 + c + 8) = a[4 * kk + 3];
+            }
+        }
+    }
+}
+
+// FP32 activation v as the sum of three BF16 values, exactly: hi = v truncated to BF16, mid = (v - hi) truncated, lo =
+// v - hi - mid (at most 8 significant bits left; both subtractions are exact). Part n of v as BF16 bits. Infinities
+// and NaNs stay in hi (a NaN whose payload sits in the truncated bits keeps a quiet bit), mid = lo = 0.
+__device__ __forceinline__ uint32_t fo_split(float v, int n) {
+    const uint32_t u = __float_as_uint(v);
+    if ((u & 0x7F800000u) == 0x7F800000u) {
+        return n == 0 ? (u >> 16) | ((u & 0x007FFFFFu) && !(u & 0x007F0000u) ? 0x40u : 0u) : 0u;
+    }
+    const float hi = __uint_as_float(u & 0xFFFF0000u);
+    const float r1 = v - hi;
+    const float mid = __uint_as_float(__float_as_uint(r1) & 0xFFFF0000u);
+    return __float_as_uint(n == 0 ? hi : n == 1 ? mid : r1 - mid) >> 16;
+}
+
+constexpr int FO_MMV_XB = FO_K / 32 * 3 * 4; // uint4 B-register entries of one column: tile pair, split, t
+inline size_t fo_mmv_shm() { return FO_MMV_XB * 16 + (4u << HP_LP); }
+
+// GEMV on the tensor cores (one column per blockIdx.y, expert ids as in k_hp_mmv): a warp takes a band and multiplies
+// its A fragments with a B operand whose columns 0, 1, 2 are the hi, mid and lo parts of the column's FP32 activations
+// (fo_split; staged once per block in B-register order, lanes g >= 3 supply zero columns). Products are exact, sums
+// FP32 on the tensor cores; y = D[:, 0] + (D[:, 1] + D[:, 2]). Against the FMA form this drops the per-weight unpack
+// and FMA instructions: two mma per tile pair.
+template <typename TX>
+__global__ void __launch_bounds__(HP_NT) k_fo_mmv(const hp_ptrs w, cols_t p) {
+    constexpr int K = FO_K, NP = K / 32, PF = 2; // tile pairs per band, plane words in flight
+    extern __shared__ __align__(16) uint32_t fov_shm[];
+    uint4 * xb = (uint4 *) fov_shm;               // xb[12 q + 4 n + t]: b0, b1 of tile 2q, b0, b1 of tile 2q + 1
+    uint32_t * lut = fov_shm + 4 * FO_MMV_XB;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const TX * xg; ydst out; int64_t rbase;
+    col_setup(p, blockIdx.y, xg, out, rbase);
+    for (int i = threadIdx.x; i < FO_MMV_XB; i += blockDim.x) {
+        const int tt = i & 3, n = (i >> 2) % 3, q = i / 12;
+        uint32_t r[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) { // tile 2q + j / 2, k = 2t (b0) or 2t + 8 (b1) and the next column
+            const int c = 32 * q + 16 * (j >> 1) + 2 * tt + 8 * (j & 1);
+            r[j] = fo_split(load_x1(xg, c), n) | fo_split(load_x1(xg, c + 1), n) << 16;
+        }
+        xb[i] = make_uint4(r[0], r[1], r[2], r[3]);
+    }
+    for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += blockDim.x) { ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i); }
+    __syncthreads();
+    const uint4 * xl = xb + 4 * g + t;
+    for (int64_t u = blockIdx.x * wpb + warp; u < p.nrows / 16; u += gridDim.x * wpb) {
+        const int64_t gu = rbase / 16 + u;
+        HP_UNIT_BEGIN(w, gu)
+        const uint4 * pp = (const uint4 *) (w.sm + gu * 16 * K) + lane;
+        uint4 ring[PF];
+#pragma unroll
+        for (int i = 0; i < PF; i++) { ring[i] = ld_plane(pp + i * 32); }
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int q = 0; q < NP; q++) {
+            const uint4 pl = ring[q % PF];
+            if (q + PF < NP) { ring[q % PF] = ld_plane(pp + (q + PF) * 32); }
+            uint32_t ex[8], a[8];
+            HP_PAIRS(ex)
+            fo_a(pl, ex, a);
+            const uint4 b = g < 3 ? xl[12 * q] : make_uint4(0, 0, 0, 0);
+            mma_bf16(acc, *(const uint32_t (*)[4]) a, b.x, b.y);
+            mma_bf16(acc, *(const uint32_t (*)[4]) (a + 4), b.z, b.w);
+        }
+        // lane (g, t) holds D[g][2t], D[g][2t + 1], D[g + 8][2t], D[g + 8][2t + 1]: hi, mid in t = 0, lo in t = 1
+        const float lo0 = __shfl_down_sync(0xffffffffu, acc[0], 1), lo8 = __shfl_down_sync(0xffffffffu, acc[2], 1);
+        if (t == 0) {
+            out.set(u * 16 + g, acc[0] + (acc[1] + lo0));
+            out.set(u * 16 + g + 8, acc[2] + (acc[3] + lo8));
+        }
+    }
+}
+
+// Batched MUL_MAT_ID (prefill) over fragment-order experts. Persistent: one block per SM walks the items (expert, tile
+// of up to NTOK routed tokens) built from the routing bounds in shared memory, as k_hp_mm_ids does. Per item the
+// tokens' BF16 activations are staged once with cp.async (rows FOM_LD apart: conflict-free ldmatrix); the NW warps
+// take the expert's bands, and per tile pair a lane decodes its A fragments and multiplies them with every 16 staged
+// tokens (ldmatrix.x4 B fragments, FP32 accumulation). Every weight is decoded once per item.
+constexpr int FOM_LD = FO_K + 8; // staged activation row stride (bf16)
+
+inline size_t fo_mm_shm(int ntok, int n_experts) {
+    return (4u << HP_LP) + (size_t) ntok * FOM_LD * 2 + (size_t) (n_experts + 1) * 2 * sizeof(int);
+}
+
+template <int NTOK, int NW>
+__global__ void __launch_bounds__(NW * 32, 1) k_fo_mm_ids(const hp_ptrs w, hpm_args a) {
+    constexpr int K = FO_K, NP = K / 32, NT = NTOK / 8; // tile pairs per band, 8-token mma tiles
+    static_assert(NTOK % 16 == 0, "tokens in pairs of 8-token tiles");
+    extern __shared__ __align__(16) uint32_t fom_shm[];
+    uint32_t * lut = fom_shm;
+    __nv_bfloat16 * xs = (__nv_bfloat16 *) (fom_shm + (1 << HP_LP));
+    const int E = a.n_experts;
+    int * bnd = (int *) (xs + NTOK * FOM_LD); // routing bounds, E + 1
+    int * toff = bnd + E + 1;                 // first item of each expert, E + 1
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int64_t bands = a.rows / 16;
+    const ydst out = {a.dst, a.dst_bf16};
+    for (int i = threadIdx.x; i <= E; i += NW * 32) { bnd[i] = a.bounds[i]; }
+    for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += NW * 32) { ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i); }
+    __syncthreads();
+    if (warp == 0) { // exclusive scan of the items per expert
+        int run = 0;
+        for (int e0 = 0; e0 < E; e0 += 32) {
+            const int e = e0 + lane;
+            const int nt = e < E ? (bnd[e + 1] - bnd[e] + NTOK - 1) / NTOK : 0;
+            int incl = nt;
+#pragma unroll
+            for (int d = 1; d < 32; d <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, incl, d);
+                incl += lane >= d ? y : 0;
+            }
+            if (e < E) { toff[e] = run + incl - nt; }
+            run += __shfl_sync(0xffffffffu, incl, 31);
+        }
+        if (lane == 0) { toff[E] = run; }
+    }
+    __syncthreads();
+    const int n_items = toff[E];
+    // ldmatrix row address of this lane: token (lane / 16) * 8 + lane % 8 of a 16-token group, column 8 ((lane / 8) % 2)
+    const uint32_t xs_s = (uint32_t) __cvta_generic_to_shared(xs);
+    const uint32_t lrow = xs_s + (((lane >> 4) * 8 + (lane & 7)) * FOM_LD + ((lane >> 3) & 1) * 8) * 2;
+    for (int it = blockIdx.x; it < n_items; it += gridDim.x) {
+        int lo = 0, hi = E; // the item belongs to the largest e with toff[e] <= it
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) / 2;
+            if (toff[mid] <= it) { lo = mid; } else { hi = mid; }
+        }
+        const int e = lo;
+        const int jb = bnd[e] + (it - toff[e]) * NTOK;
+        const int ncol = min(NTOK, bnd[e + 1] - jb);
+        const int npair = (ncol + 15) / 16;
+        __syncthreads(); // the previous item's readers of xs are done
+        for (int i = threadIdx.x; i < npair * 16 * (K / 8); i += NW * 32) {
+            const int r = i / (K / 8), c8 = i % (K / 8);
+            __nv_bfloat16 * dst = xs + r * FOM_LD + c8 * 8;
+            if (r < ncol) {
+                cp_async16(dst, a.x + (int64_t) a.ids_src1[jb + r] * a.x_row + c8 * 8);
+            } else {
+                *(uint4 *) dst = make_uint4(0, 0, 0, 0);
+            }
+        }
+        cp_async_commit();
+        cp_async_wait<0>();
+        __syncthreads();
+        for (int64_t band = warp; band < bands; band += NW) {
+            const int64_t gu = (int64_t) e * bands + band;
+            hp_dec d;
+            hp_dec_begin(d, w, gu, lane);
+            float acc[NT][4];
+#pragma unroll
+            for (int n = 0; n < NT; n++) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f; }
+            const uint4 * pp = (const uint4 *) (w.sm + gu * 16 * K) + lane;
+            uint4 nxt = ld_plane(pp);
+#pragma unroll 1
+            for (int q = 0; q < NP; q++) {
+                const uint4 pl = nxt;
+                if (q + 1 < NP) { nxt = ld_plane(pp + (q + 1) * 32); }
+                uint32_t ex[8], af[8];
+#pragma unroll
+                for (int j = 0; j < 8; j++) { ex[j] = hp_pair(d, j, w.stream, lut); }
+                fo_a(pl, ex, af);
+#pragma unroll
+                for (int kk = 0; kk < 2; kk++) {
+                    const uint32_t kofs = (uint32_t) ((2 * q + kk) * 16 * 2);
+                    const uint32_t (&ak)[4] = *(const uint32_t (*)[4]) (af + 4 * kk);
+#pragma unroll
+                    for (int n = 0; n < NT / 2; n++) {
+                        if (n < npair) {
+                            uint32_t b[4];
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                         : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3])
+                                         : "r"(lrow + n * 16 * FOM_LD * 2 + kofs));
+                            mma_bf16(acc[2 * n], ak, b[0], b[1]);
+                            mma_bf16(acc[2 * n + 1], ak, b[2], b[3]);
+                        }
+                    }
+                }
+            }
+            const int64_t row = band * 16 + g;
+#pragma unroll
+            for (int n = 0; n < NT; n++) {
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int col = n * 8 + 2 * t + h;
+                    if (col < ncol) {
+                        const int64_t o = (int64_t) a.ids_dst[jb + col] * a.dst_col + row;
+                        out.set(o, acc[n][h]);
+                        out.set(o + 8, acc[n][2 + h]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace kern
 } // namespace bf16n

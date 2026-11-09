@@ -375,10 +375,10 @@ Hypotheses and the experiment that decided each:
 **Claim boundary:** BF16N reconstructs the target BF16 weights exactly. The draft-only 4-bit candidate selector is
 approximate, and arithmetic kernels can differ despite identical weights. Correct speculative rejection can preserve
 the target sampling distribution with an approximate proposal, provided it uses the actual proposal probabilities
-(or a point mass for deterministic drafting). The default external MTP loop breaker is a separate policy that
-intentionally changes target sampling logits on detected cycles; comparisons with it enabled are not a universal
-claim of equivalence to the unmodified target. An explicit fidelity evaluation disables it and selects the full draft
-head (`VBF16N_LOOP_BREAKER=0 BF16N_DRAFT_HEAD=full`); production defaults are unchanged. See
+(or a point mass for deterministic drafting): the production MTP path drafts deterministically and the rejection sampler
+receives no draft probabilities, i.e. the point-mass branch. Results measured before 11-09 had the host's external MTP
+loop breaker enabled (it penalises target logits on detected repetition cycles); since 11-09 the launcher keeps it off
+and target sampling is unmodified. An explicit evaluation can also select the full draft head (`BF16N_DRAFT_HEAD=full`). See
 [README.md](README.md#fidelity-boundaries).
 
 * **vs llama.cpp BF16N** (`compare_llama.py`, 32K window because the prompt-logprob requests do not fit next to the
@@ -499,3 +499,26 @@ At long context the draft layer's three passes per step read its whole KV cache 
   so the drop comes from the window, not from the shift.
 * **Verdict:** dropped. The MTP layer uses long-range context: acceptance falls 12–17 % at every long length, more
   than the ≈ 6 ms per step saved at 197K. The plugin code was removed.
+
+## 2026-11-09 release: batched MoE prefill, GDN state fixes, unmodified sampling (measured)
+
+Production wheel `0.1.0+ge2e458f10ab4` against the 11-01 release, same launcher configuration:
+
+* **Batched MoE prefill.** Every MoE prefill chunk runs the batched BF16N kernels; the exact dequant into a BF16
+  workspace plus Triton `fused_experts` for chunks of ≥ 4096 tokens is gone (with its 0.4 GB workspace and tuned
+  configs). `bench_prefill.py`, median of 3: 8K 1439 → **1516** tok/s, 23K 1367 → **1488**. Long context
+  (`long_ctx_test.py`, haystack from the llama.cpp tree): prefill 1156 tok/s at 72K and 840 at 197K. The
+  fragment-order down layout halves the batched down kernel (2048 tokens 9.95 → 4.34 ms per layer) but its 4-token
+  decode GEMV is 7 % slower than row-major, so the policy does not choose it.
+* **GDN state correctness** (`hybrid_state.py`). On the 11-01 release `tests/serving/state_checks.py` failed 7 checks:
+  the first 4-token prompt after a start returned NaN (`!!!!!!!!`), `2+2=` depended on the previous request, and five
+  prefix-cache hits were off by 91–98 nats against a no-cache run. All pass now; real hits are bitwise equal to the
+  no-cache run.
+* **Sampling.** The host's MTP loop breaker (≈ 245 interventions in 5775 requests over 11-05..11-09) is off: target
+  sampling is the model's distribution.
+* **Decode** (`bench_openai.py`, 4 prompts × 256 tokens): **41.4** tok/s without logprobs (41.2 before), 40.6 with
+  (40.4). Long context: 29.9 tok/s at 72K (draft acceptance 0.56), 26.5 at 197K (0.63); the 11-04 runs on the same
+  haystack with another prompt salt gave 28.6 / 22.6 at acceptance 0.565 / 0.570, so part of the 197K gain is the
+  different continuation.
+* **Vision.** The FA2 library that runs the ViT attention on this host is a rebuilt one; at the ViT's shapes (16 heads
+  × 72, BF16, 1K–16K tokens) its outputs are bitwise equal to the stock wheel's library.

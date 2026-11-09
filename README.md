@@ -29,8 +29,8 @@ One implementation of the format and kernels (`core/`) runs in two engines: **ll
   flip (see [Limitations](#limitations)).
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671): the model's full 262,144-token window
   and its vision encoder fit beside the weights.
-* **Fast.** ≈ 31 tok/s single-stream decode, 41.2 with the checkpoint's own multi-token-prediction layer as a
-  speculative draft (vLLM; 40.2 in llama.cpp), 830–1480 tok/s prefill on a 60 W board. Per matrix, the fused decode+GEMV beats raw BF16: the
+* **Fast.** ≈ 31 tok/s single-stream decode, 41.4 with the checkpoint's own multi-token-prediction layer as a
+  speculative draft (vLLM; 40.2 in llama.cpp), 830–1520 tok/s prefill on a 60 W board. Per matrix, the fused decode+GEMV beats raw BF16: the
   248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **Two engines, one format.** llama.cpp: an ordinary BF16 GGUF and `LLAMA_BF16N=hybrid`; vLLM: the original
   safetensors and `--quantization bf16n`. Both serve the OpenAI-compatible API with text, images, tools and reasoning.
@@ -53,10 +53,10 @@ Both engines with BF16N on the same board (MAXN, pinned clocks). Decode is singl
 |---|---|---|
 | weights resident | 46.5 GB (0.671), 472/472 tensors bit-exact at load | 43.5 GiB text model + 1.0 MTP layer (+ 0.9 BF16 vision), every tensor bit-exact at load |
 | decode, no draft, same client | 28.6 | 32.7 (FlashInfer, M2); 31.1 in the M6 configuration |
-| decode with the MTP draft, same client | 35.5 (1 draft token) | 40.4 (3 draft tokens); **41.2** without logprobs |
+| decode with the MTP draft, same client | 35.5 (1 draft token) | 40.6 (3 draft tokens); **41.4** without logprobs |
 | decode, `llama-bench` tg64 / `llama-server` MTP (4 × 400 tokens) | 31.2 / 40.2 | — |
-| prefill 8k / 23k tokens | 832–1481 (`llama-bench`, ub 512–4096) / 1192 (server) | 1439 / 1367 (production config) |
-| long-context decode (MTP) | 27.1 @ 64K, 22.6 @ 224K | 28.0 @ 68.5K, 23.6 @ 200K, 21.7 @ 248K |
+| prefill 8k / 23k tokens | 832–1481 (`llama-bench`, ub 512–4096) / 1192 (server) | 1516 / 1488 (production config) |
+| long-context decode (MTP) | 27.1 @ 64K, 22.6 @ 224K | 29.9 @ 72K, 26.5 @ 197K (11-09 haystack); 21.7 @ 248K (11-01) |
 | full 262,144 window + images | yes | yes (images capped at 4.19 MP) |
 | uncompressed BF16, either engine | does not fit: 64.6 GiB > 61.4 GiB | same |
 
@@ -153,8 +153,9 @@ Correctness, methodology and the full history of what was tried: [docs/llamacpp/
 ## vLLM results
 
 Production on the board runs vLLM-BF16N with the shared core (since 2026-11-01): 262,144-token window, vision, MTP
-with 3 draft tokens, prefix caching, tool and reasoning parsers. Short-context decode **41.2 tok/s** (40.4 with
-logprobs), 28.0 tok/s at 68.5K, 23.6 at 200K and 21.7 at 248K; prefill 1439 tok/s at 8K, 1367 at 23K, 727 at 193K;
+with 3 draft tokens, prefix caching, tool and reasoning parsers. Short-context decode **41.4 tok/s** (40.6 with
+logprobs), 29.9 tok/s at 72K and 26.5 at 197K; prefill 1516 tok/s at 8K, 1488 at 23K, 1156 at 72K, 840 at 197K
+(release of 2026-11-09: batched BF16N kernels for every MoE prefill chunk, GDN state fixes; target sampling unmodified);
 ≥ 2.7 GiB free at the full window after a 4K image and a 248K request. Against llama.cpp-BF16N on identical prompts
 and its own tokens: top-1 agreement 99.5 %, mean KL ≈ 2e-3.
 The milestones, the step analysis and what did not help: [docs/vllm/RESULTS.md](docs/vllm/RESULTS.md); design and
@@ -192,7 +193,7 @@ environment variables, the benchmarks and how the patch series is maintained: [d
 ```bash
 # in a vLLM 0.20 venv (JetPack 6, CUDA 12.6, torch 2.11; versions.env), from the original BF16 safetensors
 TORCH_CUDA_ARCH_LIST=8.7 MAX_JOBS=4 pip install . --no-build-isolation --no-deps
-export BF16N_CUDA_SCHED=yield BF16N_MOE_DEQUANT_SPLIT=4 VLLM_WORKER_MULTIPROC_METHOD=spawn
+export BF16N_CUDA_SCHED=yield VLLM_WORKER_MULTIPROC_METHOD=spawn
 python3 -m vllm.entrypoints.openai.api_server --model /path/to/Qwen3.6-35B-A3B \
   --quantization bf16n --dtype bfloat16 --kv-cache-dtype auto --attention-backend TRITON_ATTN \
   --max-model-len 262144 --max-num-seqs 1 --max-num-batched-tokens 4288 --enable-chunked-prefill \
@@ -231,7 +232,7 @@ never change the inputs behind a published number.
 |---|---|
 | `core/` | the format: `include/bf16n/` (format, encoder API, kernels), `src/` (encoder, launchers), `torch/` (torch ops), host tests |
 | `engines/llamacpp/` | patch series against the pinned llama.cpp, `build.sh`, ggml-linked benches |
-| `engines/vllm/` | the `vllm_bf16n` plugin package (+ tuned Triton MoE configs), tools, benches |
+| `engines/vllm/` | the `vllm_bf16n` plugin package, tools, benches |
 | `tests/` | `core/` and `vllm/` (GPU pytest), `serving/` (clients against a running server, either engine) |
 | `bench/` | `prompts/` (frozen inputs), `serving/`, `xengine/` (llama.cpp vs core / vLLM), `micro/` (kernel prototypes) |
 | `tools/` | analysis, charts, Orin samplers |

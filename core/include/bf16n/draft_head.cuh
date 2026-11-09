@@ -2,7 +2,7 @@
 // Draft-only output head for MTP (M6): a 4-bit lm_head copy (symmetric, one FP32 scale per 128 weights) selects
 // candidates, then gathered BF16N rows are re-scored in FP32. Proposals need not equal the full BF16-output head:
 // candidate restriction and output rounding can change the winner. The target does not use these 4-bit weights;
-// that fact alone does not establish sequence equivalence (see docs/vllm/README.md, including the loop breaker).
+// that fact alone does not establish sequence equivalence (see docs/vllm/README.md, fidelity boundaries).
 // Included by launch.cu (one translation unit; keeps the build file list unchanged).
 #pragma once
 #include "bf16n/compat.cuh"

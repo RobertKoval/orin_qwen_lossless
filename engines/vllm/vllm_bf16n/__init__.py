@@ -46,11 +46,6 @@ def cache_key() -> str:
     return h.hexdigest()[:16]
 
 
-def tuned_config_dir() -> str:
-    """Orin-tuned Triton fused-MoE configs shipped with the package; launchers pass it as VLLM_TUNED_CONFIG_FOLDER."""
-    return str(_PKG / "configs" / "fused_moe")
-
-
 _registered = False
 
 

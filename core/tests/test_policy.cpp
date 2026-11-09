@@ -66,6 +66,18 @@ int main() {
             expect(512 * r + 1, 512, 1, forced, FMT_HUFPAIR, 1, false);
         }
     }
+    // Fragment order is never chosen while its decode GEMV is slower than row-major (T-023), for any engine or shape.
+    struct fo_case { int64_t rows, K, n; policy_engine engine; bool fo; };
+    for (const fo_case & f : {fo_case{2048, 512, 256, policy_engine::vllm, false}, fo_case{2048, 512, 256, policy_engine::llama, false},
+                              fo_case{2040, 512, 256, policy_engine::vllm, false}, fo_case{2048, 1024, 256, policy_engine::vllm, false},
+                              fo_case{16384, 512, 1, policy_engine::vllm, false}}) {
+        const auto c = choose(f.rows, f.K, f.n, {f.engine, policy_mode::hybrid, 8ll << 20, f.n > 1});
+        if (!c || c->frag_order != f.fo) {
+            std::fprintf(stderr, "choose(%lld,%lld,%lld,engine=%d): frag_order expected %d\n", (long long) f.rows,
+                         (long long) f.K, (long long) f.n, (int) f.engine, f.fo);
+            ++failures;
+        }
+    }
     expect(64, 2048, 1, vllm, FMT_NIBBLE, 0, false);
     expect(1024, 2048, 1, vllm, FMT_NIBBLE, 0, false);
     expect(8194, 1024, 1, vllm, FMT_HUFPAIR, 2, false);

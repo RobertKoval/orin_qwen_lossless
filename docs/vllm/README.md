@@ -36,7 +36,7 @@ instructions as in llama.cpp. Tests (GPU, on the Orin; memory capped at 40 % per
 `make test-core test-vllm`.
 
 Start: the server command in the [README](../../README.md#vllm) is the production recipe (settings below). The
-board's launcher takes the plugin, the compile-cache key and the tuned Triton configs from the **installed** package
+board's launcher takes the plugin and the compile-cache key from the **installed** package
 and refuses a source checkout unless `VBF16N_ALLOW_SOURCE_PACKAGE=1`.
 
 ## Design
@@ -87,9 +87,11 @@ identical to llama.cpp for llama.cpp's shapes).
   above, one op for Dynamo), `get_rows`, `moe_mm_ids` (routing helper + batched MMA kernel, fused GLU), `moe_combine`
   (deterministic slot sum), `swiglu`, `int4_quantize` / `int4_gemv` (the 4-bit draft head, `ops.draft_logits`),
   `init`.
-* Dispatch thresholds are llama.cpp's: ≤ 8 tokens → GEMV kernels; more → batched kernels. MoE chunks of ≥ 4096 tokens
-  use exact dequant into a BF16 workspace plus vLLM's Triton `fused_experts` with the Orin-tuned configs in
-  `vllm_bf16n/configs/fused_moe` (package data), a part of the experts at a time.
+* Dispatch thresholds are llama.cpp's: ≤ 8 tokens → GEMV kernels; more → batched kernels. Every MoE prefill chunk runs
+  the batched BF16N kernels (`moe_mm_ids`: gate/up with fused GLU, then down), with no BF16 workspace (T-023: +7–10 %
+  prefill over the former dequant + Triton `fused_experts` path for chunks of ≥ 4096 tokens). The fragment-order
+  layout for down experts (`FLAG_FRAG_ORDER`, halves the batched down kernel) exists and is tested, but the policy does
+  not choose it while its 4-token decode GEMV is slower than row-major.
 * CUDA-graph safety: no `cudaMalloc` (workspaces from the caching allocator), no host sync, no `getenv` in hot paths,
   kernel attributes set once in `init()` before capture.
 * Compile cache: BF16N metadata are baked into compiled graphs and vLLM's cache key does not see them, so launchers
@@ -101,6 +103,13 @@ identical to llama.cpp for llama.cpp's shapes).
 * Attention `TRITON_ATTN` with routing (`triton_spec.py`): MTP verification and the first draft step use Triton's
   split-KV kernel, prefill chunks run FlashInfer's paged prefill on the same KV cache.
 * Align-mode prefix caching with asynchronous accepted-token bookkeeping (`async_align.py`).
+* GDN state correctness on vLLM 0.20 (`hybrid_state.py`, T-066), three upstream defects that made the target read a
+  recurrent state not its own: a prefill of exactly 1 + 3 tokens was dispatched to the FULL spec-decode CUDA graph
+  with stale state indices (vllm-project/vllm#53051; NaN on the first such request after a start); a fresh one-token
+  prompt ran the GDN decode kernel on a stale slot; and the hybrid cache coordinator let Mamba groups extend a prefix
+  hit one block past the full-attention hit that the MTP last-block drop had shortened, so the hit counted attention
+  KV that was never computed. `tests/serving/state_checks.py` checks a running server: short prompts independent of
+  the previous request, and prefix-cache hits equal to a no-cache run.
 * MTP with 3 draft tokens; a **lossy, draft-only** 4-bit copy of lm_head selects 32 candidates. Their BF16N weight
   rows are reconstructed exactly and re-scored with FP32 arithmetic; other draft logits become `-inf`. This is not
   the full draft head: it can omit the best token, and its FP32 scores need not select the same token as the ordinary
@@ -114,10 +123,11 @@ identical to llama.cpp for llama.cpp's shapes).
 same-seed generated sequence. Different reductions, kernels and rounding can change logits. The 4-bit candidate
 selector is an additional approximate *draft* representation; `BF16N_DRAFT_HEAD=full` disables it.
 
-The launcher's default MTP loop breaker intentionally changes target sampling logits when a repeated cycle is
-detected. That preserves the requested recovery functionality, **not** the unmodified target's distribution.
-For an explicit fidelity evaluation, use `VBF16N_LOOP_BREAKER=0 BF16N_DRAFT_HEAD=full` (or install with `--fidelity`).
-These are evaluation settings, not a silent change to production defaults.
+Target sampling is the unmodified model distribution: the launcher keeps the host venv's MTP loop breaker (a
+rejection-sampler patch of another engine that penalises detected repetition cycles) off with
+`VLLM_MTP_LOOP_BREAKER_ENABLED=0`. A request that makes the model repeat itself repeats until `max_tokens`; clients
+that want to discourage repetition set the OpenAI sampling parameters (`presence_penalty`, `frequency_penalty`)
+themselves. For an evaluation with the full draft head, use `BF16N_DRAFT_HEAD=full` (or install with `--fidelity`).
 
 An approximate draft need not bias the final target distribution if rejection uses its actual proposal distribution:
 accept with `min(1, p/q)` and recover from normalized `(p-q)+`. Deterministic drafting has a point-mass proposal;
@@ -139,11 +149,9 @@ variables cannot leak in):
 | `VBF16N_VISION` | 1 | vision tower on (BF16) |
 | `VBF16N_MAX_PIXELS` | 4194304 | longest-edge pixel budget per image |
 | `VBF16N_BATCH` | 4288 | `--max-num-batched-tokens` |
-| `VBF16N_MOE_SPLIT` | 4 | → `BF16N_MOE_DEQUANT_SPLIT` |
 | `VBF16N_ATTN` | TRITON_ATTN | attention backend |
 | `VBF16N_PREFIX_CACHE` | 1 | 0 = no prefix caching (GDN cache mode `none`) |
 | `VBF16N_UTIL` | 0.55 | `--gpu-memory-utilization` (only satisfies vLLM's start check on unified memory) |
-| `VBF16N_LOOP_BREAKER` | 1 | the host's MTP loop breaker |
 | `VBF16N_EXTRA`, `VBF16N_NSYS` | — | more vLLM args; nsys profile prefix |
 | `BF16N_API_KEY` | — | `--api-key` |
 
@@ -153,8 +161,6 @@ Plugin knobs (read at import; changing one that shapes compiled graphs needs a f
 |---|---|---|
 | `BF16N_CUDA_SCHED` | unset (launchers: `yield`) | CUDA context scheduling flags, set before CUDA init in every vLLM process (host waits must not slow kernels) |
 | `BF16N_REFERENCE` | 0 | exact dequant + stock kernels everywhere (needs `--enforce-eager`); part of the cache key |
-| `BF16N_MOE_DEQUANT_MIN_TOKENS` | 4096 | MoE chunk size from which prefill uses dequant + Triton `fused_experts` |
-| `BF16N_MOE_DEQUANT_SPLIT` | 2 | expert parts of the dequant workspace |
 | `BF16N_DRAFT_HEAD` | int4 | `full` = draft scores with the exact head |
 | `BF16N_DRAFT_CANDIDATES` | 32 | candidates re-scored exactly by the 4-bit draft head |
 | `BF16N_TRITON_3D`, `BF16N_FI_PREFILL`, `BF16N_ASYNC_ALIGN` | 1 | the M6 routing / bookkeeping, 0 = stock |

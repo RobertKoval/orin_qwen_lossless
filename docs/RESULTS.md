@@ -14,20 +14,20 @@ Benchmark inputs are frozen (`bench/prompts/`). Details and methodology per engi
 | decode, no draft | llama.cpp | 31.2 tok/s (tg64, ±0.3 %); 28.6 same client | `llama-bench`; `bench_openai.py` |
 | decode, no draft | vLLM | 32.7 tok/s (M2, FlashInfer); 31.1 (M6 config) | `bench_openai.py` |
 | decode, MTP draft | llama.cpp | 40.2 tok/s (1 draft token, 4 × 400 tokens); 35.5 same client | `llama-server`; `bench_openai.py` |
-| decode, MTP draft | vLLM | **41.2 tok/s** (3 draft tokens, without logprobs; shared-core release); 40.4 with logprobs | `bench_openai.py` |
+| decode, MTP draft | vLLM | **41.4 tok/s** (3 draft tokens, without logprobs; 2026-11-09 release); 40.6 with logprobs | `bench_openai.py` |
 | prefill 8k | llama.cpp | 832 / 1323 / 1481 tok/s (ub 512 / 2048 / 4096) | `llama-bench` |
-| prefill 8k / 23k | vLLM | 1439 / 1367 tok/s in the production config (1855 / 1756 in the leaner M3 config) | `bench_prefill.py` |
+| prefill 8k / 23k | vLLM | 1516 / 1488 tok/s in the production config (1439 / 1367 before the batched MoE prefill) | `bench_prefill.py` |
 | prefill 23k | llama.cpp | 1192 tok/s | `llama-server`, same client |
 | long-context decode | llama.cpp | 27.1 @ 64K, 22.6 @ 224K (MTP); 25.1 / 16.6 without | `llama-server` / `llama-bench` |
 | long-context prefill | llama.cpp | 648 tok/s at 224K (585 with the MTP draft) | `llama-server` |
-| long-context prefill | vLLM | 1093 tok/s at 71K, 727 at 193K (production config) | `long_ctx_test.py` |
-| long-context decode | vLLM | 28.0 @ 68.5K, 23.6 @ 200K, 21.7 @ 248K (MTP 3) | `long_ctx_test.py` |
+| long-context prefill | vLLM | 1156 tok/s at 72K, 840 at 197K (production config, 2026-11-09) | `long_ctx_test.py` |
+| long-context decode | vLLM | 29.9 @ 72K, 26.5 @ 197K (MTP 3, 2026-11-09 haystack); 21.7 @ 248K (11-01) | `long_ctx_test.py` |
 | free memory, full window + vision | llama.cpp | ≈ 3 GB (process 56.4–56.7 GB after a 4K image) | |
 | free memory, full window + vision | vLLM | ≥ 2.7 GiB after a 4K image and a 248K request | MemFree + Cached |
 | agreement between engines | both | top-1 99.5 %, mean KL ≈ 2e-3 (teacher-forced on llama.cpp's tokens) | `compare_llama.py` |
 | per op: lm_head 248320 × 2048 | both | 4.3 ms fused decode+GEMV vs 5.7 ms cuBLAS BF16 | nsys |
 | per op: prefill MoE | llama.cpp | batched kernel 2.4–2.7× over dequant + cuBLAS | `moe_prefill.cpp` |
-| per op: prefill MoE | vLLM | 22 vs 29.5 ms per layer at 2048 tokens vs dequant + Triton `fused_experts` | nsys |
+| per op: prefill MoE | vLLM | 22 vs 29.5 ms per layer at 2048 tokens vs dequant + Triton `fused_experts`; every chunk batched since 11-09 | nsys |
 
 The vLLM numbers are from the production configuration (full 262,144-token window, vision, MTP with 3 draft tokens,
 prefix caching) unless stated otherwise. The shared-core release (one `core/` for both engines, deployed 2026-11-01)

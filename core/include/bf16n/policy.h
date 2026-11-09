@@ -26,6 +26,7 @@ struct policy_choice {
     int format;
     int R; // 0 for NIBBLE
     bool chunk_major;
+    bool frag_order = false; // vLLM experts with K = 512 (FLAG_FRAG_ORDER); never chosen for llama
 };
 
 // nullopt: shape stays BF16. HUFPAIR is a request; the encoder may fall back to HUFFMAN.

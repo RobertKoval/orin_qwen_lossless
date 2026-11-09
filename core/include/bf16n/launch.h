@@ -19,6 +19,7 @@ struct weight {
     int64_t K = 0, rows = 0;
     int     R = 0;
     bool    cm = false; // HUFPAIR chunk-major units
+    bool    fo = false; // HUFPAIR fragment-order bands (FLAG_FRAG_ORDER: K = 512, R = 16)
     uint64_t off_a = 0, off_b = 0, off_c = 0, off_d = 0;
 };
 

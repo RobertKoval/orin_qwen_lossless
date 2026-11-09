@@ -17,7 +17,7 @@ def mats(ops):
         "shexp": encode_upload(ops, weights_like_model((2 * 512, 2048), seed=3), NIB),
         "gate": encode_upload(ops, weights_like_model((E, N, H), seed=4), HP, 8, True),
         "up": encode_upload(ops, weights_like_model((E, N, H), seed=5), HP, 8, True),
-        "down": encode_upload(ops, weights_like_model((E, H, N), seed=6), HP, 16),
+        "down": encode_upload(ops, weights_like_model((E, H, N), seed=6), HP, 16, False, True),  # vLLM: fragment order
     }
 
 
