@@ -15,7 +15,7 @@ Benchmark inputs are frozen (`bench/prompts/`). Details and methodology per engi
 | decode, no draft | vLLM | 32.7 tok/s (M2, FlashInfer); 31.1 (M6 config) | `bench_openai.py` |
 | decode, MTP draft | llama.cpp | 40.2 tok/s (1 draft token, 4 × 400 tokens); 35.5 same client | `llama-server`; `bench_openai.py` |
 | decode, MTP draft | vLLM | **47.2 tok/s** (3 draft tokens, without logprobs; 2026-11-09); 46.6 with logprobs | `bench_openai.py` |
-| decode, two concurrent streams | vLLM | 23.8 / 24.8 tok/s per stream (`--max-num-seqs 2`, 512 greedy tokens; one stream 41.8 on the same prompts) | `bench_streams.py` |
+| decode, two concurrent streams | vLLM | 23.8 / 24.8 tok/s per stream (`--max-num-seqs 2`, 512 greedy tokens; one stream 41.8 on the same prompts); step 121 ms for two sessions, 68 ms for one | `bench_streams.py`, vLLM log |
 | prefill 8k | llama.cpp | 832 / 1323 / 1481 tok/s (ub 512 / 2048 / 4096) | `llama-bench` |
 | prefill 8k / 23k | vLLM | 1903 / 1744 tok/s in the production config (6432-token chunks; 1762 / 1696 with 4288, 1516 / 1488 before the fragment-order down experts, 1439 / 1367 before the batched MoE prefill) | `bench_prefill.py` |
 | prefill 23k | llama.cpp | 1192 tok/s | `llama-server`, same client |

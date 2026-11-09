@@ -625,10 +625,13 @@ Production wheel `0.1.0+gf43af2f2a28a` against `0.1.0+g34a7b50adf1a`.
 * **Numerics.** Weights stay bit-exact; the sums run in FP32 on the tensor cores in another order (error 0.8–1.4e-7 of
   Σ|w·x| against 1.2–1.7e-8 for the FMA path; bound 1e-5), the class of change of the fragment-order experts. A/B
   greedy outputs diverge only at near ties (top-2 margin ≤ 0.375 nat) after a top-1 logprob drift ≤ 0.19 nat. A
-  column's result no longer depends on what else is batched with it (tested bitwise at 1, 7, 8, 9 tokens).
+  column's GEMV result no longer depends on what else is batched with it (tested bitwise at 1, 7, 8, 9 tokens); server
+  outputs still do, through other operators (router, attention, recurrent state).
 * **A/B** (`:8010`): decode 45.4 → 46.8 tok/s without logprobs, 45.0 → 46.2 with (step −2.5 to −3.6 % per prompt);
-  two concurrent streams 22.1 / 23.3 → 23.8 / 24.8 tok/s each; prefill equal in a swapped-order rerun (8K 1918 / 1917,
-  23K 1761 / 1758).
+  two concurrent sessions (`--max-num-seqs 2`, vLLM's 10-s throughput and acceptance intervals with 2 running): step
+  134 → 121 ms (the same 34a7b50 wheel measured 137 ms in an earlier session), one session 70 → 68 ms; per stream
+  22.1 / 23.3 → 23.8 / 24.8 tok/s, which also moves with acceptance (the same wheel gave 19.9 / 22.4 at acceptance
+  length 2.78 instead of 2.96); prefill equal in a swapped-order rerun (8K 1918 / 1917, 23K 1761 / 1758).
 * **Production**: decode **47.2** tok/s without logprobs (45.6), 46.6 with (44.9); step 77.6 ms at 72K (79.6), 95.1 at
   197K (97.4); haystack decode 32.0 / 29.9 tok/s at draft acceptance 0.50 / 0.62 (the changed text accepts differently:
   34.1 / 28.9 at 0.57 / 0.60); prefill 8K 1900, 23K 1745 (unchanged).

@@ -155,7 +155,7 @@ Correctness, methodology and the full history of what was tried: [docs/llamacpp/
 Production on the board runs vLLM-BF16N with the shared core (since 2026-11-01): 262,144-token window, vision, MTP
 with 3 draft tokens, prefix caching, tool and reasoning parsers. Short-context decode **47.2 tok/s** (46.6 with
 logprobs), 32.0 tok/s at 72K and 29.9 at 197K (step 77.6 / 95.1 ms; draft acceptance varies with the text: 0.50 /
-0.62 on the haystack; with `--max-num-seqs 2` two concurrent streams get 23.8 / 24.8 tok/s each); prefill
+0.62 on the haystack; with `--max-num-seqs 2` a step of two sessions takes 121 ms, 23.8 / 24.8 tok/s each); prefill
 1903 tok/s at 8K, 1744 at 23K, 1269 at 72K, 895 at 197K in 6432-token chunks (releases of 2026-11-09: batched BF16N kernels for every MoE
 prefill chunk with the down experts in tensor-core fragment order, one split-KV program per multi-token sequence, a
 2-bit draft-only candidate head, dense decode GEMVs on the tensor cores (8 tokens per weight decode), GDN state fixes;
