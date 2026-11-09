@@ -14,6 +14,10 @@ ARCH = "Qwen3_5MoeForConditionalGeneration"
 _PKG = pathlib.Path(__file__).resolve().parent
 
 
+# package modules that decide each matrix's encoding: the policy wrapper and its callers, which pass per-module options
+# (linear layers and lm_head opt in to fragment order; T-080 changed lm_head's encoding in embedding.py alone)
+_PKG_KEY_FILES = ("policy.py", "linear.py", "embedding.py", "moe.py")
+
 # encoding-defining sources, hashed in this order; values: path in the repo (package at engines/vllm/vllm_bf16n)
 _KEY_FILES = {
     "format.h": "core/include/bf16n/format.h",
@@ -35,11 +39,12 @@ def _key_source(name: str) -> bytes:
 
 
 def cache_key() -> str:
-    """Key of everything that decides the per-matrix metadata baked into compiled graphs: the format policy, the
-    encoder / format definition, and BF16N_REFERENCE. Launchers put vLLM's caches under a directory named by it
+    """Key of everything that decides the per-matrix metadata baked into compiled graphs: the format policy and the
+    modules that call it with per-module options, the encoder / format definition, and BF16N_REFERENCE. Launchers put vLLM's caches under a directory named by it
     (VLLM_CACHE_ROOT=.../bf16n-<key>, BF16N_CACHE_KEY=<key>); otherwise the compile cache is disabled (config.py)."""
     h = hashlib.sha256()
-    h.update((_PKG / "policy.py").read_bytes())
+    for name in _PKG_KEY_FILES:
+        h.update((_PKG / name).read_bytes())
     for name in _KEY_FILES:
         h.update(_key_source(name))
     h.update(os.environ.get("BF16N_REFERENCE", "0").encode())

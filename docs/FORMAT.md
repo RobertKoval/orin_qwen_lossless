@@ -56,7 +56,8 @@ mapping](#engine-mapping)). It starts with a 256-byte header (`magic "B16N"`, fo
 * **Fragment-order units** (header `flags` bit 1, `R = 16`, vLLM only) hold 16-row bands in `mma.m16n8k16` A-fragment
   order: per 32-column tile pair a lane's 16 plane bytes and 8 exponent pairs are exactly its A registers of two 16×16
   tiles. A unit is a 512-column slab of a band (`K / 512` units per band; for `K = 512` the band), so a decode can be
-  split along K. Used for the down experts (batched prefill on the tensor cores) and for vLLM's dense linear layers:
+  split along K. Used for the down experts (batched prefill on the tensor cores) and for vLLM's dense linear layers and
+  lm_head (a row gather decodes only the 4 lanes of the row's quad, ≈ 1/8 of each slab):
   the decode GEMV multiplies a band's fragments with up to 8 BF16 token columns at once (8 tokens cost about one), and
   a K-split band's slab partial sums are added in slab order, so a column's result does not depend on what is batched
   with it. Same code and LUT as row-major units; per-slab stream offsets add ≈ 0.4 % of the matrix bytes.
@@ -70,7 +71,7 @@ The same rules in both engines (llama.cpp `LLAMA_BF16N=hybrid`, the default; vLL
 | tensor | format |
 |---|---|
 | routed experts (`*_exps`) | HUFPAIR, `R = 16` if ≥ 2048 rows per expert else 8; chunk-major units when `K > 512` |
-| dense with ≥ 8M weights (lm_head, embedding, qkv, gates, out projections) | HUFPAIR, largest `R` with ≥ 512 units; vLLM linear layers (not lm_head / embedding, which `get_rows` reads): 16-row fragment-order bands |
+| dense with ≥ 8M weights (lm_head, embedding, qkv, gates, out projections) | HUFPAIR, largest `R` with ≥ 512 units; vLLM linear layers and lm_head (not the embedding, whose `get_rows` reads every prompt token): 16-row fragment-order bands |
 | smaller dense (k/v, shared expert, α/β) | NIBBLE |
 | F32 router `ffn_gate_inp` | NIBBLE, after checking every value is exactly BF16 |
 

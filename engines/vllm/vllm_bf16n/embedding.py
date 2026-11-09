@@ -39,8 +39,14 @@ class BF16NEmbeddingMethod(QuantizeMethodBase):
 
     def create_weights(self, layer: torch.nn.Module, input_size_per_partition: int, output_partition_sizes: list[int],
                        input_size: int, output_size: int, params_dtype: torch.dtype, **extra_weight_attrs):
+        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
         rows = sum(output_partition_sizes)
-        choice = policy.choose(rows, input_size_per_partition) if params_dtype == torch.bfloat16 else None
+        # lm_head is multiplied (decode GEMV on the tensor cores in fragment order, T-080) and read by get_rows only for
+        # the draft head's few candidate rows; the vocab embedding stays row-major: get_rows of every prompt token
+        lm_head = isinstance(layer, ParallelLMHead)
+        choice = (policy.choose(rows, input_size_per_partition, dense_frag_order=lm_head)
+                  if params_dtype == torch.bfloat16 else None)
         layer.bf16n_choice = choice
         if choice is None:
             self.delegate = UnquantizedEmbeddingMethod()

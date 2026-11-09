@@ -373,14 +373,25 @@ void get_rows(const weight & e, const void * ids, int64_t ids_s0, int64_t n, voi
     BF16N_REQUIRE(n >= 0, "get_rows: n must be nonnegative");
     BF16N_REQUIRE(row0 >= 0 && (n == 0 ? row0 <= e.rows : row0 < e.rows), "get_rows: row0 out of range");
     BF16N_REQUIRE(!e.cm, "get_rows of a chunk-major (expert) matrix");
-    BF16N_REQUIRE(!e.fo, "get_rows of a fragment-order (expert) matrix");
     BF16N_REQUIRE(e.format != FMT_HUFFMAN, "get_rows is not implemented for the single-symbol Huffman format");
     if (n == 0) {
         return;
     }
-    const dim3 grid((unsigned) ((n + 7) / 8));
     const char * ip = (const char *) ids;
     char * dp = (char *) dst;
+    if (e.fo) { // one quad per (row, 512-column slab)
+        const int C = (int) (e.K / FO_K);
+        const dim3 gq((unsigned) ((n * C * 4 + 255) / 256));
+#define FGR(CC) case CC: \
+    if (dst_bf16) { k_fo_get_rows<CC, true><<<gq, 256, 0, stream>>>(hpp(e), ip, ids_s0, n, row0, dp, dst_s1); } \
+    else { k_fo_get_rows<CC, false><<<gq, 256, 0, stream>>>(hpp(e), ip, ids_s0, n, row0, dp, dst_s1); } \
+    break;
+        switch (C) { FGR(1) FGR(2) FGR(4) FGR(8) default: throw std::invalid_argument("bf16n: unsupported K"); }
+#undef FGR
+        BF16N_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const dim3 grid((unsigned) ((n + 7) / 8));
 #define GR(CC)                                                                                                         \
     case CC:                                                                                                           \
         if (e.format == FMT_NIBBLE) {                                                                                  \

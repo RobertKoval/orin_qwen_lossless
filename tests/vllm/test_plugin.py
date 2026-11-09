@@ -177,7 +177,8 @@ def test_fused_moe_accepts_bf16n_method(vllm_env, ops):
 
 
 @pytest.mark.parametrize("layout", ["wheel", "tree"])
-@pytest.mark.parametrize("changed", ["format.h", "encode.cpp", "policy.h", "policy.cpp", "policy.py"])
+@pytest.mark.parametrize("changed", ["format.h", "encode.cpp", "policy.h", "policy.cpp", "policy.py", "linear.py",
+                                     "embedding.py", "moe.py"])
 def test_cache_key_tracks_encoding_and_policy_bytes_and_requires_them(tmp_path, monkeypatch, layout, changed):
     import vllm_bf16n as p
 
@@ -185,20 +186,21 @@ def test_cache_key_tracks_encoding_and_policy_bytes_and_requires_them(tmp_path, 
     files = {n: p._key_source(n) for n in p._KEY_FILES}
     pkg = tmp_path / "engines" / "vllm" / "vllm_bf16n"
     pkg.mkdir(parents=True)
-    (pkg / "policy.py").write_bytes((p._PKG / "policy.py").read_bytes())
+    for n in p._PKG_KEY_FILES:  # the policy wrapper and its callers (per-module options such as fragment order)
+        (pkg / n).write_bytes((p._PKG / n).read_bytes())
     where = {n: pkg / "_keysrc" / n if layout == "wheel" else tmp_path / rel for n, rel in p._KEY_FILES.items()}
     for n, b in files.items():
         where[n].parent.mkdir(parents=True, exist_ok=True)
         where[n].write_bytes(b)
     monkeypatch.setattr(p, "_PKG", pkg)
     assert p.cache_key() == ref                       # same bytes in either layout -> same key
-    changed_path = pkg / "policy.py" if changed == "policy.py" else where[changed]
+    changed_path = pkg / changed if changed in p._PKG_KEY_FILES else where[changed]
     original = changed_path.read_bytes()
     changed_path.write_bytes(original + b"\n")
     assert p.cache_key() != ref                       # changes cannot reuse stale compiled metadata
     changed_path.write_bytes(original)
     assert p.cache_key() == ref
-    if changed != "policy.py":
+    if changed not in p._PKG_KEY_FILES:
         changed_path.unlink()
         with pytest.raises(RuntimeError):             # never silently omit a missing core input
             p.cache_key()

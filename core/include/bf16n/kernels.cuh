@@ -1573,6 +1573,51 @@ __global__ void __launch_bounds__(256) k_fo_dequant(const hp_ptrs w, int64_t row
     }
 }
 
+// GET_ROWS of a fragment-order matrix (lm_head: the draft head's exact rescoring): one quad per (requested row, slab).
+// Row r of a band lives in the 4 lanes 4 (r % 8) + t (registers a0, a2, a4, a6 for r % 16 < 8, else a1, a3, a5, a7),
+// so the quad decodes just those 4 lane streams of the slab unit, about 1/8 of the unit's bytes, and the quad
+// transpose of k_fo_dequant leaves lane t columns 8t .. 8t + 7 of each tile pair. Exact BF16 bits (BF) or FP32.
+template <int C, bool BF>
+__global__ void __launch_bounds__(256) k_fo_get_rows(const hp_ptrs w, const char * __restrict__ ids, int64_t ids_s0,
+        int64_t n, int64_t row0, char * __restrict__ dst, int64_t dst_s1) {
+    constexpr int K = C * FO_K, NP = FO_K / 32;
+    __shared__ uint32_t lut[1 << HP_LP];
+    for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut[i_] = w.lut[i_]; }
+    __syncthreads();
+    const int t = threadIdx.x & 3;
+    const int64_t task0 = ((int64_t) blockIdx.x * blockDim.x + (threadIdx.x & ~31)) / 4; // this warp's first quad
+    if (task0 / C >= n) {
+        return; // warp-uniform: the whole warp is past the last row
+    }
+    const int64_t task = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) / 4;
+    const bool active = task / C < n; // inactive quads of the last warp decode a valid row and store nothing
+    const int64_t i = active ? task / C : n - 1;
+    const int slab = (int) (task % C);
+    const int64_t gr = row0 + *(const int32_t *) (ids + i * ids_s0);
+    const int64_t band = gr / 16;
+    const int rr = (int) (gr % 16), vlane = 4 * (rr % 8) + t;
+    const int64_t unit = band * C + slab;
+    HP_UNIT_BEGIN_AT(w, __ldg(w.ubase + unit) + __ldg(w.lrel + unit * 32 + vlane))
+    const uint4 * pp = (const uint4 *) (w.sm + band * 16 * K + slab * 16 * FO_K) + vlane;
+    char * o = dst + i * dst_s1;
+#pragma unroll 4
+    for (int p = 0; p < NP; p++) {
+        const uint4 pl = ld_plane(pp + p * 32);
+        uint32_t ex[8], a[8];
+        HP_PAIRS(ex)
+        fo_a(pl, ex, a);
+        uint32_t r4[4];
+#pragma unroll
+        for (int e = 0; e < 4; e++) { r4[e] = a[2 * e + (rr >= 8)]; }
+        quad_transpose(r4, t);
+        if (active) {
+            const int64_t c = slab * FO_K + p * 32 + 8 * t;
+            store_w4<BF>(o, c, r4[0], r4[1]);
+            store_w4<BF>(o, c + 4, r4[2], r4[3]);
+        }
+    }
+}
+
 // FP32 activation v as the sum of three BF16 values, exactly: hi = v truncated to BF16, mid = (v - hi) truncated, lo =
 // v - hi - mid (at most 8 significant bits left; both subtractions are exact). Part n of v as BF16 bits. Infinities
 // and NaNs stay in hi (a NaN whose payload sits in the truncated bits keeps a quiet bit), mid = lo = 0.

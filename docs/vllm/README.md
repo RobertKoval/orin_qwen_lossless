@@ -69,13 +69,15 @@ and refuses a source checkout unless `VBF16N_ALLOW_SOURCE_PACKAGE=1`.
 | `self_attn.o_proj`, `linear_attn.out_proj`, MTP `fc` | 2048 × 4096 | HUFPAIR R = 16, fragment order |
 | `linear_attn.in_proj_qkvz` | 12288 × 2048 | HUFPAIR R = 16, fragment order |
 | `linear_attn.in_proj_ba`, shared expert `gate_up_proj` / `down_proj` | 64 × 2048, 1024 × 2048, 2048 × 512 | NIBBLE |
-| `lm_head`, `embed_tokens` | 248320 × 2048 | HUFPAIR R = 16 |
+| `lm_head` | 248320 × 2048 | HUFPAIR R = 16, fragment order |
+| `embed_tokens` | 248320 × 2048 | HUFPAIR R = 16 |
 | router `gate`, `shared_expert_gate`, conv1d, norms, `A_log`, `dt_bias`, vision tower | — | BF16 (not encoded) |
 
 The rules are llama.cpp's (`llama_bf16n_format_for` + the unit sizes of `ggml_backend_cuda_bf16n_convert`), with two
-additions. Linear layers (`linear.py`) opt in to fragment order (`dense_frag_order`): 16-row bands decoded straight into
-tensor-core operands, so the decode GEMV multiplies up to 8 tokens per decode (T-077). `lm_head` and `embed_tokens` stay
-row-major: `get_rows` reads their rows (embedding lookups, the draft head's exact rescoring). For other dense shapes
+additions. Linear layers (`linear.py`) and `lm_head` opt in to fragment order (`dense_frag_order`): 16-row bands
+decoded straight into tensor-core operands, so the decode GEMV multiplies up to 8 tokens per decode (T-077, T-080); the
+draft head's exact rescoring gathers lm_head rows with the fragment-order `get_rows` (one quad per row and slab decodes
+only the lanes holding the row). `embed_tokens` stays row-major: `get_rows` of every prompt token. For other dense shapes
 (rows not a multiple of 16) the dense R comes from a wave model (`policy.dense_R`; identical to llama.cpp for
 llama.cpp's shapes), because vLLM's merged projections leave "largest R with ≥ 512 units" a half-empty second wave.
 

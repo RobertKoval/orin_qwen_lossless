@@ -29,7 +29,7 @@ One implementation of the format and kernels (`core/`) runs in two engines: **ll
   flip (see [Limitations](#limitations)).
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671): the model's full 262,144-token window
   and its vision encoder fit beside the weights.
-* **Fast.** ≈ 31 tok/s single-stream decode, 47.2 with the checkpoint's own multi-token-prediction layer as a
+* **Fast.** ≈ 31 tok/s single-stream decode, 48.0 with the checkpoint's own multi-token-prediction layer as a
   speculative draft (vLLM; 40.2 in llama.cpp), 830–1900 tok/s prefill on a 60 W board. Per matrix, the fused decode+GEMV beats raw BF16: the
   248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **Two engines, one format.** llama.cpp: an ordinary BF16 GGUF and `LLAMA_BF16N=hybrid`; vLLM: the original
@@ -53,10 +53,10 @@ Both engines with BF16N on the same board (MAXN, pinned clocks). Decode is singl
 |---|---|---|
 | weights resident | 46.5 GB (0.671), 472/472 tensors bit-exact at load | 43.5 GiB text model + 1.0 MTP layer (+ 0.9 BF16 vision), every tensor bit-exact at load |
 | decode, no draft, same client | 28.6 | 32.7 (FlashInfer, M2); 31.1 in the M6 configuration |
-| decode with the MTP draft, same client | 35.5 (1 draft token) | 46.6 (3 draft tokens); **47.2** without logprobs |
+| decode with the MTP draft, same client | 35.5 (1 draft token) | 47.3 (3 draft tokens); **48.0** without logprobs |
 | decode, `llama-bench` tg64 / `llama-server` MTP (4 × 400 tokens) | 31.2 / 40.2 | — |
 | prefill 8k / 23k tokens | 832–1481 (`llama-bench`, ub 512–4096) / 1192 (server) | 1903 / 1744 (production config) |
-| long-context decode (MTP) | 27.1 @ 64K, 22.6 @ 224K | 32.0 @ 72K, 29.9 @ 197K (11-09 haystack; step 77.6 / 95.1 ms) |
+| long-context decode (MTP) | 27.1 @ 64K, 22.6 @ 224K | 32.7 @ 72K, 30.4 @ 197K (11-09 haystack; step 76.1 / 93.6 ms) |
 | full 262,144 window + images | yes | yes (images capped at 4.19 MP) |
 | uncompressed BF16, either engine | does not fit: 64.6 GiB > 61.4 GiB | same |
 
@@ -153,12 +153,13 @@ Correctness, methodology and the full history of what was tried: [docs/llamacpp/
 ## vLLM results
 
 Production on the board runs vLLM-BF16N with the shared core (since 2026-11-01): 262,144-token window, vision, MTP
-with 3 draft tokens, prefix caching, tool and reasoning parsers. Short-context decode **47.2 tok/s** (46.6 with
-logprobs), 32.0 tok/s at 72K and 29.9 at 197K (step 77.6 / 95.1 ms; draft acceptance varies with the text: 0.50 /
-0.62 on the haystack; with `--max-num-seqs 2` a step of two sessions takes 121 ms, 23.8 / 24.8 tok/s each); prefill
+with 3 draft tokens, prefix caching, tool and reasoning parsers. Short-context decode **48.0 tok/s** (47.3 with
+logprobs), 32.7 tok/s at 72K and 30.4 at 197K (step 76.1 / 93.6 ms; draft acceptance varies with the text: 0.50 /
+0.62 on the haystack; with `--max-num-seqs 2` a step of two sessions takes 112 ms, 24.6 / 26.3 tok/s each); prefill
 1903 tok/s at 8K, 1744 at 23K, 1269 at 72K, 895 at 197K in 6432-token chunks (releases of 2026-11-09: batched BF16N kernels for every MoE
 prefill chunk with the down experts in tensor-core fragment order, one split-KV program per multi-token sequence, a
-2-bit draft-only candidate head, dense decode GEMVs on the tensor cores (8 tokens per weight decode), GDN state fixes;
+2-bit draft-only candidate head, dense decode GEMVs and lm_head on the tensor cores (8 tokens per weight decode), GDN
+state fixes;
 target sampling unmodified);
 ≥ 2.4 GiB free at the full window after a 4K image and a 246K request. Against llama.cpp-BF16N on identical prompts
 and its own tokens: top-1 agreement 99.5 %, mean KL ≈ 2e-3.

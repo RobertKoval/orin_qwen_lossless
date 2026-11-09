@@ -69,16 +69,21 @@ def test_kbit_gemv_is_the_product_with_the_stored_matrix(ops, bits, K, T):
     assert ((y - ref).abs() <= 2e-2 * bound + 1e-6).all()
 
 
-def test_draft_logits_rescore_every_candidate_exactly(ops):
+@pytest.mark.parametrize("fo", [False, True])
+def test_draft_logits_rescore_every_candidate_exactly(ops, fo):
+    """fo: the lm_head in fragment order (production since T-080): gathered rows are the same bits, so the draft
+    logits are bitwise those of the row-major head."""
     V, K = 4096, 2048
     w = weights_like_model((V, K), seed=7)
     h = (torch.randn(3, K, generator=torch.Generator().manual_seed(3)) * 3).to(torch.bfloat16)
     w[777] = (h[2].float() / h[2].float().norm() * 0.5).to(torch.bfloat16)    # row 2: a clear exact winner
-    enc = encode_upload(ops, w, HP, 4)
+    enc = encode_upload(ops, w, HP, 16, False, True) if fo else encode_upload(ops, w, HP, 4)
     q, s = ops.int2_quantize(w.cuda())
     head = ops.DraftHead(2, q, s, 128)
     h = h.cuda()
     out = ops.draft_logits(h, enc, head, V)
+    if fo:
+        assert torch.equal(out, ops.draft_logits(h, encode_upload(ops, w, HP, 4), head, V))
     cand = head.scores(h).topk(128, dim=-1).indices
     finite = torch.isfinite(out)
     assert torch.equal(finite.sum(1), torch.full((3,), 128, device="cuda"))

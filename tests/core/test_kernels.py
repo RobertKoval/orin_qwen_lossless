@@ -103,13 +103,14 @@ def test_linear_dispatch(ops, dense, name, T):
         assert_within(yb[0], ref + bias.double(), S + bias.double().abs(), out_rel=BF16_REL)
 
 
+@pytest.mark.parametrize("fo", [False, True])
 @pytest.mark.parametrize("T", [9, 17])
-def test_linear_chunked_dequant(ops, T):
+def test_linear_chunked_dequant(ops, T, fo):
     """A matrix above the 64 MiB dequant chunk (lm_head-like) goes through several chunks. Stock torch BF16 GEMMs allow
     reduced-precision (BF16) split-K reductions (allow_bf16_reduced_precision_reduction, default on), so the bound is
     the stock GEMM's: 2^-9 of sum |w x| (a wrong or missing chunk is off by O(1))."""
     w = weights_like_model((17408, 2048), seed=11)  # 71 MB of BF16
-    enc = encode_upload(ops, w, HP, 16)
+    enc = encode_upload(ops, w, HP, 16, False, fo)  # fo: lm_head in fragment order, chunks start at band 1024
     x = act(T, 2048)
     ref, S = gemv_ref(w, x)
     y = ops.linear(x, enc)
@@ -244,10 +245,21 @@ def test_get_rows_rejects_chunk_major(ops):
         ops.get_rows(torch.zeros(1, dtype=torch.int32, device="cuda"), enc)
 
 
-def test_get_rows_rejects_frag_order(ops):
-    enc = encode_upload(ops, weights_like_model((16, 512)), HP, 16, False, True)
-    with pytest.raises(ValueError, match="fragment-order"):
-        ops.get_rows(torch.zeros(1, dtype=torch.int32, device="cuda"), enc)
+@pytest.mark.parametrize("K", [512, 2048, 4096])
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+def test_get_rows_frag_order_exact(ops, K, ids_dtype):
+    """Fragment order (lm_head; the draft head rescores gathered rows): rows in both register halves of a band (r % 16 <
+    8 and >= 8), band edges, repeats, every row; exact BF16 bits and FP32. 10 rows: the last warp has inactive quads."""
+    from test_roundtrip import special_values
+
+    w = special_values(64, K, seed=K)
+    enc = encode_upload(ops, w, HP, 16, False, True)
+    ids = torch.tensor([0, 7, 8, 15, 16, 63, 31, 0, 47, 40], dtype=ids_dtype).cuda()
+    rows = ops.get_rows(ids, enc)
+    assert torch.equal(bits(rows.cpu()), bits(w[ids.cpu()]))
+    as_f32 = ops.get_rows(ids, enc, out_dtype=torch.float32)
+    assert torch.equal(as_f32.view(torch.int32), rows.float().view(torch.int32))
+    assert torch.equal(bits(ops.get_rows(torch.arange(64, dtype=ids_dtype).cuda(), enc).cpu()), bits(w))
 
 
 @pytest.mark.parametrize("T", [1, 2, 4, 9])

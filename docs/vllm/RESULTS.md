@@ -635,3 +635,20 @@ Production wheel `0.1.0+gf43af2f2a28a` against `0.1.0+g34a7b50adf1a`.
 * **Production**: decode **47.2** tok/s without logprobs (45.6), 46.6 with (44.9); step 77.6 ms at 72K (79.6), 95.1 at
   197K (97.4); haystack decode 32.0 / 29.9 tok/s at draft acceptance 0.50 / 0.62 (the changed text accepts differently:
   34.1 / 28.9 at 0.57 / 0.60); prefill 8K 1900, 23K 1745 (unchanged).
+
+## 2026-11-10 seventh release: lm_head in fragment order (measured)
+
+Production wheel `0.1.0+g0fef3fa10de4` against `0.1.0+gf43af2f2a28a`.
+
+* **Change.** The 248320 × 2048 output projection, the largest dense GEMV left row-major, joins the linear layers in
+  fragment order. It was kept row-major because the draft head's exact rescoring gathers its rows; a fragment-order
+  `get_rows` now gathers a row with one quad per 512-column slab, decoding only the 4 lane streams that hold it. The
+  gathered rows are the same bits, so the draft logits are unchanged. The vocab embedding stays row-major.
+* **Kernels** (full lm_head): 1 / 4 / 8 tokens 4232 / 4740 / 9485 → 3950 / 3950 / 3955 µs; `get_rows` of 128 / 256
+  candidate rows 36 / 69 → 19 / 26 µs; 6 MB more metadata.
+* **A/B** (`:8010`, both start orders): greedy outputs identical to the previous release (top-1 logprob drift ≤ 4e-5);
+  one stream +0.6 to +0.7 % on average over the two orders (within the spread); two sessions (`--max-num-seqs 2`) step
+  119 → 112 ms. The first server start after production stops decodes 1.6–2.5 % slower than the next one: earlier A/Bs
+  that ran the old build first credit the new one with part of that.
+* **Production** (same texts as the previous release): decode **48.0** tok/s without logprobs (47.2), 47.3 with (46.6);
+  step 76.1 ms at 72K (77.6), 93.6 at 197K (95.1); prefill 8K 1866, 23K 1732, 72K 1310, 197K 898 (A/B: equal).
