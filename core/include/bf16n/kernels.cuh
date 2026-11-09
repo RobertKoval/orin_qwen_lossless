@@ -1521,34 +1521,54 @@ __device__ __forceinline__ void fo_a(const uint4 & pl, const uint32_t (&ex)[8], 
     a[6] = sel_bits(prmt(pl.w, 0, 0x9180u), ex[6]); a[7] = sel_bits(prmt(pl.w, 0, 0xB3A2u), ex[7]);
 }
 
-// exact BF16 bits of bands [row0 / 16, (row0 + nrows) / 16), one warp per band; a[q] of tile k holds columns c, c + 1
-// of row g + 8 (q & 1), c = 16 k + 2t + 8 (q >> 1)
+// 4 x 4 transpose of 32-bit words across the 4 lanes t of a quad: v[e] of lane t becomes word t of lane e (two
+// exchange rounds, one shuffle per word pair each)
+__device__ __forceinline__ void quad_transpose(uint32_t (&v)[4], int t) {
+#pragma unroll
+    for (int m = 1; m <= 2; m <<= 1) {
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            if (e & m) { continue; }
+            const bool hi = t & m; // this lane keeps v[e ^ m] (hi) or v[e], and receives the other
+            const uint32_t r = __shfl_xor_sync(0xffffffffu, hi ? v[e] : v[e ^ m], m);
+            if (hi) { v[e] = r; } else { v[e ^ m] = r; }
+        }
+    }
+}
+
+// exact BF16 bits of bands [row0 / 16, (row0 + nrows) / 16), one warp per 16 x 512 slab unit. a[q] of tile k holds
+// columns c, c + 1 of row g + 8 (q & 1), c = 16 k + 2t + 8 (q >> 1): per tile pair and row, word e of lane t is columns
+// 8e + 2t, 8e + 2t + 1, so a quad transpose leaves lane t columns 8t .. 8t + 7 for one 16-byte store per row
+template <int C>
 __global__ void __launch_bounds__(256) k_fo_dequant(const hp_ptrs w, int64_t row0, int64_t nrows, uint16_t * __restrict__ out) {
-    constexpr int K = FO_K;
+    constexpr int K = C * FO_K, NP = FO_K / 32, PF = 2;
     __shared__ uint32_t lut[1 << HP_LP];
     for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut[i_] = w.lut[i_]; }
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
-    for (int64_t u = blockIdx.x * 8 + warp; u < nrows / 16; u += gridDim.x * 8) {
-        const int64_t gu = row0 / 16 + u;
-        HP_UNIT_BEGIN(w, gu)
-        uint16_t * o0 = out + (u * 16 + g) * K + 2 * t;
-        uint16_t * o8 = out + (u * 16 + g + 8) * K + 2 * t;
-        const uint4 * pp = (const uint4 *) (w.sm + gu * 16 * K) + lane;
-        for (int p = 0; p < K / 32; p++) {
-            const uint4 pl = ld_plane(pp + p * 32);
+    for (int64_t u = blockIdx.x * 8 + warp; u < nrows / 16 * C; u += gridDim.x * 8) {
+        const int64_t band = u / C;
+        const int slab = (int) (u % C);
+        HP_UNIT_BEGIN(w, row0 / 16 * C + u)
+        uint16_t * o0 = out + (band * 16 + g) * K + slab * FO_K + 8 * t;
+        uint16_t * o8 = o0 + 8 * K;
+        const uint4 * pp = (const uint4 *) (w.sm + (row0 / 16 + band) * 16 * K + slab * 16 * FO_K) + lane;
+        uint4 ring[PF];
+#pragma unroll
+        for (int i = 0; i < PF; i++) { ring[i] = ld_plane(pp + i * 32); }
+#pragma unroll
+        for (int p = 0; p < NP; p++) {
+            const uint4 pl = ring[p % PF];
+            if (p + PF < NP) { ring[p % PF] = ld_plane(pp + (p + PF) * 32); }
             uint32_t ex[8], a[8];
             HP_PAIRS(ex)
             fo_a(pl, ex, a);
-#pragma unroll
-            for (int kk = 0; kk < 2; kk++) {
-                const int c = (2 * p + kk) * 16;
-                *(uint32_t *) (o0 + c) = a[4 * kk];
-                *(uint32_t *) (o8 + c) = a[4 * kk + 1];
-                *(uint32_t *) (o0 + c + 8) = a[4 * kk + 2];
-                *(uint32_t *) (o8 + c + 8) = a[4 * kk + 3];
-            }
+            uint32_t r0[4] = {a[0], a[2], a[4], a[6]}, r8[4] = {a[1], a[3], a[5], a[7]};
+            quad_transpose(r0, t);
+            quad_transpose(r8, t);
+            *(uint4 *) (o0 + p * 32) = make_uint4(r0[0], r0[1], r0[2], r0[3]);
+            *(uint4 *) (o8 + p * 32) = make_uint4(r8[0], r8[1], r8[2], r8[3]);
         }
     }
 }
@@ -1642,6 +1662,111 @@ __global__ void __launch_bounds__(HP_NT) k_fo_mmv(const hp_ptrs w, cols_t p) {
         if (t == 0) {
             out.set(u * 16 + g, acc[0] + (acc[1] + lo0));
             out.set(u * 16 + g + 8, acc[2] + (acc[3] + lo8));
+        }
+    }
+}
+
+// Dense GEMV of up to 8 BF16 columns on the tensor cores (T-077): one decode of the matrix feeds mma.m16n8k16 whose B
+// columns are the tokens (exact BF16, zero columns past ncols), so 8 tokens cost about one. A group of C warps takes a
+// band, warp s its slab s (K-split: bands alone are too few for 2048-row matrices); slab 0 adds the other slabs' FP32
+// partial sums in slab order through shared memory. Every reduction depends on the matrix shape only (no atomics, no
+// dependence on the column count or the grid), and mma keeps output columns independent: a column's result is the
+// same bits whatever else is batched with it. Activations are staged row-major (rows LD apart: conflict-free ldmatrix,
+// whose four 8x8 matrices are the B registers of a tile pair), only the ncols present: the lanes addressing an absent
+// token's row read one 16-byte zero block instead (less shared memory, more L1 for the lane streams at 1-4 tokens).
+// Warps per block (a multiple of C, at most 15 groups: one named barrier each) are the launcher's wave choice. Band
+// starts are pipelined as in k_fo_mmv.
+constexpr int FO8_NTOK = 8;
+inline size_t fo8_shm(int C, int ncols, int nw) {
+    return (4u << HP_LP) + (size_t) ncols * (C * FO_K + 8) * 2 + 16 + (C > 1 ? (size_t) nw * 32 * 16 : 0);
+}
+
+template <int C>
+__global__ void __launch_bounds__(1024) k_fo_mmv8(const hp_ptrs w, cols_t p, int ncols) {
+    constexpr int K = C * FO_K, LD = K + 8, NP = FO_K / 32, PF = 2;
+    extern __shared__ __align__(16) uint32_t fo8_shm_raw[];
+    uint32_t * lut = fo8_shm_raw;
+    __nv_bfloat16 * xs = (__nv_bfloat16 *) (lut + (1 << HP_LP));
+    uint4 * zero = (uint4 *) (xs + ncols * LD);
+    float4 * part = (float4 *) (zero + 1); // [warps][32] slab partial sums (C > 1)
+    const int nw = blockDim.x >> 5, G = nw / C;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int gid = warp / C, s = warp % C;
+    for (int i = threadIdx.x; i < ncols * (K / 8); i += blockDim.x) {
+        const int r = i / (K / 8), c8 = i % (K / 8);
+        *(uint4 *) (xs + r * LD + c8 * 8) = __ldg((const uint4 *) (p.x + r * p.x_tok) + c8);
+    }
+    if (threadIdx.x == 0) { *zero = make_uint4(0, 0, 0, 0); }
+    for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += blockDim.x) { ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i); }
+    __syncthreads();
+    // ldmatrix row address: token lane % 8, columns 8 (lane / 8) of tile pair 0 of this warp's slab (64 bytes per tile
+    // pair), or the zero block for an absent token
+    const bool present = (lane & 7) < ncols;
+    const uint32_t lrow = present ? (uint32_t) __cvta_generic_to_shared(xs) + ((lane & 7) * LD + s * FO_K + 8 * (lane >> 3)) * 2
+                                  : (uint32_t) __cvta_generic_to_shared(zero);
+    const uint32_t lstep = present ? 64 : 0;
+    const int64_t b0 = p.row0 / 16, bands = p.nrows / 16, bstep = (int64_t) gridDim.x * G;
+    const int64_t u0 = (int64_t) blockIdx.x * G + gid;
+    uint32_t s_next = 0; // this lane's stream position in its warp's next unit
+    if (u0 < bands) {
+        const int64_t un = (b0 + u0) * C + s;
+        s_next = __ldg(w.ubase + un) + __ldg(w.lrel + un * 32 + lane);
+    }
+    for (int64_t u = u0; u < bands; u += bstep) {
+        const int64_t gb = b0 + u;
+        const bool has_next = u + bstep < bands;
+        uint32_t ub_n = 0, lr_n = 0;
+        if (has_next) {
+            const int64_t un = (gb + bstep) * C + s;
+            ub_n = __ldg(w.ubase + un);
+            lr_n = __ldg(w.lrel + un * 32 + lane);
+        }
+        HP_UNIT_BEGIN_AT(w, s_next)
+        const uint4 * pp = (const uint4 *) (w.sm + gb * 16 * K + s * 16 * FO_K) + lane;
+        uint4 ring[PF];
+#pragma unroll
+        for (int i = 0; i < PF; i++) { ring[i] = ld_plane(pp + i * 32); }
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int q = 0; q < NP; q++) {
+            if (q == NP / 2 && has_next) {
+                s_next = ub_n + lr_n;
+                prefetch_l1(lst + s_next);
+            }
+            const uint4 pl = ring[q % PF];
+            if (q + PF < NP) { ring[q % PF] = ld_plane(pp + (q + PF) * 32); }
+            uint32_t ex[8], a[8], b[4];
+            HP_PAIRS(ex)
+            fo_a(pl, ex, a);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(lrow + q * lstep));
+            mma_bf16(acc, *(const uint32_t (*)[4]) a, b[0], b[1]);
+            mma_bf16(acc, *(const uint32_t (*)[4]) (a + 4), b[2], b[3]);
+        }
+        if (C > 1) { // slab 0 sums the group's partials in slab order
+            if (s > 0) { part[warp * 32 + lane] = make_float4(acc[0], acc[1], acc[2], acc[3]); }
+            asm volatile("bar.sync %0, %1;" :: "r"(1 + gid), "r"(C * 32) : "memory");
+            if (s == 0) {
+#pragma unroll
+                for (int j = 1; j < C; j++) {
+                    const float4 v = part[(warp + j) * 32 + lane];
+                    acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w;
+                }
+            }
+            asm volatile("bar.sync %0, %1;" :: "r"(1 + gid), "r"(C * 32) : "memory");
+        }
+        // lane (g, t) holds D[g][2t], D[g][2t + 1], D[g + 8][2t], D[g + 8][2t + 1]: rows g, g + 8 of tokens 2t, 2t + 1
+        if (s == 0) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int n = 2 * t + h;
+                if (n < ncols) {
+                    const ydst out = {p.dst + n * p.dst_tok, p.dst_bf16};
+                    out.set(u * 16 + g, acc[h]);
+                    out.set(u * 16 + g + 8, acc[2 + h]);
+                }
+            }
         }
     }
 }

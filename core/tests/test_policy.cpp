@@ -78,6 +78,21 @@ int main() {
             ++failures;
         }
     }
+    // Dense fragment order: only on the vLLM caller's opt-in (linear layers), rows % 16 == 0, after the NIBBLE threshold;
+    // llama ignores it.
+    struct dfo_case { int64_t rows, K; policy_engine engine; int R; bool fo; };
+    for (const dfo_case & f : {dfo_case{12288, 2048, policy_engine::vllm, 16, true}, dfo_case{2048, 4096, policy_engine::vllm, 16, true},
+                               dfo_case{2056, 4096, policy_engine::vllm, 2, false}, dfo_case{12288, 2048, policy_engine::llama, 16, false},
+                               dfo_case{1024, 2048, policy_engine::vllm, 0, false}}) {
+        policy_options o{f.engine, policy_mode::hybrid, 8ll << 20, false};
+        o.dense_frag_order = true;
+        const auto c = choose(f.rows, f.K, 1, o);
+        if (!c || c->frag_order != f.fo || c->R != f.R) {
+            std::fprintf(stderr, "choose(%lld,%lld,dense opt-in,engine=%d): expected R=%d frag_order %d\n", (long long) f.rows,
+                         (long long) f.K, (int) f.engine, f.R, f.fo);
+            ++failures;
+        }
+    }
     expect(64, 2048, 1, vllm, FMT_NIBBLE, 0, false);
     expect(1024, 2048, 1, vllm, FMT_NIBBLE, 0, false);
     expect(8194, 1024, 1, vllm, FMT_HUFPAIR, 2, false);

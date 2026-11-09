@@ -64,18 +64,20 @@ and refuses a source checkout unless `VBF16N_ALLOW_SOURCE_PACKAGE=1`.
 | vLLM module | rows × K | format |
 |---|---|---|
 | experts w13 (gate, up) | 256 × 512 × 2048 each | HUFPAIR R = 8, chunk-major |
-| experts w2 (down) | 256 × 2048 × 512 | HUFPAIR R = 16 |
-| `self_attn.qkv_proj` (merged q, k, v) | 9216 × 2048 | HUFPAIR R = 2 |
-| `self_attn.o_proj`, `linear_attn.out_proj`, MTP `fc` | 2048 × 4096 | HUFPAIR R = 4 |
-| `linear_attn.in_proj_qkvz` | 12288 × 2048 | HUFPAIR R = 8 |
+| experts w2 (down) | 256 × 2048 × 512 | HUFPAIR R = 16, fragment order |
+| `self_attn.qkv_proj` (merged q, k, v) | 9216 × 2048 | HUFPAIR R = 16, fragment order |
+| `self_attn.o_proj`, `linear_attn.out_proj`, MTP `fc` | 2048 × 4096 | HUFPAIR R = 16, fragment order |
+| `linear_attn.in_proj_qkvz` | 12288 × 2048 | HUFPAIR R = 16, fragment order |
 | `linear_attn.in_proj_ba`, shared expert `gate_up_proj` / `down_proj` | 64 × 2048, 1024 × 2048, 2048 × 512 | NIBBLE |
 | `lm_head`, `embed_tokens` | 248320 × 2048 | HUFPAIR R = 16 |
 | router `gate`, `shared_expert_gate`, conv1d, norms, `A_log`, `dt_bias`, vision tower | — | BF16 (not encoded) |
 
-The rules are llama.cpp's (`llama_bf16n_format_for` + the unit sizes of `ggml_backend_cuda_bf16n_convert`), with one
-addition: vLLM merges projections into shapes (qkvz 12288 rows, qkv 9216) where llama.cpp's "largest R with ≥ 512
-units" leaves a half-empty second wave of the decode GEMV, so the dense R comes from a wave model (`policy.dense_R`;
-identical to llama.cpp for llama.cpp's shapes).
+The rules are llama.cpp's (`llama_bf16n_format_for` + the unit sizes of `ggml_backend_cuda_bf16n_convert`), with two
+additions. Linear layers (`linear.py`) opt in to fragment order (`dense_frag_order`): 16-row bands decoded straight into
+tensor-core operands, so the decode GEMV multiplies up to 8 tokens per decode (T-077). `lm_head` and `embed_tokens` stay
+row-major: `get_rows` reads their rows (embedding lookups, the draft head's exact rescoring). For other dense shapes
+(rows not a multiple of 16) the dense R comes from a wave model (`policy.dense_R`; identical to llama.cpp for
+llama.cpp's shapes), because vLLM's merged projections leave "largest R with ≥ 512 units" a half-empty second wave.
 
 ### Ops (`torch.ops.bf16n`)
 
@@ -94,7 +96,10 @@ identical to llama.cpp for llama.cpp's shapes).
   in fragment order (`FLAG_FRAG_ORDER`): each lane's stream and plane bytes are its `mma` A-fragment elements, so the
   batched kernel multiplies them straight on the tensor cores (2048 tokens: 9.95 → 4.34 ms per layer), and the
   tensor-core decode GEMV loads the next band's stream position ahead of the current band (4 tokens: 290 µs per layer,
-  row-major 298).
+  row-major 298). Dense linear layers in fragment order take `k_fo_mmv8`: one decode of a band feeds `mma` with up to 8
+  BF16 token columns, a group of `K / 512` warps splits the band along K and slab 0 adds the partial sums in slab order
+  (in_proj_qkvz 12288 × 2048: 1 / 4 / 8 tokens 213 / 245 / 490 → 212 / 213 / 216 µs; prefill keeps exact dequant +
+  cuBLAS).
 * CUDA-graph safety: no `cudaMalloc` (workspaces from the caching allocator), no host sync, no `getenv` in hot paths,
   kernel attributes set once in `init()` before capture.
 * Compile cache: BF16N metadata are baked into compiled graphs and vLLM's cache key does not see them, so launchers

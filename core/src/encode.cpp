@@ -315,11 +315,12 @@ std::vector<uint8_t> encode_huffman(const uint16_t * w, int64_t rows, int64_t K,
 // correlated (pair entropy ~2.05 vs ~2.53 bit/weight). Returns empty if the tensor has > 2^HP_LP distinct pairs.
 // Lane streams of a unit (R rows) are row-major (row 0 over all K, then row 1, ...) or, with cm, chunk-major (512-column
 // chunk 0 of rows 0..R-1, then chunk 1, ...). Chunk-major lets a batched kernel decode a K-slab of many rows at a time;
-// such units also keep their sign|mantissa plane chunk-major (see encode() below). With fo (FLAG_FRAG_ORDER, K = 512,
-// R = 16) a lane's stream holds its pairs of the 16-row band tile by tile, in A-register order (fo_pair).
+// such units also keep their sign|mantissa plane chunk-major (see encode() below). With fo (FLAG_FRAG_ORDER, R = 16) a
+// unit is a 16-row x 512-column slab of a band (slab s of band b is unit b * K / 512 + s; K = 512: the band) and a
+// lane's stream holds its pairs of the slab tile by tile, in A-register order (fo_pair).
 std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K, int R, bool cm, bool fo) {
     const int64_t C = K / 512;
-    const int64_t units = rows / R;
+    const int64_t units = fo ? rows / 16 * C : rows / R;
     auto ex = [&](int64_t i) { return (w[i] >> 7) & 0xFF; };
     std::vector<uint64_t> freq(65536, 0);
     {
@@ -384,11 +385,12 @@ std::vector<uint8_t> encode_huffpair(const uint16_t * w, int64_t rows, int64_t K
                 }
             };
             if (fo) {
-                for (int64_t kt = 0; kt < K / 16; kt++) {
+                const int64_t band = u / C, slab = u % C;
+                for (int64_t kt = slab * 32; kt < slab * 32 + 32; kt++) {
                     for (int q = 0; q < 4; q++) {
                         int r, c;
                         fo_pair(l, q, r, c);
-                        put((u * R + r) * K + kt * 16 + c);
+                        put((band * 16 + r) * K + kt * 16 + c);
                     }
                 }
             } else {
@@ -463,8 +465,8 @@ encoded encode(const uint16_t * w, int64_t rows, int64_t K, int format, int R, b
         if (chunk_major && (K == CHUNK || (R != 4 && R != 8 && R != 16))) {
             bad("chunk-major units need K > 512 and R in {4, 8, 16} (the chunk-major kernels' instances)");
         }
-        if (frag_order && (format != FMT_HUFPAIR || chunk_major || K != CHUNK || R != 16)) {
-            bad("fragment order exists only for HUFPAIR with K = 512 and R = 16, without chunk-major units");
+        if (frag_order && (format != FMT_HUFPAIR || chunk_major || R != 16)) {
+            bad("fragment order exists only for HUFPAIR with R = 16, without chunk-major units");
         }
     } else {
         bad("unknown format " + std::to_string(format));

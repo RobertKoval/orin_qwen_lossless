@@ -20,13 +20,16 @@ struct policy_options {
     // llama's loader classifies by "_exps" in the tensor name, independently of n_matrices.
     // vLLM classifies by n_matrices > 1 and ignores this flag.
     bool expert = false;
+    // vLLM linear layers (the caller's opt-in; not embeddings, whose get_rows reads row-major units): dense HUFPAIR
+    // matrices with rows % 16 == 0 in fragment order, for the tensor-core decode GEMV. Ignored by llama.
+    bool dense_frag_order = false;
 };
 
 struct policy_choice {
     int format;
     int R; // 0 for NIBBLE
     bool chunk_major;
-    bool frag_order = false; // vLLM experts with K = 512 (FLAG_FRAG_ORDER); never chosen for llama
+    bool frag_order = false; // vLLM experts with K = 512, opted-in vLLM dense (FLAG_FRAG_ORDER); never for llama
 };
 
 // nullopt: shape stays BF16. HUFPAIR is a request; the encoder may fall back to HUFFMAN.

@@ -409,12 +409,15 @@ TORCH_LIBRARY_IMPL(bf16n, CUDA, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "BF16N lossless BF16 weight ops (registered as torch.ops.bf16n)";
-    m.def("choose", [](int64_t rows, int64_t K, int64_t n_matrices)
+    m.def("choose", [](int64_t rows, int64_t K, int64_t n_matrices, bool dense_frag_order)
             -> std::optional<std::tuple<int, int, bool, bool>> {
-        const auto c = bf16n::choose(rows, K, n_matrices); // vLLM defaults; no CUDA access
+        bf16n::policy_options opts; // vLLM defaults; no CUDA access
+        opts.dense_frag_order = dense_frag_order;
+        const auto c = bf16n::choose(rows, K, n_matrices, opts);
         if (!c) {
             return std::nullopt;
         }
         return std::make_tuple(c->format, c->R, c->chunk_major, c->frag_order);
-    }, pybind11::arg("rows"), pybind11::arg("K"), pybind11::arg("n_matrices") = 1);
+    }, pybind11::arg("rows"), pybind11::arg("K"), pybind11::arg("n_matrices") = 1,
+       pybind11::arg("dense_frag_order") = false);
 }

@@ -19,10 +19,11 @@ class Choice:
     frag_order: bool = False
 
 
-def choose(rows_per_matrix: int, K: int, n_matrices: int = 1) -> Choice | None:
-    """Choose encoding for n_matrices of rows_per_matrix x K; None leaves the weights BF16."""
+def choose(rows_per_matrix: int, K: int, n_matrices: int = 1, dense_frag_order: bool = False) -> Choice | None:
+    """Choose encoding for n_matrices of rows_per_matrix x K; None leaves the weights BF16. dense_frag_order: the
+    caller's matrix is only multiplied (a linear layer, never get_rows): 16-row bands in fragment order."""
     import torch  # noqa: F401; load libtorch symbols before the native extension
     from . import _C
 
-    c = _C.choose(rows_per_matrix, K, n_matrices)
+    c = _C.choose(rows_per_matrix, K, n_matrices, dense_frag_order)
     return None if c is None else Choice(*c)

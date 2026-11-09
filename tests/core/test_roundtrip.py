@@ -185,11 +185,13 @@ def test_frag_order_same_code_as_row_major(ops):
     assert abs(rm.aux.numel() - fo.aux.numel()) <= 4 * 32 * 4  # one padding word per lane and band at most
 
 
-@pytest.mark.parametrize("fmt, K, R, cm, ok", [(HP, 512, 16, False, True), (HP, 1024, 16, False, False),
-                                               (HP, 512, 8, False, False), (HP, 2048, 16, True, False),
-                                               (HUF, 512, 16, False, False), (NIB, 512, 0, False, False)])
+@pytest.mark.parametrize("fmt, K, R, cm, ok", [(HP, 512, 16, False, True), (HP, 1024, 16, False, True),
+                                               (HP, 4096, 16, False, True), (HP, 512, 8, False, False),
+                                               (HP, 2048, 16, True, False), (HUF, 512, 16, False, False),
+                                               (NIB, 512, 0, False, False)])
 def test_frag_order_shape_limits(ops, fmt, K, R, cm, ok):
-    """Fragment order exists for HUFPAIR K = 512, R = 16 bands only: anything else is rejected at encode time."""
+    """Fragment order exists for HUFPAIR R = 16 bands (any K: 512-column slab units), without chunk-major units:
+    anything else is rejected at encode time."""
     w = weights_like_model((32, K))
     if ok:
         assert encode_upload(ops, w, fmt, R, cm, True).meta.frag_order

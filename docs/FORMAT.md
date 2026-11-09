@@ -53,6 +53,13 @@ mapping](#engine-mapping)). It starts with a 256-byte header (`magic "B16N"`, fo
 * **Chunk-major units** (header `flags` bit 0) order the streams chunks → rows → pairs instead, and store the plane chunk-major
   (see above). Used for 3-D expert tensors with `K > 512` (gate and up), so the batched kernel can decode a 512-column slab of
   many rows at a time; for `K = 512` (down) the two orders coincide. Same size; the GEMV adds per-chunk partial sums.
+* **Fragment-order units** (header `flags` bit 1, `R = 16`, vLLM only) hold 16-row bands in `mma.m16n8k16` A-fragment
+  order: per 32-column tile pair a lane's 16 plane bytes and 8 exponent pairs are exactly its A registers of two 16×16
+  tiles. A unit is a 512-column slab of a band (`K / 512` units per band; for `K = 512` the band), so a decode can be
+  split along K. Used for the down experts (batched prefill on the tensor cores) and for vLLM's dense linear layers:
+  the decode GEMV multiplies a band's fragments with up to 8 BF16 token columns at once (8 tokens cost about one), and
+  a K-split band's slab partial sums are added in slab order, so a column's result does not depend on what is batched
+  with it. Same code and LUT as row-major units; per-slab stream offsets add ≈ 0.4 % of the matrix bytes.
 * Chosen whenever the tensor has ≤ 4096 distinct exponent pairs (true for every tensor of Qwen3.6-35B-A3B); otherwise the
   single-symbol variant 2 (`HUFFMAN`, max code length 10, 1024-entry LUT) is used.
 
@@ -63,7 +70,7 @@ The same rules in both engines (llama.cpp `LLAMA_BF16N=hybrid`, the default; vLL
 | tensor | format |
 |---|---|
 | routed experts (`*_exps`) | HUFPAIR, `R = 16` if ≥ 2048 rows per expert else 8; chunk-major units when `K > 512` |
-| dense with ≥ 8M weights (lm_head, embedding, qkv, gates, out projections) | HUFPAIR, largest `R` with ≥ 512 units |
+| dense with ≥ 8M weights (lm_head, embedding, qkv, gates, out projections) | HUFPAIR, largest `R` with ≥ 512 units; vLLM linear layers (not lm_head / embedding, which `get_rows` reads): 16-row fragment-order bands |
 | smaller dense (k/v, shared expert, α/β) | NIBBLE |
 | F32 router `ffn_gate_inp` | NIBBLE, after checking every value is exactly BF16 |
 

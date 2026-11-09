@@ -251,18 +251,44 @@ def test_get_rows_rejects_frag_order(ops):
 
 
 @pytest.mark.parametrize("T", [1, 2, 4, 9])
-@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.bfloat16])
-def test_mmv_dense_frag_order(ops, T, input_dtype, output_dtype):
-    """Fragment-order GEMV without ids (columns = tokens) against the FP64 reference; BF16 output = rounded FP32."""
+def test_mmv_dense_frag_order_fp32_input(ops, T, output_dtype):
+    """FP32 activations on a K = 512 fragment-order matrix (k_fo_mmv: hi / mid / lo BF16 parts) against FP64."""
     w = weights_like_model((64, 512), seed=T)
     enc = encode_upload(ops, w, HP, 16, False, True)
-    x = act(T, 512, seed=T, dtype=input_dtype)
+    x = act(T, 512, seed=T, dtype=torch.float32)
     y = ops.mmv(x, enc)
     ref, S = gemv_ref(w, x)
     assert_within(y, ref, S)
     if output_dtype == torch.bfloat16:
         assert torch.equal(bits(ops.mmv(x, enc, out_dtype=output_dtype)), bits(y.to(torch.bfloat16)))
+
+
+# one band; 129 bands (a group of the K-split takes a second band: next-band pipelining, uneven groups); K = 512:
+# 520 bands, more than one per 32-warp group
+@pytest.mark.parametrize("rows, K", [(16, 512), (16, 2048), (16, 4096), (2064, 512), (2064, 2048), (2064, 4096), (8320, 512)])
+def test_mmv_dense_frag_order(ops, rows, K):
+    """Dense fragment order (tensor-core GEMV of up to 8 BF16 columns, bands K-split into 512-column slabs): exact
+    dequant; FP32 accumulation within the GEMV bound; BF16 output = rounded FP32; every column bitwise the same whatever
+    else is batched with it (1, 7, 8 columns; 9 = two launches); linear above 8 tokens = exact dequant + stock GEMM."""
+    w = weights_like_model((rows, K), seed=rows + K)
+    enc = encode_upload(ops, w, HP, 16, False, True)
+    wc = w.cuda()
+    assert torch.equal(bits(ops.dequant(enc)), bits(wc))
+    x = act(9, K, seed=K)
+    ref, S = gemv_ref(w, x)
+    y9 = ops.mmv(x, enc)
+    assert_within(y9, ref, S)
+    assert torch.equal(bits(ops.mmv(x, enc, out_dtype=torch.bfloat16)), bits(y9.to(torch.bfloat16)))
+    for t0, t1 in ((0, 1), (0, 7), (0, 8), (8, 9), (3, 9)):
+        assert torch.equal(ops.mmv(x[t0:t1].contiguous(), enc).view(torch.int32), y9[t0:t1].view(torch.int32)), (t0, t1)
+    assert torch.equal(bits(ops.linear(x, enc)), bits(F.linear(x, wc)))
+
+
+def test_mmv_frag_order_k_split_rejects_fp32_input(ops):
+    enc = encode_upload(ops, weights_like_model((16, 2048)), HP, 16, False, True)
+    with pytest.raises(ValueError, match="BF16 activations"):
+        ops.mmv(act(1, 2048, dtype=torch.float32), enc)
 
 
 # ---------------------------------------------------------------- MoE

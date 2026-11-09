@@ -121,14 +121,17 @@ std::vector<uint16_t> decode(const encoded & e, int64_t rows, int64_t K) {
             const uint32_t ub = at<uint32_t>(e.aux, h.off_b + 4 * u);
             for (int l = 0; l < 32; l++) {
                 bits bs{e.aux, ub + at<uint16_t>(e.aux, h.off_c + 2 * (u * 32 + l)), h.off_d};
-                for (int64_t kt = 0; fo && kt < K / 16; kt++) { // the lane's pairs tile by tile, in register order
+                // fragment order: unit u = slab u % C of band u / C; the lane's pairs of the slab tile by tile, in
+                // register order
+                const int64_t band = fo ? (int64_t) u / C : 0, kt0 = fo ? (int64_t) (u % C) * (CHUNK / 16) : 0;
+                for (int64_t kt = kt0; fo && kt < kt0 + CHUNK / 16; kt++) {
                     for (int q = 0; q < 4; q++) {
                         int r, c;
                         fo_rc(l, q, r, c);
                         const uint32_t v = at<uint32_t>(e.aux, h.off_a + 4 * bs.peek(HP_LP));
                         bs.skip((int) (v & 0x7F));
-                        ex[(u * 16 + r) * K + kt * 16 + c]     = (int) ((v >> 7) & 0xFF);
-                        ex[(u * 16 + r) * K + kt * 16 + c + 1] = (int) ((v >> 23) & 0xFF);
+                        ex[(band * 16 + r) * K + kt * 16 + c]     = (int) ((v >> 7) & 0xFF);
+                        ex[(band * 16 + r) * K + kt * 16 + c + 1] = (int) ((v >> 23) & 0xFF);
                     }
                 }
                 for (int64_t o = 0; !fo && o < (int64_t) h.R * C; o++) {
@@ -244,10 +247,15 @@ int main() {
         }
     }
 
-    // fragment order: K = 512 bands of 16 rows
-    for (int64_t rows : {16, 48}) {
-        const std::vector<uint16_t> w = model_like(rows * CHUNK, (uint32_t) rows);
-        round_trip(("hufpair fo rows=" + std::to_string(rows)).c_str(), w, rows, CHUNK, FMT_HUFPAIR, 16, false, FMT_HUFPAIR, true);
+    // fragment order: bands of 16 rows, units of 512-column slabs (K = 512: one per band)
+    for (int64_t K : {(int64_t) CHUNK, (int64_t) 2048, (int64_t) K_MAX}) {
+        for (int64_t rows : {16, 48}) {
+            const std::vector<uint16_t> w = model_like(rows * K, (uint32_t) (rows + K));
+            const encoded e = encode(w.data(), rows, K, FMT_HUFPAIR, 16, false, true);
+            CHECK(at<aux_header>(e.aux, 0).n_a == (uint64_t) (rows / 16 * (K / CHUNK)), "fo K=%lld: one unit per slab", (long long) K);
+            round_trip(("hufpair fo K=" + std::to_string(K) + " rows=" + std::to_string(rows)).c_str(), w, rows, K,
+                       FMT_HUFPAIR, 16, false, FMT_HUFPAIR, true);
+        }
     }
 
     // HUFPAIR falls back to HUFFMAN (still lossless) above HP_MAX_PAIRS distinct exponent pairs, not at it
@@ -291,7 +299,7 @@ int main() {
         return [=, &z]() { encode(z.data(), rows, K, fmt, R, cm, true); };
     };
     CHECK(!throws(enc_fo(16, 512, FMT_HUFPAIR, 16, false)), "fragment order at K = 512, R = 16 rejected");
-    CHECK(throws(enc_fo(16, 1024, FMT_HUFPAIR, 16, false)), "fragment order at K = 1024 accepted");
+    CHECK(!throws(enc_fo(16, 1024, FMT_HUFPAIR, 16, false)), "fragment order at K = 1024 (two slabs) rejected");
     CHECK(throws(enc_fo(16, 512, FMT_HUFPAIR, 8, false)), "fragment order with R = 8 accepted");
     CHECK(throws(enc_fo(32, 1024, FMT_HUFPAIR, 16, true)), "fragment order with chunk-major accepted");
     CHECK(throws(enc_fo(16, 512, FMT_HUFFMAN, 16, false)), "HUFFMAN fragment order accepted");

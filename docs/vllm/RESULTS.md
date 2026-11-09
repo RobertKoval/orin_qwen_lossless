@@ -608,3 +608,27 @@ Production wheel `0.1.0+g34a7b50adf1a` against `0.1.0+geb8b3e5c7006`.
   without logprobs, 41.8 → 44.7 with; 72K 30.1 → 32.4, 197K 26.3 → 27.4.
 * **Production**: decode **45.6** tok/s without logprobs (42.3), 44.9 with (41.9); 72K 34.1 (31.9), 197K 28.9 (27.1),
   step 79.6 / 97.4 ms (85.0 / 103.6), all at identical acceptance; prefill unchanged (8K 1873–1903, 23K 1747).
+
+## 2026-11-09 sixth release: dense decode GEMVs on the tensor cores (measured)
+
+Production wheel `0.1.0+gf43af2f2a28a` against `0.1.0+g34a7b50adf1a`.
+
+* **Cause.** After the fifth release a two-session step (8 verified tokens) cost about two one-session steps: the dense
+  multi-column GEMV did FMA work per column (8 columns 1.6–1.9× of 4), the routed experts read per token, attention ran
+  per sequence. Two concurrent streams got ≈ 52 % of one stream each, the aggregate equal to one stream.
+* **Change.** vLLM's dense linear layers are encoded as 16-row bands in `mma` A-fragment order (units of 512-column
+  slabs, docs/FORMAT.md); `k_fo_mmv8` decodes a band once and multiplies it with up to 8 BF16 token columns on the
+  tensor cores, K-split into slabs whose partial sums are added in slab order. `lm_head` and `embed_tokens` stay
+  row-major (`get_rows`). Per call on real layer matrices, 1 / 4 / 8 tokens: in_proj_qkvz 213 / 245 / 490 → 212 / 213 /
+  216 µs, qkv_proj 164 / 188 / 375 → 168 / 169 / 173, o_proj and out_proj 62 / 81 / 161 → 59–60 / 64–66 / 65–68. Exact
+  dequant (prefill) as fast as row-major after a per-slab rewrite (in_proj 579 → 557 µs, qkv_proj 378 → 412).
+* **Numerics.** Weights stay bit-exact; the sums run in FP32 on the tensor cores in another order (error 0.8–1.4e-7 of
+  Σ|w·x| against 1.2–1.7e-8 for the FMA path; bound 1e-5), the class of change of the fragment-order experts. A/B
+  greedy outputs diverge only at near ties (top-2 margin ≤ 0.375 nat) after a top-1 logprob drift ≤ 0.19 nat. A
+  column's result no longer depends on what else is batched with it (tested bitwise at 1, 7, 8, 9 tokens).
+* **A/B** (`:8010`): decode 45.4 → 46.8 tok/s without logprobs, 45.0 → 46.2 with (step −2.5 to −3.6 % per prompt);
+  two concurrent streams 22.1 / 23.3 → 23.8 / 24.8 tok/s each; prefill equal in a swapped-order rerun (8K 1918 / 1917,
+  23K 1761 / 1758).
+* **Production**: decode **47.2** tok/s without logprobs (45.6), 46.6 with (44.9); step 77.6 ms at 72K (79.6), 95.1 at
+  197K (97.4); haystack decode 32.0 / 29.9 tok/s at draft acceptance 0.50 / 0.62 (the changed text accepts differently:
+  34.1 / 28.9 at 0.57 / 0.60); prefill 8K 1900, 23K 1745 (unchanged).

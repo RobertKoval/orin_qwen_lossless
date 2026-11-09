@@ -105,3 +105,22 @@ def test_frag_order_only_for_k512_experts(rows, K, n, frag_order):
     c = choose(rows, K, n)
     assert c.frag_order is frag_order
     assert not (c.frag_order and c.chunk_major)
+
+
+@pytest.mark.parametrize(
+    "rows, K, expected",
+    [
+        (12288, 2048, Choice(HP, 16, False, True)),  # linear_attn.in_proj_qkvz
+        (9216, 2048, Choice(HP, 16, False, True)),   # self_attn.qkv_proj
+        (2048, 4096, Choice(HP, 16, False, True)),   # o_proj / out_proj / mtp.fc
+        (248320, 2048, Choice(HP, 16, False, True)),
+        (2056, 4096, Choice(HP, 2, False)),          # rows % 16 != 0: no bands, the row-major wave model's R
+        (1024, 2048, Choice(NIB, 0, False)),         # small dense: NIBBLE whatever the opt-in
+        (64, 2048, Choice(NIB, 0, False)),
+    ],
+)
+def test_dense_frag_order_opt_in(rows, K, expected):
+    """Linear layers opt in to fragment order (tensor-core decode GEMV); without the opt-in (embeddings, get_rows) the
+    same shape keeps the row-major choice."""
+    assert choose(rows, K, 1, dense_frag_order=True) == expected
+    assert choose(rows, K, 1).frag_order is False

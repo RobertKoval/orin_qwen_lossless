@@ -22,7 +22,8 @@ class BF16NLinearMethod(LinearMethodBase):
     def create_weights(self, layer: torch.nn.Module, input_size_per_partition: int, output_partition_sizes: list[int],
                        input_size: int, output_size: int, params_dtype: torch.dtype, **extra_weight_attrs):
         rows = sum(output_partition_sizes)
-        choice = policy.choose(rows, input_size_per_partition) if params_dtype == torch.bfloat16 else None
+        choice = (policy.choose(rows, input_size_per_partition, dense_frag_order=True)
+                  if params_dtype == torch.bfloat16 else None)
         layer.bf16n_choice = choice
         if choice is None:  # stays BF16: the stock method, real parameters, no layerwise processing
             self.delegate = UnquantizedLinearMethod()

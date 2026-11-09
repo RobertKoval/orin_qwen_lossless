@@ -83,6 +83,15 @@ cols_t make_cols(const mmv_args & a) {
     return p;
 }
 
+// dense fragment-order GEMV: 32 warps per block (30 for C = 2: at most 15 groups of C, one named barrier each), one
+// block per SM. Fewer warps per block levelled the bands per group better but lost more to latency (T-077: 24 and 16
+// warps 1-26 % slower on the four dense shapes). The block count never changes a result, only which group takes a band.
+void fo8_launch_dims(int C, int64_t bands, int & nw, unsigned & blocks) {
+    nw = C > 1 && 32 / C > 15 ? 15 * C : 32;
+    const int64_t G = nw / C;
+    blocks = (unsigned) std::max<int64_t>(1, std::min<int64_t>(g_sms, (bands + G - 1) / G));
+}
+
 // multi-column GEMV: NC x K activations in their input type, then the LUT
 template <typename TX> size_t mc_shm(int C, int NC) { return (size_t) NC * C * 512 * sizeof(TX) + (4u << HP_LP); }
 
@@ -101,7 +110,28 @@ void launch_mmv_t(const weight & e, const cols_t & p, int ncols, cudaStream_t st
         dim3 g2; int nt;
         hp_launch_dims(e, p.nrows, ncols, g2, nt);
         const size_t shm = K * sizeof(TX) + (4u << HP_LP); // activations in the input type
-        if (e.fo) {
+        if (e.fo && !p.ids && sizeof(TX) == 2) {
+            // dense fragment order: up to 8 BF16 columns per launch on the tensor cores, bands split into slabs
+            const int C = (int) (K / FO_K);
+            int nw; unsigned blocks;
+            fo8_launch_dims(C, p.nrows / 16, nw, blocks);
+            for (int c0 = 0; c0 < ncols; c0 += FO8_NTOK) {
+                cols_t q = p;
+                q.x += c0 * p.x_tok;
+                q.dst += c0 * p.dst_tok;
+                const int nc = std::min(FO8_NTOK, ncols - c0);
+                const size_t shm = fo8_shm(C, nc, nw);
+                switch (C) {
+#define FO8_CASE(CC) case CC: k_fo_mmv8<CC><<<blocks, nw * 32, shm, stream>>>(hpp(e), q, nc); break;
+                    FO8_CASE(1) FO8_CASE(2) FO8_CASE(4) FO8_CASE(8)
+#undef FO8_CASE
+                    default: throw std::invalid_argument("bf16n: unsupported K");
+                }
+            }
+        } else if (e.fo) {
+            if (K != FO_K) {
+                throw std::invalid_argument("bf16n: fragment-order matrices with K > 512 take BF16 activations without expert ids");
+            }
             k_fo_mmv<TX><<<g2, nt, fo_mmv_shm(), stream>>>(hpp(e), p);
         } else if (e.cm) {
 #define CM_CASE(CC, RR) case CC * 100 + RR: k_hp_mmv_cm<TX, CC, RR><<<g2, nt, shm, stream>>>(hpp(e), p); break;
@@ -203,8 +233,8 @@ void check_weight(const weight & w) {
     BF16N_REQUIRE(w.format == FMT_NIBBLE || w.format == FMT_HUFFMAN || w.format == FMT_HUFPAIR, "unknown format");
     BF16N_REQUIRE(w.format == FMT_NIBBLE || (w.R > 0 && w.rows % w.R == 0), "rows must be a multiple of R");
     BF16N_REQUIRE(!w.cm || w.format == FMT_HUFPAIR, "chunk-major units exist only for HUFPAIR");
-    BF16N_REQUIRE(!w.fo || (w.format == FMT_HUFPAIR && !w.cm && w.K == FO_K && w.R == 16),
-                  "fragment order exists only for HUFPAIR with K = 512 and R = 16, without chunk-major units");
+    BF16N_REQUIRE(!w.fo || (w.format == FMT_HUFPAIR && !w.cm && w.R == 16),
+                  "fragment order exists only for HUFPAIR with R = 16, without chunk-major units");
 }
 
 void ensure_init() { std::call_once(g_once, [] {
@@ -223,6 +253,9 @@ void ensure_init() { std::call_once(g_once, [] {
     MC_ATTRS(float) MC_ATTRS(bf16)
 #undef MC_ATTRS
 #undef MC_ATTR
+#define FO8_ATTR(CC) BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mmv8<CC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fo8_shm(CC, FO8_NTOK, 32)));
+    FO8_ATTR(1) FO8_ATTR(2) FO8_ATTR(4) FO8_ATTR(8)
+#undef FO8_ATTR
     BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mm_ids<FO_NTOK, FO_NW>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                           (int) std::min<size_t>(g_smem_optin, fo_mm_shm(FO_NTOK, MM_MAX_EXPERTS_INIT))));
 #define MM_ATTR(CC, RR, NW, IL, WT, B, G) BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_hp_mm_ids<CC, RR, NW, IL, WT, B, G>, \
@@ -302,7 +335,7 @@ void dequant(const weight & e, int64_t row0, int64_t nrows, uint16_t * out, cuda
     if (nrows == 0) {
         return;
     }
-    const int64_t work = e.format == FMT_NIBBLE ? nrows : nrows / e.R;
+    const int64_t work = e.format == FMT_NIBBLE ? nrows : e.fo ? nrows / 16 * (e.K / FO_K) : nrows / e.R; // one warp each
     const int gx = (int) std::max<int64_t>(1, std::min<int64_t>((work + 7) / 8, (int64_t) g_sms * 16));
     if (e.format != FMT_NIBBLE) {
         BF16N_REQUIRE(nrows % e.R == 0 && row0 % e.R == 0, "dequant rows must be whole units");
@@ -313,7 +346,7 @@ void dequant(const weight & e, int64_t row0, int64_t nrows, uint16_t * out, cuda
         if (e.format == FMT_NIBBLE) {                                                                                  \
             k_nibble_dequant<CC><<<gx, 256, 0, stream>>>(np.sm, np.nib, np.lut_row, np.esc_off, np.esc, row0, nrows, out); \
         } else if (e.fo) {                                                                                             \
-            k_fo_dequant<<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out);                                        \
+            k_fo_dequant<CC><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out);                                    \
         } else if (e.format == FMT_HUFPAIR && e.cm) {                                                                  \
             switch (e.R) {                                                                                             \
                 case 4: k_hp_dequant_cm<CC, 4><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out); break;              \
