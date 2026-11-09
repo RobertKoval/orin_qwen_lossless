@@ -59,4 +59,5 @@ for n in lengths:
         print(f"{pt:6d} tokens: {runs[-1]:7.1f} tok/s", flush=True)
     res[n] = runs
     print(f"== {n}: median {statistics.median(runs):.0f}, min {min(runs):.0f}, max {max(runs):.0f} tok/s", flush=True)
+(root / "out").mkdir(exist_ok=True)  # a clean checkout has no out/ (crashed after printing, 11-09)
 json.dump(res, open(root / f"out/prefill-{os.environ.get('TAG', 'run')}.json", "w"))

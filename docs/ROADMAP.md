@@ -47,7 +47,8 @@ matrices, 6 % in the gated delta net, 4.3 % in F32→BF16 conversions, 3.3 % in 
    at 2048 tokens, 4.84 → 3.00 ms at 512; gate/up (K = 2048) not better yet. **Done for the down experts in vLLM
    (2026-11-09):** every MoE prefill chunk runs the batched BF16N kernels and the down experts are encoded in fragment
    order (down 9.95 → 4.34 ms per layer at 2048 tokens; prefill 8K 1439 → 1762 tok/s, 23K 1367 → 1696, 197K → 892);
-   the fragment-order decode GEMV is no slower than row-major (4 tokens 290 vs 298 µs per layer). Open: gate/up.
+   the fragment-order decode GEMV is faster than row-major at 2–4 tokens (4 tokens 290 vs 298 µs per layer) and within
+   noise at 1. Open: gate/up.
 2. **Conversions** (≈ 4 %, at bandwidth): every BF16N matmul converts its F32 input again (≈ 300 conversions per
    forward for ≈ 80 distinct tensors). Converting each tensor once is worth ≈ 2 % and needs a BF16 buffer that lives
    across ops and stays valid under CUDA graph replay.
