@@ -6,8 +6,8 @@ encoder, kernels in `core/`, used by both engines), `[llamacpp]`, `[vllm]`. Numb
 [vllm/RESULTS.md](vllm/RESULTS.md), M6); "gain" estimates come from the measurements in [RESULTS.md](llamacpp/RESULTS.md) and are
 hypotheses until measured with alternating A/B runs.
 
-Production runs the vLLM engine (since 10-30; releases of 2026-11-09: 42.3 tok/s short decode with MTP 3, 31.9 @ 72K,
-27.1 @ 197K, prefill 1903 tok/s at 8k); llama.cpp is the rollback engine. The fragment-order down experts in vLLM's
+Production runs the vLLM engine (since 10-30; releases of 2026-11-09: 45.6 tok/s short decode with MTP 3, 34.1 @ 72K,
+28.9 @ 197K, prefill 1903 tok/s at 8k); llama.cpp is the rollback engine. The fragment-order down experts in vLLM's
 prefill (Stage 1) are done; next: parallel requests on the production server.
 
 ## Ceiling `[core]`

@@ -35,6 +35,14 @@ __device__ __forceinline__ float load_x1(const __nv_bfloat16 * x, int64_t i) {
     return __uint_as_float((uint32_t) __ldg((const unsigned short *) x + i) << 16);
 }
 
+// elements i .. i+3 of activations staged in shared memory in their input type (BF16 inputs stay BF16: half the bytes)
+__device__ __forceinline__ float4 xs_load4(const float * xs, int i) { return *(const float4 *) (xs + i); }
+__device__ __forceinline__ float4 xs_load4(const __nv_bfloat16 * xs, int i) {
+    const uint2 v = *(const uint2 *) (xs + i);
+    return make_float4(__uint_as_float(v.x << 16), __uint_as_float(v.x & 0xFFFF0000u), __uint_as_float(v.y << 16),
+                       __uint_as_float(v.y & 0xFFFF0000u));
+}
+
 // one output vector (column) in FP32 or BF16
 struct ydst {
     char * p;
@@ -514,7 +522,7 @@ __device__ __forceinline__ uint64_t shl64w(uint64_t b, uint32_t n) { // {hi:lo} 
                 if (q_ % 2 == 0) { pa = ent_; } else { pb = ent_; }                                  \
             }                                                                                        \
             _Pragma("unroll") for (int j_ = 0; j_ < 4; j_++) {                                       \
-                const float4 xv_ = XREG_C1 ? xr[j_] : *(const float4 *) (xs + c_ * 512 + 128 * j_ + 4 * lane); \
+                const float4 xv_ = XREG_C1 ? xr[j_] : xs_load4(xs, c_ * 512 + 128 * j_ + 4 * lane);          \
                 const uint32_t w0_ = sel_bits(prmt(smw_[j_], 0, 0x9180u), ex_[2 * j_]);              \
                 const uint32_t w1_ = sel_bits(prmt(smw_[j_], 0, 0xB3A2u), ex_[2 * j_ + 1]);          \
                 a0_ = fmaf(__uint_as_float(w0_ << 16), xv_.x, a0_);                                  \
@@ -527,20 +535,20 @@ __device__ __forceinline__ uint64_t shl64w(uint64_t b, uint32_t n) { // {hi:lo} 
     }
 
 #define HP_STAGE(XG, LUT_SRC, LUT_DST)                                                               \
-    for (int i_ = threadIdx.x; i_ < K; i_ += blockDim.x) { xs[i_] = to_f((XG)[i_]); }               \
+    for (int i_ = threadIdx.x; i_ < K; i_ += blockDim.x) { xs[i_] = (XG)[i_]; } /* in the input type */ \
     for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { (LUT_DST)[i_] = (LUT_SRC)[i_]; }
 
 #define HP_XREG                                                                                      \
     constexpr bool XREG_C1 = C == 1; /* K=512: this lane's 16 activations stay in registers */      \
     float4 xr[4];                                                                                    \
-    if (XREG_C1) { _Pragma("unroll") for (int j_ = 0; j_ < 4; j_++) { xr[j_] = *(const float4 *) (xs + 128 * j_ + 4 * lane); } }
+    if (XREG_C1) { _Pragma("unroll") for (int j_ = 0; j_ < 4; j_++) { xr[j_] = xs_load4(xs, 128 * j_ + 4 * lane); } }
 
 template <typename TX, int C>
 __global__ void __launch_bounds__(HP_NT) k_hp_mmv(const hp_ptrs w, int R, cols_t p) {
     constexpr int K = C * 512;
-    extern __shared__ float shm[];
-    float * xs = shm;
-    uint32_t * lut = (uint32_t *) (shm + K);
+    extern __shared__ __align__(16) unsigned char hp_shm_raw[];
+    TX * xs = (TX *) hp_shm_raw; // activations in the input type (T-076: BF16 halves the shared bytes and loads)
+    uint32_t * lut = (uint32_t *) (hp_shm_raw + K * sizeof(TX));
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int wpb = blockDim.x >> 5;
     const int t = threadIdx.x;
@@ -553,9 +561,10 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv(const hp_ptrs w, int R, cols_t
     }
     const TX * xg; ydst out; int64_t rbase;
     col_setup(p, blockIdx.y, xg, out, rbase);
-    float4 x4 = make_float4(0.f, 0.f, 0.f, 0.f);
+    using XV = std::conditional_t<sizeof(TX) == 2, uint2, float4>; // 4 activations in the input type
+    XV x4{};
     if (one_pass && t < K / 4) {
-        x4 = load_x4(xg, t);
+        x4 = __ldg((const XV *) xg + t);
     }
     const int64_t units = p.nrows / R;
     const int64_t u0 = blockIdx.x * wpb + warp;
@@ -565,7 +574,7 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv(const hp_ptrs w, int R, cols_t
             ((uint4 *) lut)[t] = l4;
         }
         if (t < K / 4) {
-            ((float4 *) xs)[t] = x4;
+            ((XV *) xs)[t] = x4;
         }
     } else {
         HP_STAGE(xg, w.lut, lut)
@@ -613,18 +622,26 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv(const hp_ptrs w, int R, cols_t
 template <typename TX, int C, int NC, bool Y_BF16>
 __global__ void __launch_bounds__(HP_NT) k_hp_mmv_mc(const hp_ptrs w, int R, cols_t p) {
     constexpr int K = C * 512;
-    extern __shared__ float shm[];
-    float * xs = shm; // NC x K activations
-    uint32_t * lut = (uint32_t *) (shm + NC * K);
+    extern __shared__ __align__(16) unsigned char mc_shm_raw[];
+    // NC x K activations in the input type: staged as FP32, 4 BF16 columns took 32 KiB (K = 2048) to 64 KiB (K = 4096)
+    // of the L1 that holds the lane streams and doubled the shared-memory wavefronts; 4 columns ran at 1.6x the time of
+    // one, limited by the LSU pipe (ncu, T-076). BF16 values are the same numbers, so every sum is bitwise unchanged.
+    TX * xs = (TX *) mc_shm_raw;
+    uint32_t * lut = (uint32_t *) (mc_shm_raw + (size_t) NC * K * sizeof(TX));
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int wpb = blockDim.x >> 5;
     const int64_t units = p.nrows / R;
     const int64_t gbase = p.row0 / R;
     const int64_t u0 = blockIdx.x * wpb + warp;
     HP_UNIT_BEGIN(w, gbase + (u0 < units ? u0 : 0))
-    for (int i = threadIdx.x; i < NC * K / 4; i += blockDim.x) {
+    for (int i = threadIdx.x; i < NC * K / 4; i += blockDim.x) { // 4 elements: 16 bytes (FP32) or 8 bytes (BF16)
         const int n = i / (K / 4);
-        ((float4 *) xs)[i] = load_x4((const TX *) (p.x + n * p.x_tok), i - n * (K / 4));
+        const TX * xg = (const TX *) (p.x + n * p.x_tok);
+        if constexpr (sizeof(TX) == 2) {
+            ((uint2 *) xs)[i] = __ldg((const uint2 *) xg + (i - n * (K / 4)));
+        } else {
+            ((float4 *) xs)[i] = __ldg((const float4 *) xg + (i - n * (K / 4)));
+        }
     }
     for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += blockDim.x) { ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i); }
     __syncthreads();
@@ -657,7 +674,7 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv_mc(const hp_ptrs w, int R, col
                     const float f2 = __uint_as_float(w1 << 16), f3 = __uint_as_float(w1 & 0xFFFF0000u);
 #pragma unroll
                     for (int n = 0; n < NC; n++) {
-                        const float4 xv = *(const float4 *) (xs + n * K + c * 512 + 128 * j + 4 * lane);
+                        const float4 xv = xs_load4(xs, n * K + c * 512 + 128 * j + 4 * lane);
                         a[n][0] = fmaf(f0, xv.x, a[n][0]);
                         a[n][1] = fmaf(f1, xv.y, a[n][1]);
                         a[n][2] = fmaf(f2, xv.z, a[n][2]);
@@ -684,9 +701,9 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv_mc(const hp_ptrs w, int R, col
 template <typename TX, int C, int R>
 __global__ void __launch_bounds__(HP_NT) k_hp_mmv_glu(const hp_ptrs g, const hp_ptrs wu, cols_t p) {
     constexpr int K = C * 512;
-    extern __shared__ float shm[];
-    float * xs = shm;
-    uint32_t * lut_g = (uint32_t *) (shm + K);
+    extern __shared__ __align__(16) unsigned char hp_shm_raw[];
+    TX * xs = (TX *) hp_shm_raw; // activations in the input type
+    uint32_t * lut_g = (uint32_t *) (hp_shm_raw + K * sizeof(TX));
     uint32_t * lut_u = lut_g + (1 << HP_LP);
     const TX * xg; ydst out; int64_t rbase;
     col_setup(p, blockIdx.y, xg, out, rbase);
@@ -879,9 +896,9 @@ __global__ void __launch_bounds__(256) k_hp_get_rows(const hp_ptrs w, int R, con
 template <typename TX, int C, int R>
 __global__ void __launch_bounds__(HP_NT) k_hp_mmv_cm(const hp_ptrs w, cols_t p) {
     constexpr int K = C * 512;
-    extern __shared__ float shm[];
-    float * xs = shm;
-    uint32_t * lut = (uint32_t *) (shm + K);
+    extern __shared__ __align__(16) unsigned char hp_shm_raw[];
+    TX * xs = (TX *) hp_shm_raw; // activations in the input type (T-076: BF16 halves the shared bytes and loads)
+    uint32_t * lut = (uint32_t *) (hp_shm_raw + K * sizeof(TX));
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int wpb = blockDim.x >> 5;
     const int t = threadIdx.x;
@@ -893,9 +910,10 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv_cm(const hp_ptrs w, cols_t p) 
     }
     const TX * xg; ydst out; int64_t rbase;
     col_setup(p, blockIdx.y, xg, out, rbase);
-    float4 x4 = make_float4(0.f, 0.f, 0.f, 0.f);
+    using XV = std::conditional_t<sizeof(TX) == 2, uint2, float4>; // 4 activations in the input type
+    XV x4{};
     if (one_pass && t < K / 4) {
-        x4 = load_x4(xg, t);
+        x4 = __ldg((const XV *) xg + t);
     }
     const int64_t units = p.nrows / R;
     const int64_t u0 = blockIdx.x * wpb + warp;
@@ -905,7 +923,7 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv_cm(const hp_ptrs w, cols_t p) 
             ((uint4 *) lut)[t] = l4;
         }
         if (t < K / 4) {
-            ((float4 *) xs)[t] = x4;
+            ((XV *) xs)[t] = x4;
         }
     } else {
         HP_STAGE(xg, w.lut, lut)
@@ -940,7 +958,7 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv_cm(const hp_ptrs w, cols_t p) 
                     float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
 #pragma unroll
                     for (int j = 0; j < 4; j++) {
-                        const float4 xv = *(const float4 *) (xs + c * 512 + 128 * j + 4 * lane);
+                        const float4 xv = xs_load4(xs, c * 512 + 128 * j + 4 * lane);
                         const uint32_t w0 = sel_bits(prmt(smw[j], 0, 0x9180u), ex[2 * j]);
                         const uint32_t w1 = sel_bits(prmt(smw[j], 0, 0xB3A2u), ex[2 * j + 1]);
                         a0 = fmaf(__uint_as_float(w0 << 16), xv.x, a0);

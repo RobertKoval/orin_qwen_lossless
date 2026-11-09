@@ -591,3 +591,20 @@ Production wheel `0.1.0+geb8b3e5c7006` against `0.1.0+g4540db4b8cab`; only the l
 * **First request after a start** (T-071, py-spy): the first long prefill pays a one-time ≈ 1–3 s for lazy CUDA module
   loading — FlashInfer's paged prefill kernels (1.4 s), torch's elementwise / reduction kernels of the accepted-count
   update (1.6 s), the inductor prefill graph's first call (1.1 s), partly overlapped with the GPU work.
+
+## 2026-11-09 fifth release: BF16 activations in the GEMVs' shared memory (measured)
+
+Production wheel `0.1.0+g34a7b50adf1a` against `0.1.0+geb8b3e5c7006`.
+
+* **Cause** (ncu, in_proj_qkvz 12288 × 2048 and o_proj 2048 × 4096): the 4-column dense GEMV (MTP-3 verification)
+  took 1.6× the time of one column, limited by the LSU / shared-memory pipe — Mem Busy 92.5 % against 75 %, twice the
+  shared-memory wavefronts, MIO throttle — because the activations were staged as FP32: 32 KiB (K = 2048) to 64 KiB
+  (K = 4096) of shared memory per block, taken from the L1 that caches the lane streams (L1 hit 45 % / 18 %).
+* **Change.** Every HUFPAIR GEMV (single column, multi-column, GLU, chunk-major) stages activations in their input
+  type; BF16 inputs stay BF16. The values are the same, so every output is bitwise unchanged. Per call on real layer
+  matrices: 4 / 8 columns in_proj_qkvz 333 / 666 → 245 / 489 µs, qkv_proj 252 / 504 → 188 / 375, o_proj and out_proj
+  111 / 223 → 80 / 160 (4 columns now 1.16–1.18× one column); one column at K = 4096 69 → 60 µs.
+* **A/B** (same build otherwise, `:8010`): greedy outputs bitwise equal, acceptance identical; decode 42.1 → 45.2 tok/s
+  without logprobs, 41.8 → 44.7 with; 72K 30.1 → 32.4, 197K 26.3 → 27.4.
+* **Production**: decode **45.6** tok/s without logprobs (42.3), 44.9 with (41.9); 72K 34.1 (31.9), 197K 28.9 (27.1),
+  step 79.6 / 97.4 ms (85.0 / 103.6), all at identical acceptance; prefill unchanged (8K 1873–1903, 23K 1747).

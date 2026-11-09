@@ -14,14 +14,14 @@ Benchmark inputs are frozen (`bench/prompts/`). Details and methodology per engi
 | decode, no draft | llama.cpp | 31.2 tok/s (tg64, ±0.3 %); 28.6 same client | `llama-bench`; `bench_openai.py` |
 | decode, no draft | vLLM | 32.7 tok/s (M2, FlashInfer); 31.1 (M6 config) | `bench_openai.py` |
 | decode, MTP draft | llama.cpp | 40.2 tok/s (1 draft token, 4 × 400 tokens); 35.5 same client | `llama-server`; `bench_openai.py` |
-| decode, MTP draft | vLLM | **42.3 tok/s** (3 draft tokens, without logprobs; 2-bit draft head, 2026-11-09); 41.9 with logprobs | `bench_openai.py` |
+| decode, MTP draft | vLLM | **45.6 tok/s** (3 draft tokens, without logprobs; 2026-11-09); 44.9 with logprobs | `bench_openai.py` |
 | prefill 8k | llama.cpp | 832 / 1323 / 1481 tok/s (ub 512 / 2048 / 4096) | `llama-bench` |
 | prefill 8k / 23k | vLLM | 1903 / 1744 tok/s in the production config (6432-token chunks; 1762 / 1696 with 4288, 1516 / 1488 before the fragment-order down experts, 1439 / 1367 before the batched MoE prefill) | `bench_prefill.py` |
 | prefill 23k | llama.cpp | 1192 tok/s | `llama-server`, same client |
 | long-context decode | llama.cpp | 27.1 @ 64K, 22.6 @ 224K (MTP); 25.1 / 16.6 without | `llama-server` / `llama-bench` |
 | long-context prefill | llama.cpp | 648 tok/s at 224K (585 with the MTP draft) | `llama-server` |
 | long-context prefill | vLLM | 1269 tok/s at 72K, 895 at 197K, 724 at 246K (production config, 2026-11-09) | `long_ctx_test.py` |
-| long-context decode | vLLM | 31.9 @ 72K, 27.1 @ 197K (MTP 3, 2026-11-09 haystack, draft acceptance 0.57 / 0.60; step 85.0 / 103.6 ms); 23.3 @ 246K | `long_ctx_test.py` |
+| long-context decode | vLLM | 34.1 @ 72K, 28.9 @ 197K (MTP 3, 2026-11-09 haystack, draft acceptance 0.57 / 0.60; step 79.6 / 97.4 ms); 23.3 @ 246K (before T-076) | `long_ctx_test.py` |
 | free memory, full window + vision | llama.cpp | ≈ 3 GB (process 56.4–56.7 GB after a 4K image) | |
 | free memory, full window + vision | vLLM | ≥ 2.7 GiB after a 4K image and a 248K request | MemFree + Cached |
 | agreement between engines | both | top-1 99.5 %, mean KL ≈ 2e-3 (teacher-forced on llama.cpp's tokens) | `compare_llama.py` |

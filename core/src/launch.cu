@@ -83,7 +83,8 @@ cols_t make_cols(const mmv_args & a) {
     return p;
 }
 
-size_t mc_shm(int C, int NC) { return (size_t) NC * C * 512 * sizeof(float) + (4u << HP_LP); }
+// multi-column GEMV: NC x K activations in their input type, then the LUT
+template <typename TX> size_t mc_shm(int C, int NC) { return (size_t) NC * C * 512 * sizeof(TX) + (4u << HP_LP); }
 
 constexpr int MM_MAX_EXPERTS_INIT = 512;
 constexpr int FO_NTOK = 96, FO_NW = 16; // fragment-order batched kernel: tokens per item, warps (T-023 prototype)
@@ -99,7 +100,7 @@ void launch_mmv_t(const weight & e, const cols_t & p, int ncols, cudaStream_t st
     if (e.format == FMT_HUFPAIR) {
         dim3 g2; int nt;
         hp_launch_dims(e, p.nrows, ncols, g2, nt);
-        const size_t shm = K * sizeof(float) + (4u << HP_LP);
+        const size_t shm = K * sizeof(TX) + (4u << HP_LP); // activations in the input type
         if (e.fo) {
             k_fo_mmv<TX><<<g2, nt, fo_mmv_shm(), stream>>>(hpp(e), p);
         } else if (e.cm) {
@@ -118,7 +119,7 @@ void launch_mmv_t(const weight & e, const cols_t & p, int ncols, cudaStream_t st
                 cols_t q = p;
                 q.x += c0 * p.x_tok;
                 q.dst += c0 * p.dst_tok;
-                const size_t shm_mc = mc_shm((int) (K / 512), nc);
+                const size_t shm_mc = mc_shm<TX>((int) (K / 512), nc);
                 switch (K / 512 * 10 + nc) {
 #define MC_CASE(CC, NC) case CC * 10 + NC: \
     if (p.dst_bf16) { k_hp_mmv_mc<TX, CC, NC, true><<<g2, nt, shm_mc, stream>>>(hpp(e), e.R, q); } \
@@ -168,7 +169,7 @@ void launch_mmv_glu_t(const weight & g, const weight & u, const cols_t & p, int 
     if (g.format == FMT_HUFPAIR) {
         dim3 g2; int nt;
         hp_launch_dims(g, p.nrows, ncols, g2, nt);
-        const size_t shm = K * sizeof(float) + (8u << HP_LP);
+        const size_t shm = K * sizeof(TX) + (8u << HP_LP);
 #define HP_CASE(CC, RR) case CC * 100 + RR: k_hp_mmv_glu<TX, CC, RR><<<g2, nt, shm, stream>>>(hpp(g), hpp(u), p); break;
 #define HP_CASES(RR) HP_CASE(1, RR) HP_CASE(2, RR) HP_CASE(4, RR) HP_CASE(8, RR)
         switch ((K / 512) * 100 + g.R) {
@@ -214,8 +215,8 @@ void ensure_init() { std::call_once(g_once, [] {
     // every kernel instance that may need more than the default 48 KiB of dynamic shared memory, at the size the
     // llama.cpp launchers would set (multi-column GEMV: exact; batched MoE: up to MM_MAX_EXPERTS_INIT experts)
 #define MC_ATTR(TX, CC, NC) \
-    BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_hp_mmv_mc<TX, CC, NC, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mc_shm(CC, NC))); \
-    BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_hp_mmv_mc<TX, CC, NC, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mc_shm(CC, NC)));
+    BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_hp_mmv_mc<TX, CC, NC, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mc_shm<TX>(CC, NC))); \
+    BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_hp_mmv_mc<TX, CC, NC, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mc_shm<TX>(CC, NC)));
 #define MC_ATTRS(TX) MC_ATTR(TX, 1, 1) MC_ATTR(TX, 1, 2) MC_ATTR(TX, 1, 3) MC_ATTR(TX, 1, 4) MC_ATTR(TX, 2, 1) MC_ATTR(TX, 2, 2) \
     MC_ATTR(TX, 2, 3) MC_ATTR(TX, 2, 4) MC_ATTR(TX, 4, 1) MC_ATTR(TX, 4, 2) MC_ATTR(TX, 4, 3) MC_ATTR(TX, 4, 4) MC_ATTR(TX, 8, 1) \
     MC_ATTR(TX, 8, 2) MC_ATTR(TX, 8, 3) MC_ATTR(TX, 8, 4)
