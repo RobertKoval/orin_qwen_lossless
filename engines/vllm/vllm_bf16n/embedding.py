@@ -13,18 +13,21 @@ from . import policy
 from .encode_layer import attach, encode_matrix, weight_of
 
 
-def _wants_draft_head(layer: torch.nn.Module) -> bool:
-    """lm_head of a model served with MTP drafting, unless BF16N_DRAFT_HEAD=full: build the draft-only 4-bit copy
-    (vllm_bf16n/model.py Qwen3_5MoeMTP.compute_logits; +262 MB for Qwen3.6's 248320 x 2048 head)."""
-    import os
-
+def _draft_head_bits(layer: torch.nn.Module) -> int | None:
+    """Bits of the draft-only copy to build for the lm_head of a model served with MTP drafting (ops.draft_head_bits:
+    BF16N_DRAFT_HEAD int2 by default, int4, or full = none; vllm_bf16n/model.py Qwen3_5MoeMTP.compute_logits;
+    Qwen3.6's 248320 x 2048 head: +143 MB at 2 bits, +270 MB at 4)."""
     from vllm.config import get_current_vllm_config
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-    if os.environ.get("BF16N_DRAFT_HEAD", "int4") != "int4" or not isinstance(layer, ParallelLMHead):
-        return False
+    from . import ops
+
+    if not isinstance(layer, ParallelLMHead):
+        return None
     spec = get_current_vllm_config().speculative_config
-    return spec is not None and "mtp" in str(getattr(spec, "method", ""))
+    if spec is None or "mtp" not in str(getattr(spec, "method", "")):
+        return None
+    return ops.draft_head_bits()
 
 
 class BF16NEmbeddingMethod(QuantizeMethodBase):
@@ -61,14 +64,13 @@ class BF16NEmbeddingMethod(QuantizeMethodBase):
             return
         layer._already_called_process_weights_after_loading = True
         enc = encode_matrix(getattr(layer, "prefix", type(layer).__name__), layer.weight.data, layer.bf16n_choice)
-        if _wants_draft_head(layer):
+        bits = _draft_head_bits(layer)
+        if bits is not None:
             from . import ops
             from .encode_layer import _weights_pool
 
             with torch.cuda.use_mem_pool(_weights_pool()):
-                q, s = ops.int4_quantize(layer.weight.data.contiguous())
-            layer.register_buffer("bf16n_draft_q", q, persistent=False)
-            layer.register_buffer("bf16n_draft_s", s, persistent=False)
+                layer.bf16n_draft = ops.make_draft_head(layer.weight.data.contiguous(), bits)
         del layer.weight
         attach(layer, "bf16n", enc)
         from .encode_layer import logger

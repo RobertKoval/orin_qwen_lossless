@@ -23,6 +23,9 @@ namespace bf16n {
 void int4_quantize(const void * w_bf16, int64_t rows, int K, uint8_t * q, float * s, cudaStream_t stream);
 void int4_gemv(const void * x_bf16, int T, const uint8_t * q, const float * s, int64_t rows, int K, float * y,
                int sm_count, cudaStream_t stream);
+void int2_quantize(const void * w_bf16, int64_t rows, int K, uint8_t * q, float * s, cudaStream_t stream);
+void int2_gemv(const void * x_bf16, int T, const uint8_t * q, const float * s, int64_t rows, int K, float * y,
+               int sm_count, cudaStream_t stream);
 } // namespace bf16n
 
 namespace {
@@ -279,6 +282,33 @@ Tensor int4_gemv_cuda(const Tensor & x, const Tensor & q, const Tensor & s) {
     return y;
 }
 
+// draft-only 2-bit head (T-051): level index n in 0..3 per weight, value (n - 1.5) s, one FP32 scale per 128
+std::tuple<Tensor, Tensor> int2_quantize_cuda(const Tensor & w) {
+    const c10::cuda::CUDAGuard guard(w.device());
+    TORCH_CHECK(w.is_cuda() && w.dim() == 2 && w.scalar_type() == at::kBFloat16 && w.is_contiguous(),
+                "bf16n.int2_quantize: w must be a contiguous 2-D CUDA bf16 tensor");
+    TORCH_CHECK_VALUE(w.size(1) % 128 == 0, "bf16n.int2_quantize: K must be a multiple of 128");
+    Tensor q = at::empty({w.size(0), w.size(1) / 4}, w.options().dtype(at::kByte));
+    Tensor s = at::empty({w.size(0), w.size(1) / 128}, w.options().dtype(at::kFloat));
+    BF16N_TRY(bf16n::int2_quantize(w.data_ptr(), w.size(0), (int) w.size(1), q.data_ptr<uint8_t>(), s.data_ptr<float>(),
+                                   at::cuda::getCurrentCUDAStream()));
+    return {q, s};
+}
+
+Tensor int2_gemv_cuda(const Tensor & x, const Tensor & q, const Tensor & s) {
+    const c10::cuda::CUDAGuard guard(x.device());
+    TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.scalar_type() == at::kBFloat16 && x.is_contiguous(),
+                "bf16n.int2_gemv: x must be contiguous bf16 [T, K]");
+    TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kByte && q.dim() == 2 && q.size(1) * 4 == x.size(1) && q.is_contiguous(),
+                "bf16n.int2_gemv: q must be uint8 [rows, K / 4]");
+    TORCH_CHECK(s.is_cuda() && s.scalar_type() == at::kFloat && s.size(0) == q.size(0) && s.size(1) * 128 == x.size(1),
+                "bf16n.int2_gemv: s must be f32 [rows, K / 128]");
+    Tensor y = at::empty({x.size(0), q.size(0)}, x.options().dtype(at::kFloat));
+    BF16N_TRY(bf16n::int2_gemv(x.data_ptr(), (int) x.size(0), q.data_ptr<uint8_t>(), s.data_ptr<float>(), q.size(0),
+                               (int) x.size(1), y.data_ptr<float>(), bf16n::sm_count(), at::cuda::getCurrentCUDAStream()));
+    return y;
+}
+
 Tensor get_rows_cuda(const Tensor & ids, const Tensor & plane, const Tensor & aux, c10::IntArrayRef meta, bool out_bf16) {
     const c10::cuda::CUDAGuard guard(plane.device());
     const bf16n::weight w = make_weight(plane, aux, meta);
@@ -373,6 +403,8 @@ TORCH_LIBRARY(bf16n, m) {
     m.def("swiglu(Tensor g, Tensor u) -> Tensor");
     m.def("int4_quantize(Tensor w) -> (Tensor, Tensor)");
     m.def("int4_gemv(Tensor x, Tensor q, Tensor s) -> Tensor");
+    m.def("int2_quantize(Tensor w) -> (Tensor, Tensor)");
+    m.def("int2_gemv(Tensor x, Tensor q, Tensor s) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(bf16n, CPU, m) {
@@ -391,6 +423,8 @@ TORCH_LIBRARY_IMPL(bf16n, CUDA, m) {
     m.impl("swiglu", &swiglu_cuda);
     m.impl("int4_quantize", &int4_quantize_cuda);
     m.impl("int4_gemv", &int4_gemv_cuda);
+    m.impl("int2_quantize", &int2_quantize_cuda);
+    m.impl("int2_gemv", &int2_gemv_cuda);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

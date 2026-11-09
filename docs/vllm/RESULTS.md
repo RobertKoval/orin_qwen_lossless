@@ -553,3 +553,21 @@ the same long-context haystack and prompt salt:
   drift of at most 0.19 nats (one BF16 ulp of the logit). Both layouts multiply the exact BF16 weights and accumulate
   in FP32 (kernel tests: within 1e-5 of Σ|w x| against FP64, 2–3e-7 of it between the two layouts).
 * `tests/serving/state_checks.py` passes on a fresh start; the 72K and 197K needles are found.
+
+## 2026-11-09 third release: 2-bit draft head (measured)
+
+Production wheel `0.1.0+g4540db4b8cab` against `0.1.0+g3ba0773d302e`:
+
+* **Draft head.** The MTP draft scores the vocabulary from a draft-only lm_head copy and re-scores its top candidates
+  exactly from the BF16N rows; the draft token is their argmax (a point mass for the rejection sampler). On 1152 MTP
+  hidden states dumped from the production model, the exact top-1 was among the candidates in every case for the
+  4-bit copy with 32 candidates and for a 2-bit copy with 128 (each weight the nearest of ±0.5 s, ±1.5 s, s = amax /
+  1.5 per 128 weights); the 2-bit copy with 64 candidates missed once, 1 bit with 256 missed 0.6 %. The 2-bit copy is
+  143 MB instead of 270 MB; per draft token `draft_logits` takes 1.35 ms instead of 1.79.
+* **Same-session A/B** (both heads on one build, production configuration): greedy outputs identical, acceptance
+  identical on the four short prompts and at 72K, 0.597 → 0.617 at 197K; decode 41.6 → 42.3 tok/s without logprobs,
+  41.3 → 41.8 with, 197K 26.7 → 27.7. The gain is smaller than 3 drafts × 0.44 ms per step: the host prepares the next
+  step while the drafts run, and that preparation bounds the step.
+* **Production**: decode **42.1** tok/s without logprobs (41.5), 41.6 with (41.1), at identical acceptance; 72K 32.2
+  (31.8), 197K 29.5 (28.9) at identical acceptance (0.593 / 0.677), i.e. step 87.4 → 86.4 ms and 104.7 → 102.9 ms;
+  prefill unchanged (8K 1766, 23K 1707). `BF16N_DRAFT_HEAD=int4` selects the earlier head, `full` the exact one.

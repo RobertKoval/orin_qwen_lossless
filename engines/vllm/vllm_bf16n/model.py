@@ -16,7 +16,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.models import qwen3_5, qwen3_5_mtp
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.bf16n")  # under vLLM's configured hierarchy (vllm_bf16n.* INFO was dropped)
 
 
 def is_bf16n(quant_config) -> bool:
@@ -146,17 +146,18 @@ class Qwen3_5MoeMTP(qwen3_5_mtp.Qwen3_5MoeMTP):
         return super().load_weights(weights)
 
     def compute_logits(self, hidden_states: torch.Tensor, spec_step_idx: int = 0):
-        """Draft logits from the target's lm_head: with the draft-only 4-bit copy (built at load when MTP is on), the
-        top candidates by 4-bit score get exact BF16N logits and the rest -inf (ops.draft_logits; the full head reads
-        674 MB per draft token, the 4-bit one 262 MB). Target logits are untouched."""
+        """Draft logits from the target's lm_head: with the draft-only k-bit copy (built at load when MTP is on), the
+        top candidates by k-bit score get exact BF16N logits and the rest -inf (ops.draft_logits; the full head reads
+        674 MB per draft token, the 2-bit copy 143 MB, the 4-bit one 270 MB). Target logits are untouched."""
         lm = self.lm_head
-        if getattr(self, "_bf16n", False) and hasattr(lm, "bf16n_draft_q") and hidden_states.shape[0] <= 4:
+        head = getattr(lm, "bf16n_draft", None)
+        if getattr(self, "_bf16n", False) and head is not None and hidden_states.shape[0] <= 4:
             from . import ops
             from .encode_layer import weight_of
 
             if not getattr(self, "_draft_head_logged", False):
                 self._draft_head_logged = True
-                logger.info("bf16n: MTP draft logits from the 4-bit candidate head (%d candidates)", ops.DRAFT_CANDIDATES)
-            return ops.draft_logits(hidden_states, weight_of(lm, "bf16n"), lm.bf16n_draft_q, lm.bf16n_draft_s,
-                                    self.config.vocab_size)
+                logger.info("bf16n: MTP draft logits from the %d-bit candidate head (%d candidates)", head.bits,
+                            head.candidates)
+            return ops.draft_logits(hidden_states, weight_of(lm, "bf16n"), head, self.config.vocab_size)
         return super().compute_logits(hidden_states, spec_step_idx)

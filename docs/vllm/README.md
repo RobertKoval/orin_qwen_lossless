@@ -85,7 +85,8 @@ identical to llama.cpp for llama.cpp's shapes).
 * `encode` (CPU, multithreaded), `dequant`, `dequant_into` (straight into vLLM's interleaved w13 layout), `mmv`
   (dense or with expert ids, BF16 or F32 in and out), `mmv_glu`, `linear` (GEMV up to 8 tokens, dequant + cuBLAS
   above, one op for Dynamo), `get_rows`, `moe_mm_ids` (routing helper + batched MMA kernel, fused GLU), `moe_combine`
-  (deterministic slot sum), `swiglu`, `int4_quantize` / `int4_gemv` (the 4-bit draft head, `ops.draft_logits`),
+  (deterministic slot sum), `swiglu`, `int2_quantize` / `int2_gemv` and `int4_quantize` / `int4_gemv` (the k-bit draft heads, `ops.DraftHead`,
+  `ops.draft_logits`),
   `init`.
 * Dispatch thresholds are llama.cpp's: ≤ 8 tokens → GEMV kernels; more → batched kernels. Every MoE prefill chunk runs
   the batched BF16N kernels (`moe_mm_ids`: gate/up with fused GLU, then down), with no BF16 workspace (T-023: +7–10 %
@@ -115,7 +116,9 @@ identical to llama.cpp for llama.cpp's shapes).
   hit one block past the full-attention hit that the MTP last-block drop had shortened, so the hit counted attention
   KV that was never computed. `tests/serving/state_checks.py` checks a running server: short prompts independent of
   the previous request, and prefix-cache hits equal to a no-cache run.
-* MTP with 3 draft tokens; a **lossy, draft-only** 4-bit copy of lm_head selects 32 candidates. Their BF16N weight
+* MTP with 3 draft tokens; a **lossy, draft-only** 2-bit copy of lm_head (each weight the nearest of ±0.5 s, ±1.5 s,
+  s = amax / 1.5 per 128 weights; 143 MB) selects 128 candidates (`BF16N_DRAFT_HEAD=int4`: the earlier 4-bit copy with
+  32 candidates, 270 MB). Their BF16N weight
   rows are reconstructed exactly and re-scored with FP32 arithmetic; other draft logits become `-inf`. This is not
   the full draft head: it can omit the best token, and its FP32 scores need not select the same token as the ordinary
   BF16-output head even when both tokens are candidates. M6 measured equal acceptance and outputs on four prompts,
@@ -125,8 +128,8 @@ identical to llama.cpp for llama.cpp's shapes).
 ### Fidelity boundaries
 
 **Lossless** describes reconstruction of target BF16 weights, not bitwise equality of every arithmetic path or
-same-seed generated sequence. Different reductions, kernels and rounding can change logits. The 4-bit candidate
-selector is an additional approximate *draft* representation; `BF16N_DRAFT_HEAD=full` disables it.
+same-seed generated sequence. Different reductions, kernels and rounding can change logits. The 2-bit (or 4-bit)
+candidate selector is an additional approximate *draft* representation; `BF16N_DRAFT_HEAD=full` disables it.
 
 Target sampling is the unmodified model distribution: the launcher keeps the host venv's MTP loop breaker (a
 rejection-sampler patch of another engine that penalises detected repetition cycles) off with
@@ -166,8 +169,8 @@ Plugin knobs (read at import; changing one that shapes compiled graphs needs a f
 |---|---|---|
 | `BF16N_CUDA_SCHED` | unset (launchers: `yield`) | CUDA context scheduling flags, set before CUDA init in every vLLM process (host waits must not slow kernels) |
 | `BF16N_REFERENCE` | 0 | exact dequant + stock kernels everywhere (needs `--enforce-eager`); part of the cache key |
-| `BF16N_DRAFT_HEAD` | int4 | `full` = draft scores with the exact head |
-| `BF16N_DRAFT_CANDIDATES` | 32 | candidates re-scored exactly by the 4-bit draft head |
+| `BF16N_DRAFT_HEAD` | int2 | `int4` = the 4-bit copy, `full` = draft scores with the exact head; anything else fails at load |
+| `BF16N_DRAFT_CANDIDATES` | 128 (int2), 32 (int4) | candidates re-scored exactly by the k-bit draft head |
 | `BF16N_TRITON_3D`, `BF16N_FI_PREFILL`, `BF16N_ASYNC_ALIGN` | 1 | the M6 routing / bookkeeping, 0 = stock |
 | `BF16N_PROMPT_LOGPROBS_ROWS` | 256 | prompt-logprob slice |
 | `BF16N_CACHE_KEY` | set by launchers | must match `cache_key()`, or the compile cache is disabled |

@@ -176,18 +176,70 @@ def int4_gemv(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor) -> torch.Tensor
     return _ops.int4_gemv(x, q, s)
 
 
-DRAFT_CANDIDATES = int(os.environ.get("BF16N_DRAFT_CANDIDATES", "32"))
+def int2_quantize(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Draft-only 2-bit copy of a BF16 matrix: per 128 weights s = amax / 1.5 and each weight the nearest of
+    -1.5 s, -0.5 s, 0.5 s, 1.5 s: (q uint8 [R, K/4], s f32 [R, K/128])."""
+    return _ops.int2_quantize(w)
 
 
-def draft_logits(h: torch.Tensor, w: Weight, q: torch.Tensor, s: torch.Tensor, vocab: int,
-                 candidates: int = DRAFT_CANDIDATES) -> torch.Tensor:
-    """Draft-token logits: the 4-bit head selects candidates; gathered BF16N rows are re-scored in FP32, others get -inf.
+def int2_gemv(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """Approximate y = x W^T (FP32 [T, R]) from the 2-bit copy; T <= 4, K = 2048."""
+    return _ops.int2_gemv(x, q, s)
+
+
+DRAFT_HEADS = {"int2": 2, "int4": 4}  # BF16N_DRAFT_HEAD values with a k-bit copy; "full" scores with the exact head
+# Candidates re-scored exactly. T-051, 1152 MTP draft states of the production model: with these counts the exact
+# top-1 was always among the candidates, and the exact softmax mass left outside was 4.1e-2 (2-bit, 128) and 5.8e-2
+# (4-bit, 32) at temperature 1, 7.6e-3 / 1.2e-2 at 0.7.
+DEFAULT_CANDIDATES = {2: 128, 4: 32}
+
+
+@dataclass(frozen=True)
+class DraftHead:
+    """Draft-only k-bit copy of an lm_head (symmetric, one FP32 scale per 128 weights) whose top `candidates` scores
+    are re-scored exactly by draft_logits."""
+    bits: int
+    q: torch.Tensor
+    s: torch.Tensor
+    candidates: int
+
+    def __post_init__(self):
+        if self.bits not in DEFAULT_CANDIDATES:
+            raise ValueError(f"draft head: {self.bits} bits (2 or 4)")
+        if self.q.shape[1] * (8 // self.bits) != self.s.shape[1] * 128 or self.q.shape[0] != self.s.shape[0]:
+            raise ValueError(f"draft head: q {tuple(self.q.shape)} and s {tuple(self.s.shape)} disagree for {self.bits} bits")
+        if not 1 <= self.candidates <= self.q.shape[0]:
+            raise ValueError(f"draft head: {self.candidates} candidates for {self.q.shape[0]} rows")
+
+    def scores(self, h: torch.Tensor) -> torch.Tensor:
+        return (int2_gemv if self.bits == 2 else int4_gemv)(h, self.q, self.s)
+
+
+def draft_head_bits() -> int | None:
+    """Bits of the draft head chosen by BF16N_DRAFT_HEAD (int2 by default, int4; full = the exact head, None)."""
+    v = os.environ.get("BF16N_DRAFT_HEAD", "int2")
+    if v == "full":
+        return None
+    if v not in DRAFT_HEADS:
+        raise ValueError(f"BF16N_DRAFT_HEAD must be one of int2, int4, full; got {v!r}")
+    return DRAFT_HEADS[v]
+
+
+def make_draft_head(w: torch.Tensor, bits: int) -> DraftHead:
+    """The k-bit draft copy of BF16 w with BF16N_DRAFT_CANDIDATES candidates (default per bits)."""
+    q, s = (int2_quantize if bits == 2 else int4_quantize)(w)
+    env = os.environ.get("BF16N_DRAFT_CANDIDATES")
+    return DraftHead(bits, q, s, int(env) if env is not None else DEFAULT_CANDIDATES[bits])
+
+
+def draft_logits(h: torch.Tensor, w: Weight, head: DraftHead, vocab: int) -> torch.Tensor:
+    """Draft-token logits: the k-bit head selects candidates; gathered BF16N rows are re-scored in FP32, others get -inf.
     Candidate coverage alone does not guarantee the full BF16-output head's argmax: output rounding can change ties.
     This is a proposal path, not a claim of full-head or sequence equivalence."""
     n, K = h.shape
     h = h.contiguous()
-    cand = int4_gemv(h, q, s).topk(candidates, dim=-1).indices                     # [n, C]
-    rows = get_rows(cand.reshape(-1), w).view(n, candidates, K)                    # exact BF16 rows
+    cand = head.scores(h).topk(head.candidates, dim=-1).indices                    # [n, C]
+    rows = get_rows(cand.reshape(-1), w).view(n, head.candidates, K)              # exact BF16 rows
     exact = torch.einsum("nck,nk->nc", rows.float(), h.float())
     out = torch.full((n, vocab), float("-inf"), dtype=torch.float32, device=h.device)
     return out.scatter_(1, cand, exact)
@@ -308,6 +360,17 @@ def _int4_quantize_fake(w):
 
 @torch.library.register_fake("bf16n::int4_gemv")
 def _int4_gemv_fake(x, q, s):
+    return x.new_empty((x.shape[0], q.shape[0]), dtype=torch.float32)
+
+
+@torch.library.register_fake("bf16n::int2_quantize")
+def _int2_quantize_fake(w):
+    return (w.new_empty((w.shape[0], w.shape[1] // 4), dtype=torch.uint8),
+            w.new_empty((w.shape[0], w.shape[1] // 128), dtype=torch.float32))
+
+
+@torch.library.register_fake("bf16n::int2_gemv")
+def _int2_gemv_fake(x, q, s):
     return x.new_empty((x.shape[0], q.shape[0]), dtype=torch.float32)
 
 
