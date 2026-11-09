@@ -422,21 +422,3 @@ def test_mmv_ids_down_per_slot(ops, experts, ids_dtype):
     ref, S = per_slot_ref(down, ids, a)
     assert_within(y, ref, S)
 
-
-# ---------------------------------------------------------------- dequant into a mapped layout
-
-
-def test_dequant_into_interleaves_gate_and_up(ops, experts):
-    """gate / up experts land in vLLM's w13 layout [E][gate N; up N][K] bitwise; a second half (row0 offset) too."""
-    (gate, up, _), (eg, eu, _) = experts
-    half = E // 2
-    w13 = torch.empty(half, 2 * N, H, dtype=torch.bfloat16, device="cuda")
-    for lo in (0, half):
-        ops.dequant_into(w13, eg, lo * N, half * N, N, 2 * N)
-        ops.dequant_into(w13.view(-1)[N * H:], eu, lo * N, half * N, N, 2 * N)
-        ref = torch.cat([gate[lo:lo + half], up[lo:lo + half]], dim=1)
-        assert torch.equal(bits(w13), bits(ref))
-    with pytest.raises(ValueError, match="too small"):
-        ops.dequant_into(w13[:half - 1], eg, 0, half * N, N, 2 * N)
-    with pytest.raises(ValueError, match="whole units"):
-        ops.dequant_into(w13, eg, 0, half * N, 4, 8)  # 4-row groups split the 8-row units

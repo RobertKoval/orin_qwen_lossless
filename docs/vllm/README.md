@@ -82,7 +82,7 @@ identical to llama.cpp for llama.cpp's shapes).
 * Weights are passed explicitly: each encoded matrix lives on its layer as `bf16n_plane` / `bf16n_aux` uint8 tensors
   allocated through torch (vLLM's memory accounting sees them); format, K, R, rows and offsets are Python ints parsed
   once from the 256-byte aux header. A view (one expert) is `row0` plus a row count.
-* `encode` (CPU, multithreaded), `dequant`, `dequant_into` (straight into vLLM's interleaved w13 layout), `mmv`
+* `encode` (CPU, multithreaded), `dequant`, `mmv`
   (dense or with expert ids, BF16 or F32 in and out), `mmv_glu`, `linear` (GEMV up to 8 tokens, dequant + cuBLAS
   above, one op for Dynamo), `get_rows`, `moe_mm_ids` (routing helper + batched MMA kernel, fused GLU), `moe_combine`
   (deterministic slot sum), `swiglu`, `int2_quantize` / `int2_gemv` and `int4_quantize` / `int4_gemv` (the k-bit draft heads, `ops.DraftHead`,

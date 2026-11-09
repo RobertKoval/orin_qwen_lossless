@@ -27,11 +27,10 @@ def cases(m):
     ids = torch.stack([torch.randperm(8)[:4] for _ in range(12)]).to(torch.int32).cuda()
     hp, nib, gate, up, down, dfo = m["hp"], m["nib"], m["gate"], m["up"], m["down"], m["down_fo"]
     a12 = torch.randn(12, 4, 512, device="cuda").to(torch.bfloat16)
+    w2 = (torch.randn(64, 2048, device="cuda") * 0.02).to(torch.bfloat16)  # rows of a draft-head copy
     return {
         "encode": (b.encode, (torch.randn(16, 512).to(torch.bfloat16), HP, 8, False)),
         "dequant": (b.dequant, (hp.plane, hp.aux, hp.m, 16, 32)),
-        "dequant_into": (b.dequant_into, (torch.empty(8, 1024, 2048, dtype=torch.bfloat16, device="cuda"), gate.plane,
-                                          gate.aux, gate.m, 0, 8 * 512, 512, 1024)),
         "mmv_dense": (b.mmv, (x4, hp.plane, hp.aux, hp.m, None, 0, True)),
         "mmv_ids": (b.mmv, (x12, gate.plane, gate.aux, gate.m, ids, 512, False)),
         "mmv_glu": (b.mmv_glu, (x4, nib.plane, nib.aux, nib.m, None, 0, True)),
@@ -47,12 +46,16 @@ def cases(m):
         "moe_mm_ids_down_fo": (b.moe_mm_ids, (a12, ids, dfo.plane, dfo.aux, dfo.m, None, None, [], 8, False)),
         "moe_combine": (b.moe_combine, (torch.randn(12, 4, 2048, device="cuda"), torch.rand(12, 4, device="cuda"), True)),
         "swiglu": (b.swiglu, (torch.randn(12, 4, 512, device="cuda"), torch.randn(12, 4, 512, device="cuda"))),
+        "int2_quantize": (b.int2_quantize, (w2,)),
+        "int2_gemv": (b.int2_gemv, (x4[:1], *b.int2_quantize(w2))),
+        "int4_quantize": (b.int4_quantize, (w2,)),
+        "int4_gemv": (b.int4_gemv, (x4[:1], *b.int4_quantize(w2))),
     }
 
 
-NAMES = ["encode", "dequant", "dequant_into", "mmv_dense", "mmv_ids", "mmv_glu", "linear_gemv", "linear_gemm", "get_rows",
+NAMES = ["encode", "dequant", "mmv_dense", "mmv_ids", "mmv_glu", "linear_gemv", "linear_gemm", "get_rows",
          "moe_mm_ids_glu", "moe_mm_ids_down", "moe_combine", "swiglu", "encode_fo", "dequant_fo", "mmv_ids_fo",
-         "moe_mm_ids_down_fo"]
+         "moe_mm_ids_down_fo", "int2_quantize", "int2_gemv", "int4_quantize", "int4_gemv"]
 
 
 @pytest.mark.parametrize("name", NAMES)

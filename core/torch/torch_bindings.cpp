@@ -117,23 +117,6 @@ Tensor dequant_cuda(const Tensor & plane, const Tensor & aux, c10::IntArrayRef m
     return out;
 }
 
-// rows [row0, row0 + nrows) into an existing BF16 buffer; with group_rows > 0, matrix row i lands on output row
-// (i / group_rows) * group_stride + i % group_rows of out (viewed as rows of K). Used for the MoE workspace of the
-// dequant + Triton prefill path (gate and up into vLLM's interleaved w13).
-void dequant_into_cuda(Tensor & out, const Tensor & plane, const Tensor & aux, c10::IntArrayRef meta, int64_t row0,
-                       int64_t nrows, int64_t group_rows, int64_t group_stride) {
-    const c10::cuda::CUDAGuard guard(plane.device());
-    const bf16n::weight w = make_weight(plane, aux, meta);
-    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kBFloat16 && out.is_contiguous(),
-                "bf16n.dequant_into: out must be a contiguous CUDA bf16 tensor");
-    TORCH_CHECK_VALUE(row0 >= 0 && nrows >= 0 && row0 + nrows <= w.rows, "bf16n.dequant_into: rows out of range");
-    const int64_t g = group_rows > 0 ? group_rows : nrows, st = group_rows > 0 ? group_stride : nrows;
-    const int64_t last = nrows == 0 ? 0 : ((nrows - 1) / g) * st + (nrows - 1) % g + 1;  // output rows touched
-    TORCH_CHECK_VALUE(out.numel() >= last * w.K, "bf16n.dequant_into: out too small for the mapped rows");
-    BF16N_TRY(bf16n::dequant(w, row0, nrows, (uint16_t *) out.data_ptr(), at::cuda::getCurrentCUDAStream(), group_rows,
-                             group_stride));
-}
-
 // shared by mmv and mmv_glu; glu halves the output rows
 Tensor mmv_common(const Tensor & x, const Tensor & plane, const Tensor & aux, c10::IntArrayRef meta,
                   const c10::optional<Tensor> & ids, int64_t rows_per_matrix, bool out_bf16, bool glu) {
@@ -391,8 +374,6 @@ TORCH_LIBRARY(bf16n, m) {
     m.def("init() -> ()", &init_op);
     m.def("encode(Tensor w, int format, int R, bool chunk_major, bool frag_order=False) -> (Tensor, Tensor)");
     m.def("dequant(Tensor plane, Tensor aux, int[] meta, int row0, int nrows) -> Tensor");
-    m.def("dequant_into(Tensor(a!) out, Tensor plane, Tensor aux, int[] meta, int row0, int nrows, int group_rows, "
-          "int group_stride) -> ()");
     m.def("mmv(Tensor x, Tensor plane, Tensor aux, int[] meta, Tensor? ids, int rows_per_matrix, bool out_bf16) -> Tensor");
     m.def("mmv_glu(Tensor x, Tensor plane, Tensor aux, int[] meta, Tensor? ids, int rows_per_matrix, bool out_bf16) -> Tensor");
     m.def("linear(Tensor x, Tensor plane, Tensor aux, int[] meta, Tensor? bias) -> Tensor");
@@ -413,7 +394,6 @@ TORCH_LIBRARY_IMPL(bf16n, CPU, m) {
 
 TORCH_LIBRARY_IMPL(bf16n, CUDA, m) {
     m.impl("dequant", &dequant_cuda);
-    m.impl("dequant_into", &dequant_into_cuda);
     m.impl("mmv", &mmv_cuda);
     m.impl("mmv_glu", &mmv_glu_cuda);
     m.impl("linear", &linear_cuda);

@@ -101,12 +101,6 @@ def dequant(w: Weight, row0: int = 0, nrows: int | None = None) -> torch.Tensor:
     return _ops.dequant(w.plane, w.aux, w.m, row0, w.meta.rows - row0 if nrows is None else nrows)
 
 
-def dequant_into(out: torch.Tensor, w: Weight, row0: int, nrows: int, group_rows: int = 0, group_stride: int = 0) -> None:
-    """Rows [row0, row0 + nrows) into `out` (BF16, contiguous, rows of K); group_rows > 0: matrix row i goes to output
-    row (i // group_rows) * group_stride + i % group_rows."""
-    _ops.dequant_into(out, w.plane, w.aux, w.m, row0, nrows, group_rows, group_stride)
-
-
 def roundtrip_equal(w: Weight, src: torch.Tensor, chunk_bytes: int = 64 << 20) -> bool:
     """Bitwise check of the GPU decode against the BF16 source (any device), in row chunks of whole units."""
     K, rows = w.meta.K, w.meta.rows
@@ -300,11 +294,6 @@ def _encode_fake(w, fmt, R, chunk_major, frag_order=False):
     K = w.shape[-1]
     rows = w.numel() // K
     return w.new_empty((rows, K), dtype=torch.uint8), w.new_empty((ctx.new_dynamic_size(),), dtype=torch.uint8)
-
-
-@torch.library.register_fake("bf16n::dequant_into")
-def _dequant_into_fake(out, plane, aux, meta, row0, nrows, group_rows, group_stride):
-    return None
 
 
 @torch.library.register_fake("bf16n::dequant")

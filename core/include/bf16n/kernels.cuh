@@ -363,24 +363,17 @@ __global__ void __launch_bounds__(256) k_huffman_mmv_glu(const huf_ptrs g, const
     }
 }
 
-// output row of matrix row i in the dequant kernels: groups of G rows, S rows apart (G = S: contiguous). Used to write
-// gate and up experts straight into vLLM's interleaved w13 layout [E][gate N; up N][K].
-struct orow_map {
-    int64_t G, S;
-    __device__ __forceinline__ int64_t operator()(int64_t i) const { return (i / G) * S + i % G; }
-};
-
 // exact reconstruction to BF16 (row-major, contiguous) for the batched cuBLAS path
 template <int C>
 __global__ void __launch_bounds__(256) k_nibble_dequant(const uint8_t * __restrict__ sm, const uint8_t * __restrict__ nib,
         const uint4 * __restrict__ lut_row, const uint32_t * __restrict__ esc_off, const uint32_t * __restrict__ esc,
-        int64_t row0, int64_t nrows, uint16_t * __restrict__ out, orow_map om) {
+        int64_t row0, int64_t nrows, uint16_t * __restrict__ out) {
     constexpr int K = C * 512;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int64_t r = blockIdx.x * 8 + warp; r < nrows; r += gridDim.x * 8) {
         const int64_t gr = row0 + r;
         const uint4 L = __ldg(lut_row + gr);
-        uint16_t * o = out + om(r) * K;
+        uint16_t * o = out + r * K;
         for (int c = 0; c < C; c++) {
             const uint4 smv = __ldg((const uint4 *) (sm + gr * K + c * 512) + lane);
             const uint2 nbv = __ldg((const uint2 *) (nib + gr * (K / 2) + c * 256) + lane);
@@ -407,7 +400,7 @@ __global__ void __launch_bounds__(256) k_nibble_dequant(const uint8_t * __restri
 template <int C>
 __global__ void __launch_bounds__(256) k_huffman_dequant(const uint8_t * __restrict__ sm, const uint32_t * __restrict__ lut_g,
         const uint32_t * __restrict__ lane_off, const uint32_t * __restrict__ stream, int R, int64_t row0, int64_t nrows,
-        uint16_t * __restrict__ out, orow_map om) {
+        uint16_t * __restrict__ out) {
     constexpr int K = C * 512;
     __shared__ uint32_t lut[1 << HUF_LMAX];
     for (int i = threadIdx.x; i < (1 << HUF_LMAX); i += blockDim.x) {
@@ -424,7 +417,7 @@ __global__ void __launch_bounds__(256) k_huffman_dequant(const uint8_t * __restr
         uint32_t acc = 0, acc_chk = 0;
         for (int rr = 0; rr < R; rr++) {
             const int64_t gr = gu * R + rr;
-            uint16_t * o = out + om(gr - row0) * K;
+            uint16_t * o = out + (gr - row0) * K;
             for (int c = 0; c < C; c++) {
                 const uint4 smv = __ldg((const uint4 *) (sm + gr * K + c * 512) + lane);
                 const uint32_t smw[4] = {smv.x, smv.y, smv.z, smv.w};
@@ -729,7 +722,7 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv_glu(const hp_ptrs g, const hp_
 }
 
 template <int C>
-__global__ void __launch_bounds__(256) k_hp_dequant(const hp_ptrs w, int R, int64_t row0, int64_t nrows, uint16_t * __restrict__ out, orow_map om) {
+__global__ void __launch_bounds__(256) k_hp_dequant(const hp_ptrs w, int R, int64_t row0, int64_t nrows, uint16_t * __restrict__ out) {
     constexpr int K = C * 512;
     __shared__ uint32_t lut[1 << HP_LP];
     for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut[i_] = w.lut[i_]; }
@@ -740,7 +733,7 @@ __global__ void __launch_bounds__(256) k_hp_dequant(const hp_ptrs w, int R, int6
         HP_UNIT_BEGIN(w, gu)
         for (int rr = 0; rr < R; rr++) {
             const int64_t gr = gu * R + rr;
-            uint16_t * o = out + om(gr - row0) * K;
+            uint16_t * o = out + (gr - row0) * K;
             for (int c = 0; c < C; c++) {
                 const uint4 smv = ld_plane((const uint4 *) (w.sm + gr * K + c * 512) + lane);
                 const uint32_t smw[4] = {smv.x, smv.y, smv.z, smv.w};
@@ -977,7 +970,7 @@ __global__ void __launch_bounds__(HP_NT) k_hp_mmv_cm(const hp_ptrs w, cols_t p) 
 }
 
 template <int C, int R>
-__global__ void __launch_bounds__(256) k_hp_dequant_cm(const hp_ptrs w, int64_t row0, int64_t nrows, uint16_t * __restrict__ out, orow_map om) {
+__global__ void __launch_bounds__(256) k_hp_dequant_cm(const hp_ptrs w, int64_t row0, int64_t nrows, uint16_t * __restrict__ out) {
     constexpr int K = C * 512;
     __shared__ uint32_t lut[1 << HP_LP];
     for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut[i_] = w.lut[i_]; }
@@ -993,7 +986,7 @@ __global__ void __launch_bounds__(256) k_hp_dequant_cm(const hp_ptrs w, int64_t 
                 const uint32_t smw[4] = {smv.x, smv.y, smv.z, smv.w};
                 uint32_t ex[8];
                 HP_PAIRS(ex)
-                uint16_t * o = out + om(gr - row0) * K + c * 512;
+                uint16_t * o = out + (gr - row0) * K + c * 512;
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
                     const uint32_t w0 = sel_bits(prmt(smw[j], 0, 0x9180u), ex[2 * j]);
@@ -1512,7 +1505,7 @@ __device__ __forceinline__ void fo_a(const uint4 & pl, const uint32_t (&ex)[8], 
 
 // exact BF16 bits of bands [row0 / 16, (row0 + nrows) / 16), one warp per band; a[q] of tile k holds columns c, c + 1
 // of row g + 8 (q & 1), c = 16 k + 2t + 8 (q >> 1)
-__global__ void __launch_bounds__(256) k_fo_dequant(const hp_ptrs w, int64_t row0, int64_t nrows, uint16_t * __restrict__ out, orow_map om) {
+__global__ void __launch_bounds__(256) k_fo_dequant(const hp_ptrs w, int64_t row0, int64_t nrows, uint16_t * __restrict__ out) {
     constexpr int K = FO_K;
     __shared__ uint32_t lut[1 << HP_LP];
     for (int i_ = threadIdx.x; i_ < (1 << HP_LP); i_ += blockDim.x) { lut[i_] = w.lut[i_]; }
@@ -1522,8 +1515,8 @@ __global__ void __launch_bounds__(256) k_fo_dequant(const hp_ptrs w, int64_t row
     for (int64_t u = blockIdx.x * 8 + warp; u < nrows / 16; u += gridDim.x * 8) {
         const int64_t gu = row0 / 16 + u;
         HP_UNIT_BEGIN(w, gu)
-        uint16_t * o0 = out + om(u * 16 + g) * K + 2 * t;
-        uint16_t * o8 = out + om(u * 16 + g + 8) * K + 2 * t;
+        uint16_t * o0 = out + (u * 16 + g) * K + 2 * t;
+        uint16_t * o8 = out + (u * 16 + g + 8) * K + 2 * t;
         const uint4 * pp = (const uint4 *) (w.sm + gu * 16 * K) + lane;
         for (int p = 0; p < K / 32; p++) {
             const uint4 pl = ld_plane(pp + p * 32);

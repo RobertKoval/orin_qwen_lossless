@@ -57,10 +57,8 @@ void mmv_glu(const weight & w, const mmv_args & a, cudaStream_t stream);
 // Chunk-major fusion was not supported by llama: use mmv(gate), mmv(up), swiglu instead.
 // With BF16 output, rounds only the final GLU result, not the intermediate gate/up products.
 void mmv_glu(const weight & gate, const weight & up, const mmv_args & a, cudaStream_t stream);
-// exact BF16 bits of rows [row0, row0 + nrows) into out (row-major, nrows x K); with group_rows > 0, row i goes to output
-// row (i / group_rows) * group_stride + i % group_rows (e.g. gate / up experts into vLLM's interleaved w13)
-void dequant(const weight & w, int64_t row0, int64_t nrows, uint16_t * out, cudaStream_t stream, int64_t group_rows = 0,
-             int64_t group_stride = 0);
+// exact BF16 bits of rows [row0, row0 + nrows) into out (row-major, nrows x K)
+void dequant(const weight & w, int64_t row0, int64_t nrows, uint16_t * out, cudaStream_t stream);
 // dst[i] = W[row0 + ids[i]] (one row per id), FP32 or BF16, dst row stride in bytes.
 // Requires n >= 0 and 0 <= row0 < rows (row0 == rows allowed only when n == 0). IDs must index valid rows;
 // checking their device values is the caller's responsibility, without host synchronisation here.

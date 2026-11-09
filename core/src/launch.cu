@@ -295,8 +295,7 @@ void mmv_glu(const weight & gate, const weight & up, const mmv_args & a, cudaStr
     }
 }
 
-void dequant(const weight & e, int64_t row0, int64_t nrows, uint16_t * out, cudaStream_t stream, int64_t group_rows,
-             int64_t group_stride) {
+void dequant(const weight & e, int64_t row0, int64_t nrows, uint16_t * out, cudaStream_t stream) {
     ensure_init();
     check_weight(e);
     if (nrows == 0) {
@@ -307,31 +306,25 @@ void dequant(const weight & e, int64_t row0, int64_t nrows, uint16_t * out, cuda
     if (e.format != FMT_NIBBLE) {
         BF16N_REQUIRE(nrows % e.R == 0 && row0 % e.R == 0, "dequant rows must be whole units");
     }
-    if (group_rows <= 0) {
-        group_rows = group_stride = nrows;
-    }
-    BF16N_REQUIRE(group_stride >= group_rows, "dequant: group stride below group size");
-    BF16N_REQUIRE(e.format == FMT_NIBBLE || group_rows % e.R == 0, "dequant: groups must hold whole units");
-    const orow_map om = {group_rows, group_stride};
     const nib_ptrs np = nibp(e);
 #define DQ(CC)                                                                                                         \
     case CC:                                                                                                           \
         if (e.format == FMT_NIBBLE) {                                                                                  \
-            k_nibble_dequant<CC><<<gx, 256, 0, stream>>>(np.sm, np.nib, np.lut_row, np.esc_off, np.esc, row0, nrows, out, om); \
+            k_nibble_dequant<CC><<<gx, 256, 0, stream>>>(np.sm, np.nib, np.lut_row, np.esc_off, np.esc, row0, nrows, out); \
         } else if (e.fo) {                                                                                             \
-            k_fo_dequant<<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out, om);                                        \
+            k_fo_dequant<<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out);                                        \
         } else if (e.format == FMT_HUFPAIR && e.cm) {                                                                  \
             switch (e.R) {                                                                                             \
-                case 4: k_hp_dequant_cm<CC, 4><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out, om); break;              \
-                case 8: k_hp_dequant_cm<CC, 8><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out, om); break;              \
-                case 16: k_hp_dequant_cm<CC, 16><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out, om); break;            \
+                case 4: k_hp_dequant_cm<CC, 4><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out); break;              \
+                case 8: k_hp_dequant_cm<CC, 8><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out); break;              \
+                case 16: k_hp_dequant_cm<CC, 16><<<gx, 256, 0, stream>>>(hpp(e), row0, nrows, out); break;            \
                 default: throw std::invalid_argument("bf16n: unsupported chunk-major R");                             \
             }                                                                                                          \
         } else if (e.format == FMT_HUFPAIR) {                                                                          \
-            k_hp_dequant<CC><<<gx, 256, 0, stream>>>(hpp(e), e.R, row0, nrows, out, om);                                    \
+            k_hp_dequant<CC><<<gx, 256, 0, stream>>>(hpp(e), e.R, row0, nrows, out);                                    \
         } else {                                                                                                       \
             const huf_ptrs hq = hufp(e);                                                                               \
-            k_huffman_dequant<CC><<<gx, 256, 0, stream>>>(hq.sm, hq.lut, hq.lane_off, hq.stream, e.R, row0, nrows, out, om); \
+            k_huffman_dequant<CC><<<gx, 256, 0, stream>>>(hq.sm, hq.lut, hq.lane_off, hq.stream, e.R, row0, nrows, out); \
         }                                                                                                              \
         break;
     switch (e.K / 512) { DQ(1) DQ(2) DQ(4) DQ(8) default: throw std::invalid_argument("bf16n: unsupported K"); }
