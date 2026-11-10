@@ -1711,6 +1711,170 @@ __global__ void __launch_bounds__(HP_NT) k_fo_mmv(const hp_ptrs w, cols_t p) {
     }
 }
 
+// Routed-expert GEMV grouped by expert (T-060): the (token, slot) pairs of a decode batch (3 to FO_GRP_MAXT tokens) are
+// grouped by expert in every block (distinct experts in order of first occurrence, each one's pairs in pair order), and
+// each distinct expert's bands are decoded once for all its pairs: pair j's three split columns (fo_split, as k_fo_mmv)
+// are mma columns 3j .. 3j + 2, up to 8 pairs in 3 n8 tiles. The work is (distinct expert, 32-band chunk) items dealt
+// in contiguous runs to the blocks (one per SM, one band per warp), so the GPU stays full whatever the number of
+// distinct experts (k_fo_mmv runs one block per pair: pairs / SMs waves). A block stages its expert's split activations
+// once per expert change, 3 KB per pair sized for the token count: four 8-warp groups per block staged 112 KB at 8
+// tokens and left L1 too little for the lane streams (hit rate 66 -> 25 %). Tiles past the expert's last pair are
+// skipped at run time: one code path (templated per tile count, the instruction cache missed). Band starts are
+// pipelined as in k_fo_mmv. A pair's result is D[3j] + (D[3j + 1] + D[3j + 2]) of the same products summed over K in
+// the same order as k_fo_mmv's D[0] + (D[1] + D[2]), and mma keeps columns independent: bitwise k_fo_mmv's result,
+// independent of the other pairs. Layer 20 down experts (k_fo_mmv -> grouped): 4 tokens, 20 distinct 237 -> 186 us; 8
+// tokens, 38 distinct 492 -> 341; 8 tokens on the same 8 experts 365 -> 85; 64 distinct 570 -> 560; 1 / 2 tokens
+// 61 / 123 -> 68 / 128 (those stay per pair).
+constexpr int FO_GRP_NW = 32, FO_GRP_MINT = 3, FO_GRP_MAXT = 8, FO_GRP_MAXP = 64;
+inline size_t fo_grp_shm(int ntok) { return (4u << HP_LP) + (size_t) ntok * FO_MMV_XB * 16; }
+
+// one band of one expert for its ne pairs (ceil(3 ne / 8) n8 tiles of split columns), stored to the pairs' outputs
+__device__ __forceinline__ void fo_grp_band(const hp_ptrs & w, const uint32_t * lut, const uint4 * gxb, const cols_t & p,
+        const int * pairs, int ne, int64_t gu, int64_t band, uint32_t & s_next, bool has_next, uint32_t nxt, int lane) {
+    constexpr int K = FO_K, NP = K / 32;
+    const int ntile = (3 * ne + 7) / 8; // warp-uniform
+    const int g = lane >> 2, t = lane & 3;
+    HP_UNIT_BEGIN_AT(w, s_next)
+    const uint4 * pp = (const uint4 *) (w.sm + gu * 16 * K) + lane;
+    // B column 8 c8 + g of this lane: split n of the expert's pair jj (zero past its last pair)
+    uint32_t xo[3];
+    bool ok[3];
+#pragma unroll
+    for (int c8 = 0; c8 < 3; c8++) {
+        const int col = 8 * c8 + g, jj = col / 3;
+        ok[c8] = jj < ne;
+        xo[c8] = (ok[c8] ? jj : 0) * FO_MMV_XB + 4 * (col % 3) + t;
+    }
+    uint4 ring[2];
+    ring[0] = ld_plane(pp);
+    ring[1] = ld_plane(pp + 32);
+    float acc[3][4] = {};
+#pragma unroll
+    for (int q = 0; q < NP; q++) {
+        if (q == NP / 2 && has_next) {
+            s_next = nxt;
+            prefetch_l1(lst + s_next);
+        }
+        const uint4 pl = ring[q % 2];
+        if (q + 2 < NP) { ring[q % 2] = ld_plane(pp + (q + 2) * 32); }
+        uint32_t ex[8], a[8];
+        HP_PAIRS(ex)
+        fo_a(pl, ex, a);
+#pragma unroll
+        for (int c8 = 0; c8 < 3; c8++) {
+            if (c8 < ntile) {
+                const uint4 b = ok[c8] ? gxb[xo[c8] + 12 * q] : make_uint4(0, 0, 0, 0);
+                mma_bf16(acc[c8], *(const uint32_t (*)[4]) a, b.x, b.y);
+                mma_bf16(acc[c8], *(const uint32_t (*)[4]) (a + 4), b.z, b.w);
+            }
+        }
+    }
+    // lane (g, t) holds D[g][8 c8 + 2t + h] in acc[c8][h] and D[g + 8][...] in acc[c8][2 + h]: gather each pair's
+    // three columns into every lane of row quad g, one lane per quad stores
+#pragma unroll
+    for (int jj = 0; jj < FO_GRP_MAXT; jj++) {
+        if (jj < ne) {
+            float v0[3], v8[3];
+#pragma unroll
+            for (int n = 0; n < 3; n++) {
+                const int col = 3 * jj + n, src = 4 * g + (col % 8) / 2;
+                v0[n] = __shfl_sync(0xffffffffu, acc[col / 8][col & 1], src);
+                v8[n] = __shfl_sync(0xffffffffu, acc[col / 8][2 + (col & 1)], src);
+            }
+            if (t == (jj & 3)) {
+                const int q0 = pairs[jj];
+                ydst out;
+                out.init(p.dst_bf16);
+                out.point(p.dst + (q0 / p.n_used) * p.dst_tok + (q0 % p.n_used) * p.dst_slot);
+                out.set(band * 16 + g, v0[0] + (v0[1] + v0[2]));
+                out.set(band * 16 + g + 8, v8[0] + (v8[1] + v8[2]));
+            }
+        }
+    }
+}
+
+template <typename TX>
+__global__ void __launch_bounds__(FO_GRP_NW * 32) k_fo_mmv_grp(const hp_ptrs w, cols_t p, int npairs) {
+    constexpr int NW = FO_GRP_NW;
+    extern __shared__ __align__(16) uint32_t grp_shm[];
+    uint32_t * lut = grp_shm;
+    uint4 * xb = (uint4 *) (grp_shm + (1 << HP_LP)); // the current expert's pairs (at most one per token)
+    __shared__ int s_e[FO_GRP_MAXP], s_first[FO_GRP_MAXP], s_slot[FO_GRP_MAXP], s_cntq[FO_GRP_MAXP];
+    __shared__ int s_exp[FO_GRP_MAXP], s_cnt[FO_GRP_MAXP], s_pair[FO_GRP_MAXP][FO_GRP_MAXT], s_D;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (threadIdx.x < npairs) {
+        const int q = threadIdx.x;
+        s_e[q] = *(const int32_t *) (p.ids + (q / p.n_used) * p.ids_s1 + (q % p.n_used) * p.ids_s0);
+    }
+    for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += blockDim.x) { ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i); }
+    __syncthreads();
+    if (threadIdx.x < npairs) { // first occurrence, rank among the pairs of the expert, pairs per expert
+        const int q = threadIdx.x, e = s_e[q];
+        int first = q, slot = 0, cnt = 0;
+        for (int r = 0; r < npairs; r++) {
+            if (s_e[r] == e) {
+                cnt++;
+                if (r < q) { slot++; first = min(first, r); }
+            }
+        }
+        s_first[q] = first; s_slot[q] = slot; s_cntq[q] = cnt;
+    }
+    __syncthreads();
+    if (threadIdx.x < npairs) { // expert index = first occurrences before this expert's first one
+        const int q = threadIdx.x;
+        int d = 0;
+        for (int r = 0; r < s_first[q]; r++) { d += s_first[r] == r; }
+        s_pair[d][s_slot[q]] = q;
+        if (s_first[q] == q) { s_exp[d] = s_e[q]; s_cnt[d] = s_cntq[q]; }
+    }
+    if (threadIdx.x == 0) { // distinct experts
+        int D = 0;
+        for (int r = 0; r < npairs; r++) { D += s_first[r] == r; }
+        s_D = D;
+    }
+    __syncthreads();
+    const int D = s_D, ipe = (int) (p.nrows / 16 / NW); // items per expert: chunks of NW bands
+    const int total = D * ipe, per = (total + gridDim.x - 1) / gridDim.x;
+    const int i0 = min(total, blockIdx.x * per), i1 = min(total, i0 + per);
+    auto unit_of = [&](int item) -> int64_t { // this warp's band of an item, as a global unit index
+        return (p.row0 + (int64_t) s_exp[item / ipe] * p.rows_per_matrix) / 16 + (item % ipe) * NW + warp;
+    };
+    uint32_t s_next = 0;
+    if (i0 < i1) {
+        const int64_t un = unit_of(i0);
+        s_next = __ldg(w.ubase + un) + __ldg(w.lrel + un * 32 + lane);
+    }
+    int cur = -1;
+    for (int it = i0; it < i1; it++) {
+        const int d = it / ipe, ne = s_cnt[d];
+        if (d != cur) { // block-uniform: stage the split activations of the expert's pairs
+            __syncthreads();
+            for (int i = threadIdx.x; i < ne * FO_MMV_XB; i += blockDim.x) {
+                const int q0 = s_pair[d][i / FO_MMV_XB], e = i % FO_MMV_XB;
+                const TX * xg = (const TX *) (p.x + (q0 / p.n_used) * p.x_tok + ((q0 % p.n_used) % p.ne11) * p.x_slot);
+                const int tt = e & 3, n = (e >> 2) % 3, q = e / 12;
+                uint32_t r[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++) { // as k_fo_mmv: tile 2q + j / 2, k = 2t (b0) or 2t + 8 (b1)
+                    const int c = 32 * q + 16 * (j >> 1) + 2 * tt + 8 * (j & 1);
+                    r[j] = fo_split(load_x1(xg, c), n) | fo_split(load_x1(xg, c + 1), n) << 16;
+                }
+                xb[i] = make_uint4(r[0], r[1], r[2], r[3]);
+            }
+            __syncthreads();
+            cur = d;
+        }
+        const bool has_next = it + 1 < i1;
+        uint32_t nxt = 0;
+        if (has_next) {
+            const int64_t un = unit_of(it + 1);
+            nxt = __ldg(w.ubase + un) + __ldg(w.lrel + un * 32 + lane);
+        }
+        const int64_t gu = unit_of(it), band = (it % ipe) * NW + warp;
+        fo_grp_band(w, lut, xb, p, s_pair[d], ne, gu, band, s_next, has_next, nxt, lane);
+    }
+}
+
 // Dense GEMV of up to 8 BF16 columns on the tensor cores (T-077): one decode of the matrix feeds mma.m16n8k16 whose B
 // columns are the tokens (exact BF16, zero columns past ncols), so 8 tokens cost about one. A group of C warps takes a
 // band, warp s its slab s (K-split: bands alone are too few for 2048-row matrices); slab 0 adds the other slabs' FP32

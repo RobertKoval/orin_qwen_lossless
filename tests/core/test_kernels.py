@@ -394,6 +394,25 @@ def test_moe_experts(ops, experts, T, mode, ids_dtype):
     assert worst <= 1.0, f"error {worst:.3g} x the bound"
 
 
+@pytest.mark.parametrize("T, mode", [(1, "uniform"), (2, "uniform"), (3, "one_expert_all"), (4, "half_empty"),
+                                     (7, "uniform"), (8, "one_expert_all"), (8, "half_empty"), (9, "one_expert_all")])
+@pytest.mark.parametrize("xdtype", [torch.float32, torch.bfloat16])  # FP32: the SwiGLU output, three split columns
+def test_mmv_down_experts_pair_alone(ops, experts, T, mode, xdtype):
+    """Decode down GEMV over routed pairs (fragment order: grouped by expert from 3 to 8 tokens, per pair otherwise):
+    every (token, slot) result is bitwise the one of that token routed alone (one token: the per-pair kernel), whatever
+    else is batched with it (16 experts: up to 8 pairs share an expert, 3 split columns each, straddling the 8-column
+    mma tiles; T = 2 and 9 sit on either side of the grouped range), and within the FP32 accumulation bound of FP64."""
+    (_, _, down), (_, _, ed) = experts
+    ids, _ = routing(T, mode, seed=50 + T)
+    a = act(T * TOPK, N, seed=60 + T, dtype=xdtype).view(T, TOPK, N)
+    y = ops.mmv(a, ed, ids, H)
+    ref, S = per_slot_ref(down, ids, a)
+    assert_within(y, ref, S)
+    for t in range(T):
+        alone = ops.mmv(a[t:t + 1].contiguous(), ed, ids[t:t + 1].contiguous(), H)
+        assert torch.equal(bits(y[t]), bits(alone[0])), f"token {t}"
+
+
 @pytest.mark.parametrize("T", [9, 64, 129, 1024])  # down interleave 4 / 2 / 1 / 1 at 16 experts
 def test_moe_mm_ids_down_stage(ops, experts, T):
     """Batched down kernel alone (per-slot BF16 inputs): FP32 accumulation bound, every routed slot written; the BF16

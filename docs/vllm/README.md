@@ -98,7 +98,10 @@ llama.cpp's shapes), because vLLM's merged projections leave "largest R with ≥
   in fragment order (`FLAG_FRAG_ORDER`): each lane's stream and plane bytes are its `mma` A-fragment elements, so the
   batched kernel multiplies them straight on the tensor cores (2048 tokens: 9.95 → 4.34 ms per layer), and the
   tensor-core decode GEMV loads the next band's stream position ahead of the current band (4 tokens: 290 µs per layer,
-  row-major 298). Dense linear layers in fragment order take `k_fo_mmv8`: one decode of a band feeds `mma` with up to 8
+  row-major 298). From 3 to 8 tokens the decode GEMV groups the routed pairs by expert (`k_fo_mmv_grp`): each distinct
+  expert's bands are decoded once for all its pairs (three FP32-split columns per pair, up to 8 pairs per `mma`), with
+  results bitwise those of the per-pair kernel (served text: 21 of 32 and 38 of 64 pairs are distinct experts; layer
+  20 down, 4 / 8 tokens 237 / 492 → 184 / 338 µs). Dense linear layers in fragment order take `k_fo_mmv8`: one decode of a band feeds `mma` with up to 8
   BF16 token columns, a group of `K / 512` warps splits the band along K and slab 0 adds the partial sums in slab order
   (in_proj_qkvz 12288 × 2048: 1 / 4 / 8 tokens 213 / 245 / 490 → 212 / 213 / 216 µs; prefill keeps exact dequant +
   cuBLAS).

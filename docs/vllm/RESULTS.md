@@ -675,3 +675,26 @@ Production wheel `0.1.0+g462b5b055fea` against `0.1.0+g0fef3fa10de4`.
   logprobs (48.0), 47.1 with (47.3), within the spread between server starts; 72K 33.4 tok/s (32.7), 197K 31.1
   (30.4) at the same acceptance: long-context steps are GPU-bound, so the drafter saving counts there; prefill 8K
   1904, 23K 1745 (unchanged).
+
+## 2026-11-10 ninth release: routed down experts decoded once per distinct expert (measured)
+
+Production wheel `0.1.0+g2073cc586b59` against `0.1.0+g462b5b055fea`.
+
+* **Change (T-060, first step).** The decode GEMV of the down experts ran one block per routed (token, slot) pair:
+  a verification batch decoded an expert once per pair, in pairs / SMs waves. From 3 to 8 tokens it now groups the
+  pairs by expert in every block and decodes each distinct expert's bands once: a pair's three FP32-split columns are
+  `mma` columns, up to 8 pairs per expert in 3 tiles, and (expert, 32-band) chunks are dealt evenly to the SMs. The
+  same products are summed in the same order, so results are bitwise the per-pair kernel's and do not depend on the
+  other pairs (tested across the thresholds). A first version with four warp groups per block reserved 112 KB of
+  shared memory at 8 tokens; the lane streams lost L1 (hit rate 66 → 25 %) and it ran 21 % slower than per pair.
+* **Routing of served text** (dump of every MoE call): 20.9 distinct experts of 32 pairs at 4 tokens (one session),
+  38.4 of 64 at 8 (two sessions).
+* **Kernel** (layer 20 down, per pair → grouped): 4 tokens with 20 distinct experts 237 → 184 µs; 8 tokens with 38
+  distinct 492 → 338 µs; 8 tokens on 8 experts 365 → 82 µs; 64 distinct 570 → 563 µs. One and two tokens stay per
+  pair (68 / 128 µs grouped against 61 / 123).
+* **A/B** (`:8010`, B A A B, same compile-cache state): greedy outputs and top-1 logprobs bitwise equal, acceptance
+  identical; two sessions step 106.3 / 105.2 → 100.7 / 101.8 ms; one stream 47.0 → 48.4 tok/s with logprobs at
+  `--max-num-seqs 2`, 48.0 → 49.7 without at `--max-num-seqs 1`.
+* **Production** (texts and top-1 logprobs identical to the previous release's check): decode **49.4** tok/s without
+  logprobs (47.8), 48.6 with (47.1); 72K 34.1 tok/s (33.4), 197K 31.7 (31.1) at the same acceptance (step 72.8 /
+  89.9 ms); prefill 8K 1874, 23K 1747 (unchanged).

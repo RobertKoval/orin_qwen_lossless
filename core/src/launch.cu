@@ -132,7 +132,15 @@ void launch_mmv_t(const weight & e, const cols_t & p, int ncols, cudaStream_t st
             if (K != FO_K) {
                 throw std::invalid_argument("bf16n: fragment-order matrices with K > 512 take BF16 activations without expert ids");
             }
-            k_fo_mmv<TX><<<g2, nt, fo_mmv_shm(), stream>>>(hpp(e), p);
+            // routed pairs grouped by expert from FO_GRP_MINT tokens (decode verification: 4 tokens per session); fewer
+            // tokens share few experts and go per pair; both give the same bits (k_fo_mmv_grp)
+            const int ntok = p.ids ? ncols / p.n_used : 0;
+            if (p.ids && ncols % p.n_used == 0 && ntok >= FO_GRP_MINT && ntok <= FO_GRP_MAXT && ncols <= FO_GRP_MAXP &&
+                (p.nrows / 16) % FO_GRP_NW == 0) {
+                k_fo_mmv_grp<TX><<<g_sms, FO_GRP_NW * 32, fo_grp_shm(ntok), stream>>>(hpp(e), p, ncols);
+            } else {
+                k_fo_mmv<TX><<<g2, nt, fo_mmv_shm(), stream>>>(hpp(e), p);
+            }
         } else if (e.cm) {
 #define CM_CASE(CC, RR) case CC * 100 + RR: k_hp_mmv_cm<TX, CC, RR><<<g2, nt, shm, stream>>>(hpp(e), p); break;
             switch (K / 512 * 100 + e.R) {
@@ -256,6 +264,8 @@ void ensure_init() { std::call_once(g_once, [] {
 #define FO8_ATTR(CC) BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mmv8<CC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fo8_shm(CC, FO8_NTOK, 32)));
     FO8_ATTR(1) FO8_ATTR(2) FO8_ATTR(4) FO8_ATTR(8)
 #undef FO8_ATTR
+    BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mmv_grp<float>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fo_grp_shm(FO_GRP_MAXT)));
+    BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mmv_grp<bf16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fo_grp_shm(FO_GRP_MAXT)));
     BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mm_ids<FO_NTOK, FO_NW>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                           (int) std::min<size_t>(g_smem_optin, fo_mm_shm(FO_NTOK, MM_MAX_EXPERTS_INIT))));
 #define MM_ATTR(CC, RR, NW, IL, WT, B, G) BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_hp_mm_ids<CC, RR, NW, IL, WT, B, G>, \
