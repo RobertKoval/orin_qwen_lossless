@@ -150,6 +150,13 @@ rejection-sampler patch of another engine that penalises detected repetition cyc
 that want to discourage repetition set the OpenAI sampling parameters (`presence_penalty`, `frequency_penalty`)
 themselves. For an evaluation with the full draft head, use `BF16N_DRAFT_HEAD=full` (or install with `--fidelity`).
 
+Greedy texts can differ between starts of one build. Kernel configurations tuned at run time are chosen by timing on
+their first run and set reduction orders, so a start's cache directories and CPU load pick one of a few rounding
+variants (T-079: two text sets, top-1 logprob drift up to 0.2 nat before the first divergence, which falls on a near
+tie; the production service reproduces one of them across starts). Both agree with llama.cpp-BF16N alike: top-1
+99.7 % / 99.2 %, mean KL 1.7e-3 / 1.9e-3 over 383 teacher-forced tokens. `TORCHINDUCTOR_DETERMINISTIC=1` did not pin
+them and cost 0.9 % decode; the kernel that decides is not identified yet.
+
 An approximate draft need not bias the final target distribution if rejection uses its actual proposal distribution:
 accept with `min(1, p/q)` and recover from normalized `(p-q)+`. Deterministic drafting has a point-mass proposal;
 missing draft probabilities are then appropriate, not probabilities from a hypothetical full head. This mathematical
