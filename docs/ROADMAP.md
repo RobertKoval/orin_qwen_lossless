@@ -7,7 +7,7 @@ encoder, kernels in `core/`, used by both engines), `[llamacpp]`, `[vllm]`. Numb
 hypotheses until measured with alternating A/B runs.
 
 Production runs the vLLM engine (since 10-30; releases of 2026-11-09/10: 48.0 tok/s short decode with MTP 3, step
-76.1 ms @ 72K and 93.6 ms @ 197K, prefill 1903 tok/s at 8k); llama.cpp is the rollback engine. The fragment-order down
+74.5 ms @ 72K and 91.6 ms @ 197K, two sessions 106 ms per step, prefill 1903 tok/s at 8k); llama.cpp is the rollback engine. The fragment-order down
 experts in vLLM's prefill (Stage 1) and the tensor-core dense decode GEMV are done; next: two parallel sessions on the
 production server (speed, then lossless KV coding for two long windows).
 

@@ -123,7 +123,10 @@ llama.cpp's shapes), because vLLM's merged projections leave "largest R with ≥
   hit one block past the full-attention hit that the MTP last-block drop had shortened, so the hit counted attention
   KV that was never computed. `tests/serving/state_checks.py` checks a running server: short prompts independent of
   the previous request, and prefix-cache hits equal to a no-cache run.
-* MTP with 3 draft tokens; a **lossy, draft-only** 2-bit copy of lm_head (each weight the nearest of ±0.5 s, ±1.5 s,
+* MTP with 3 draft tokens. The drafter's CUDA graphs have their own sizes (`draft_graphs.py`): vLLM rounds the
+  shared capture sizes up to multiples of 4 for the FULL decode graphs, which padded the drafter's passes 2 and 3 (one
+  token per request) to 4 rows; the drafter now also captures the powers of two up to `max_num_seqs`.
+* A **lossy, draft-only** 2-bit copy of lm_head (each weight the nearest of ±0.5 s, ±1.5 s,
   s = amax / 1.5 per 128 weights; 143 MB) selects 128 candidates (`BF16N_DRAFT_HEAD=int4`: the earlier 4-bit copy with
   32 candidates, 270 MB). Their BF16N weight
   rows are reconstructed exactly and re-scored with FP32 arithmetic; other draft logits become `-inf`. This is not

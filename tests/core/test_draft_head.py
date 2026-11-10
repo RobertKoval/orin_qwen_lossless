@@ -69,6 +69,18 @@ def test_kbit_gemv_is_the_product_with_the_stored_matrix(ops, bits, K, T):
     assert ((y - ref).abs() <= 2e-2 * bound + 1e-6).all()
 
 
+@pytest.mark.parametrize("T", [2, 3, 4])
+def test_int2_gemv_scores_each_column_as_alone(ops, T):
+    """A sequence's draft candidates must not depend on the other sequences in the batch (two sessions share one
+    draft-head call): each column's scores are bitwise those of a one-column call."""
+    K = 2048
+    q, s = ops.int2_quantize(weights_like_model((61, K), seed=T).cuda())
+    x = (torch.randn(T, K, generator=torch.Generator().manual_seed(10 + T)) * 2).to(torch.bfloat16).cuda()
+    y = ops.int2_gemv(x, q, s)
+    for t in range(T):
+        assert torch.equal(y[t].view(torch.int32), ops.int2_gemv(x[t:t + 1].contiguous(), q, s)[0].view(torch.int32))
+
+
 @pytest.mark.parametrize("fo", [False, True])
 def test_draft_logits_rescore_every_candidate_exactly(ops, fo):
     """fo: the lm_head in fragment order (production since T-080): gathered rows are the same bits, so the draft

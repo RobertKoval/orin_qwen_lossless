@@ -91,7 +91,7 @@ class Qwen3_5MoeForConditionalGeneration(qwen3_5.Qwen3_5MoeForConditionalGenerat
         with quantized_vocab(vllm_config.quant_config):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.bf16n_fused_shared_experts = fuse_shared_experts(self)
-        from . import async_align, hybrid_state, prompt_logprobs, triton_spec
+        from . import async_align, draft_graphs, hybrid_state, prompt_logprobs, triton_spec
 
         # the scheduler's cache coordinator must see the patch: it lives in this process only with one worker
         assert vllm_config.parallel_config.world_size == 1, "vllm_bf16n patches the in-process scheduler (TP/PP = 1)"
@@ -99,6 +99,7 @@ class Qwen3_5MoeForConditionalGeneration(qwen3_5.Qwen3_5MoeForConditionalGenerat
         async_align.install()  # MTP + prefix caching without the per-step host sync (async_align.py)
         triton_spec.install()  # split-KV Triton attention for MTP verification batches (triton_spec.py)
         prompt_logprobs.install()  # prompt logprobs in bounded memory (prompt_logprobs.py, T-045)
+        draft_graphs.install()  # MTP drafter passes 2..N on their own row count, not padded to k + 1 (T-084)
 
 
 class _FromTarget(torch.nn.Module):

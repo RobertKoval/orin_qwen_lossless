@@ -144,83 +144,78 @@ __global__ void k_int2_quantize(const __nv_bfloat16 * __restrict__ w, int64_t ro
     }
 }
 
-// y[t][r] = sum_k (n_k - 1.5) s x[t][k] for T <= 4 columns, K = 2048 (the lm_head width it was measured for; K = 4096
-// spills). One warp per row; each lane loads 16 contiguous bytes (64 weights, columns 64 lane .. 64 lane + 63, one scale
-// group; coalesced 512 B per warp) and keeps its x values in registers as half2, plus their FP32 sum. Level indices become half2 by the exponent trick
-// ((n | 0x6400) - 1024 = n, exact); sum n x in half2 over 16 weights, then sum_k n x - 1.5 sum_k x times the scale in
-// FP32: approximate by design (candidate selection only).
-template <int T>
-__global__ void __launch_bounds__(256) k_int2_gemv(const __nv_bfloat16 * __restrict__ x, const uint8_t * __restrict__ q,
-                                                   const float * __restrict__ s, int64_t rows, float * __restrict__ y) {
-    constexpr int K = 2048, NIT = 1;
+// y[t][r] = sum_k (n_k - 1.5) s x[t][k] for NC = 1 or 2 columns, K = 2048 (the lm_head width it was measured for;
+// K = 4096 spills). One warp per row; each lane loads 16 contiguous bytes (64 weights, columns 64 lane .. 64 lane + 63,
+// one scale group; coalesced 512 B per warp), the next row's while this one is computed, and keeps its x values in
+// registers as half2, plus their FP32 sum. Level indices become half2 by the exponent trick ((n | 0x6400) - 1024 = n,
+// exact); sum n x in half2 over 16 weights, then sum_k n x - 1.5 sum_k x times the scale in FP32: approximate by design
+// (candidate selection only). Every column takes the same operations in the same order, so its scores do not depend on
+// the other columns. Columns beyond 2 are more launches (int2_gemv): 3 columns in registers took 204 registers (one
+// block per SM). T-083, full lm_head (248320 rows): one column 1210 -> 968 us with the next-row load and 4 blocks per
+// SM, two columns 2422 us (two one-column launches) -> 1493 us in one launch at 2 blocks per SM.
+template <int NC>
+__global__ void __launch_bounds__(256, NC == 1 ? 4 : 2) k_int2_gemv(const __nv_bfloat16 * __restrict__ x,
+        const uint8_t * __restrict__ q, const float * __restrict__ s, int64_t rows, float * __restrict__ y) {
+    constexpr int K = 2048;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    // xr[t][it][8 wd + j]: half2 of the lane's columns 16 wd + j and 16 wd + j + 8 (bits 2j and 2j + 16 of word wd)
-    __half2 xr[T][NIT][32];
-    float xsum[T][NIT];
+    const int64_t stride = (int64_t) gridDim.x * 8;
+    // xr[c][8 wd + j]: half2 of the lane's columns 16 wd + j and 16 wd + j + 8 (bits 2j and 2j + 16 of word wd)
+    __half2 xr[NC][32];
+    float xsum[NC];
 #pragma unroll
-    for (int t = 0; t < T; t++) {
+    for (int c = 0; c < NC; c++) {
+        const __nv_bfloat16 * xp = x + c * K + lane * 64;
+        float sum = 0.f;
 #pragma unroll
-        for (int it = 0; it < NIT; it++) {
-            const __nv_bfloat16 * xp = x + t * K + it * 2048 + lane * 64;
-            float sum = 0.f;
+        for (int wd = 0; wd < 4; wd++) {
 #pragma unroll
-            for (int wd = 0; wd < 4; wd++) {
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const float a = __bfloat162float(xp[16 * wd + j]), b = __bfloat162float(xp[16 * wd + j + 8]);
-                    xr[t][it][8 * wd + j] = __floats2half2_rn(a, b);
-                    sum += a + b;
-                }
+            for (int j = 0; j < 8; j++) {
+                const float a = __bfloat162float(xp[16 * wd + j]), b = __bfloat162float(xp[16 * wd + j + 8]);
+                xr[c][8 * wd + j] = __floats2half2_rn(a, b);
+                sum += a + b;
             }
-            xsum[t][it] = sum;
         }
+        xsum[c] = sum;
     }
     const __half2 bias = __float2half2_rn(1024.f);
-    for (int64_t r = blockIdx.x * 8 + warp; r < rows; r += (int64_t) gridDim.x * 8) {
-        uint4 v[NIT];
-        float sc[NIT];
-#pragma unroll
-        for (int it = 0; it < NIT; it++) {
-            v[it] = __ldg((const uint4 *) (q + r * (K / 4) + it * 512 + lane * 16));
-            sc[it] = __ldg(s + r * (K / G) + it * 16 + lane / 2);
+    int64_t r = blockIdx.x * 8 + warp;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    float sc = 0.f;
+    if (r < rows) {
+        v = __ldg((const uint4 *) (q + r * (K / 4) + lane * 16));
+        sc = __ldg(s + r * (K / G) + lane / 2);
+    }
+    for (; r < rows; r += stride) {
+        const int64_t rn = r + stride;
+        uint4 vn = make_uint4(0, 0, 0, 0);
+        float scn = 0.f;
+        if (rn < rows) {
+            vn = __ldg((const uint4 *) (q + rn * (K / 4) + lane * 16));
+            scn = __ldg(s + rn * (K / G) + lane / 2);
         }
-        float acc[T];
+        const uint32_t words[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
-        for (int t = 0; t < T; t++) { acc[t] = 0.f; }
-#pragma unroll
-        for (int it = 0; it < NIT; it++) {
-            const uint32_t words[4] = {v[it].x, v[it].y, v[it].z, v[it].w};
-            float nx[T];
-#pragma unroll
-            for (int t = 0; t < T; t++) { nx[t] = 0.f; }
+        for (int c = 0; c < NC; c++) {
+            float nx = 0.f;
 #pragma unroll
             for (int wd = 0; wd < 4; wd++) {
-                __half2 hacc[T];
-#pragma unroll
-                for (int t = 0; t < T; t++) { hacc[t] = __float2half2_rn(0.f); }
+                __half2 hacc = __float2half2_rn(0.f);
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
                     const uint32_t packed = ((words[wd] >> (2 * j)) & 0x00030003u) | 0x64006400u; // bits 2j, 2j + 16
                     const __half2 wv = __hsub2(*(const __half2 *) &packed, bias);
-#pragma unroll
-                    for (int t = 0; t < T; t++) { hacc[t] = __hfma2(wv, xr[t][it][8 * wd + j], hacc[t]); }
+                    hacc = __hfma2(wv, xr[c][8 * wd + j], hacc);
                 }
-#pragma unroll
-                for (int t = 0; t < T; t++) {
-                    const float2 f = __half22float2(hacc[t]);
-                    nx[t] += f.x + f.y;
-                }
+                const float2 f = __half22float2(hacc);
+                nx += f.x + f.y;
             }
-#pragma unroll
-            for (int t = 0; t < T; t++) { acc[t] = fmaf(fmaf(-1.5f, xsum[t][it], nx[t]), sc[it], acc[t]); }
-        }
-#pragma unroll
-        for (int t = 0; t < T; t++) {
-            float val = acc[t];
+            float val = fmaf(fmaf(-1.5f, xsum[c], nx), sc, 0.f);
 #pragma unroll
             for (int o = 16; o; o >>= 1) { val += __shfl_xor_sync(0xffffffffu, val, o); }
-            if (lane == 0) { y[t * rows + r] = val; }
+            if (lane == 0) { y[c * rows + r] = val; }
         }
+        v = vn;
+        sc = scn;
     }
 }
 
@@ -273,13 +268,14 @@ void int2_gemv(const void * x_bf16, int T, const uint8_t * q, const float * s, i
                int sm_count, cudaStream_t stream) {
     BF16N_REQUIRE(K == 2048, "int2_gemv: K must be 2048");
     BF16N_REQUIRE(T >= 1 && T <= 4, "int2_gemv: 1 to 4 columns");
-    const unsigned blocks = (unsigned) std::min<int64_t>((rows + 7) / 8, (int64_t) sm_count * 16);
+    const unsigned blocks = (unsigned) std::min<int64_t>((rows + 7) / 8, (int64_t) sm_count * 8); // T-083: best of 8, 16, 32 per SM
     const auto * xb = (const __nv_bfloat16 *) x_bf16;
-    switch (T) {
-        case 1: k_int2_gemv<1><<<blocks, 256, 0, stream>>>(xb, q, s, rows, y); break;
-        case 2: k_int2_gemv<2><<<blocks, 256, 0, stream>>>(xb, q, s, rows, y); break;
-        case 3: k_int2_gemv<3><<<blocks, 256, 0, stream>>>(xb, q, s, rows, y); break;
-        default: k_int2_gemv<4><<<blocks, 256, 0, stream>>>(xb, q, s, rows, y); break;
+    for (int t = 0; t < T; t += 2) { // two columns per launch, the odd last one alone (k_int2_gemv)
+        if (T - t >= 2) {
+            k_int2_gemv<2><<<blocks, 256, 0, stream>>>(xb + (int64_t) t * K, q, s, rows, y + t * rows);
+        } else {
+            k_int2_gemv<1><<<blocks, 256, 0, stream>>>(xb + (int64_t) t * K, q, s, rows, y + t * rows);
+        }
     }
     BF16N_CUDA_CHECK(cudaGetLastError());
 }

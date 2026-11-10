@@ -652,3 +652,26 @@ Production wheel `0.1.0+g0fef3fa10de4` against `0.1.0+gf43af2f2a28a`.
   that ran the old build first credit the new one with part of that.
 * **Production** (same texts as the previous release): decode **48.0** tok/s without logprobs (47.2), 47.3 with (46.6);
   step 76.1 ms at 72K (77.6), 93.6 at 197K (95.1); prefill 8K 1866, 23K 1732, 72K 1310, 197K 898 (A/B: equal).
+
+## 2026-11-10 eighth release: drafter graphs at their own size, 2-bit head without the register cliff (measured)
+
+Production wheel `0.1.0+g462b5b055fea` against `0.1.0+g0fef3fa10de4`.
+
+* **Change 1 (T-084).** With FULL decode graphs vLLM rounds the CUDA-graph capture sizes up to multiples of k + 1 = 4
+  (vLLM issue 28207). The drafter shares those sizes although it runs piecewise graphs only, so its passes 2 and 3
+  (one token per request) ran the draft layer on 4 rows for 1 or 2. The drafter now has its own sizes (the shared
+  ones plus the powers of two up to `max_num_seqs`), captured at start; the target's graphs are untouched. Draft
+  passes 2 and 3 take 2.36 ms instead of 3.00 (routed experts on 8 pairs instead of 32).
+* **Change 2 (T-083).** The 2-bit head kernel held every column's activations in registers: 144 registers at two
+  columns (one block of 256 threads per SM), so two sessions paid 4.08 ms per draft pass against 1.34 ms for one. It
+  now takes one or two columns per launch and loads the next row while computing the current one. Full lm_head at
+  1 / 2 / 4 columns: 1192 / 3172 / 4704 → 960 / 1512 / 3028 µs, scores bitwise unchanged.
+* **A/B** (`:8010`, starts with the same compile-cache state): greedy outputs and top-1 logprobs bitwise equal,
+  acceptance identical. Two sessions (`--max-num-seqs 2`): step 115.4 → 106.3 ms. One stream: untraced B A A B at
+  `--max-num-seqs 1` 47.9 → 48.0 tok/s (equal); one pair at `--max-num-seqs 2` with logprobs 46.8 → 47.5. At one
+  stream the drafter runs alongside host work between steps: the GPU load fell from 99 % to 96–97 % with equal
+  decode, so cheaper draft passes do not shorten a short-context step.
+* **Production** (texts and top-1 logprobs identical to the previous release's check): decode 47.8 tok/s without
+  logprobs (48.0), 47.1 with (47.3), within the spread between server starts; 72K 33.4 tok/s (32.7), 197K 31.1
+  (30.4) at the same acceptance: long-context steps are GPU-bound, so the drafter saving counts there; prefill 8K
+  1904, 23K 1745 (unchanged).
