@@ -150,12 +150,13 @@ rejection-sampler patch of another engine that penalises detected repetition cyc
 that want to discourage repetition set the OpenAI sampling parameters (`presence_penalty`, `frequency_penalty`)
 themselves. For an evaluation with the full draft head, use `BF16N_DRAFT_HEAD=full` (or install with `--fidelity`).
 
-Greedy texts can differ between starts of one build. Kernel configurations tuned at run time are chosen by timing on
-their first run and set reduction orders, so a start's cache directories and CPU load pick one of a few rounding
-variants (T-079: two text sets, top-1 logprob drift up to 0.2 nat before the first divergence, which falls on a near
-tie; the production service reproduces one of them across starts). Both agree with llama.cpp-BF16N alike: top-1
-99.7 % / 99.2 %, mean KL 1.7e-3 / 1.9e-3 over 383 teacher-forced tokens. `TORCHINDUCTOR_DETERMINISTIC=1` did not pin
-them and cost 0.9 % decode; the kernel that decides is not identified yet.
+Greedy texts can differ between starts of one build (T-079): two text sets, top-1 logprob drift up to 0.2 nat before
+the first divergence, which falls on a near tie. Measured rule over 25 starts: the second set appears only when the
+start uses the Triton cache in the home directory and loads its compiled graph without a fresh Dynamo trace; the
+production service's cache directories, an empty Triton cache or a fresh trace give the first set, which production
+reproduces across starts. The mechanism is not identified (the two caches hold bitwise-equal binaries and autotuning
+results for every shared key; `TORCHINDUCTOR_DETERMINISTIC=1` changed nothing and cost 0.9 % decode). Both sets agree
+with llama.cpp-BF16N alike: top-1 99.7 % / 99.2 %, mean KL 1.7e-3 / 1.9e-3 over 383 teacher-forced tokens.
 
 An approximate draft need not bias the final target distribution if rejection uses its actual proposal distribution:
 accept with `min(1, p/q)` and recover from normalized `(p-q)+`. Deterministic drafting has a point-mass proposal;
