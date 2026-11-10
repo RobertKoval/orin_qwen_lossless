@@ -11,7 +11,7 @@ HP, NIB = FMT_HUFPAIR, FMT_NIBBLE
     "name, rows, K, n, expected",
     [
         # Qwen3.6-35B-A3B modules (docs/vllm/README.md)
-        ("experts gate / up", 512, 2048, 256, Choice(HP, 8, True)),
+        ("experts gate / up", 512, 2048, 256, Choice(HP, 16, False, True)),  # fragment order (grouped decode GEMV)
         ("experts down", 2048, 512, 256, Choice(HP, 16, False, True)),  # fragment order (batched prefill kernel)
         ("self_attn.qkv_proj (merged)", 9216, 2048, 1, Choice(HP, 2, False)),  # 576 units of 16 = 2 waves
         ("o_proj / linear_attn.out_proj", 2048, 4096, 1, Choice(HP, 4, False)),
@@ -69,7 +69,7 @@ def test_expert_unit_size(per, R):
     assert per % c.R == 0
 
 
-@pytest.mark.parametrize("K, cm", [(512, False), (1024, True), (4096, True)])
+@pytest.mark.parametrize("K, cm", [(512, False), (1024, True), (2048, False), (4096, True)])  # 2048: fragment order
 def test_expert_chunk_major_only_above_one_chunk(K, cm):
     assert choose(512, K, 4).chunk_major is cm
 
@@ -97,14 +97,20 @@ def test_smallest_and_largest_signed_shapes():
     [
         (2048, 512, 256, True),    # vLLM down experts
         (2040, 512, 256, False),   # rows % 16 != 0: R = 8 bands do not exist in fragment order
-        (2048, 1024, 256, False),  # K > 512: chunk-major experts
+        (512, 2048, 256, True),    # vLLM gate / up experts: 16-row bands although rows < 2048
+        (520, 2048, 256, False),   # rows % 16 != 0: chunk-major R = 8
+        (16, 2048, 2, True),       # the smallest band count, two matrices
+        (2048, 1024, 256, False),  # K = 1024 / 4096: no fragment-order expert kernels, chunk-major
+        (512, 4096, 256, False),
         (16384, 512, 1, False),    # dense K = 512 HUFPAIR (R = 16): GEMV only, row-major
+        (512, 2048, 1, False),     # one matrix of the gate / up shape is dense (NIBBLE)
     ],
 )
-def test_frag_order_only_for_k512_experts(rows, K, n, frag_order):
+def test_frag_order_experts(rows, K, n, frag_order):
     c = choose(rows, K, n)
     assert c.frag_order is frag_order
     assert not (c.frag_order and c.chunk_major)
+    assert not c.frag_order or c.R == 16
 
 
 @pytest.mark.parametrize(

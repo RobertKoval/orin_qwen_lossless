@@ -54,14 +54,18 @@ std::optional<policy_choice> choose(int64_t rows, int64_t K, int64_t n_matrices,
     // opted-in vLLM dense matrices in fragment order: the decode GEMV multiplies up to 8 tokens per decode on the tensor
     // cores (T-077, in_proj_qkvz 12288 x 2048: 4 tokens 247 -> 217 us, 8 tokens 494 -> 218 us)
     const bool fo_dense = opts.engine == policy_engine::vllm && opts.dense_frag_order && n_matrices == 1 && rows % 16 == 0;
+    // vLLM's K = 2048 experts (gate / up) in fragment order, 16-row bands of 4 slabs: the decode GEMV multiplies every
+    // token routed to an expert from one decode on the tensor cores, the batched prefill kernel decodes straight into
+    // mma operands with SWIGLU fused (T-060 b2)
+    const bool fo_gate_up = opts.engine == policy_engine::vllm && n_matrices > 1 && K == 4 * CHUNK && rows % 16 == 0;
     const int R = n_matrices > 1
-        ? (rows % 16 == 0 && rows >= 2048 ? 16 : rows % 8 == 0 ? 8 : rows % 4 == 0 ? 4 : 1)
+        ? (fo_gate_up || (rows % 16 == 0 && rows >= 2048) ? 16 : rows % 8 == 0 ? 8 : rows % 4 == 0 ? 4 : 1)
         : fo_dense ? 16 : dense_R(rows, opts.engine);
     // vLLM's K = 512 experts (down) in fragment order: the batched prefill kernel decodes straight into mma operands
     // (T-023: down 2048 tokens 9.95 -> 4.34 ms per layer); the FO decode GEMV is 2-4 % faster than row-major at 2-4
     // tokens and within noise at 1
-    const bool fo_experts = opts.engine == policy_engine::vllm && n_matrices > 1 && K == CHUNK && R == 16;
-    return policy_choice{FMT_HUFPAIR, R, n_matrices > 1 && K > CHUNK, fo_experts || fo_dense};
+    const bool fo_experts = fo_gate_up || (opts.engine == policy_engine::vllm && n_matrices > 1 && K == CHUNK && R == 16);
+    return policy_choice{FMT_HUFPAIR, R, n_matrices > 1 && K > CHUNK && !fo_experts, fo_experts || fo_dense};
 }
 
 } // namespace bf16n

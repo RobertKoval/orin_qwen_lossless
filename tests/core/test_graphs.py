@@ -15,9 +15,9 @@ def mats(ops):
         "qkv": encode_upload(ops, weights_like_model((1024, 2048), seed=1), HP, 16),
         "nib": encode_upload(ops, weights_like_model((256, 2048), seed=2), NIB),
         "shexp": encode_upload(ops, weights_like_model((2 * 512, 2048), seed=3), NIB),
-        "gate": encode_upload(ops, weights_like_model((E, N, H), seed=4), HP, 8, True),
-        "up": encode_upload(ops, weights_like_model((E, N, H), seed=5), HP, 8, True),
-        "down": encode_upload(ops, weights_like_model((E, H, N), seed=6), HP, 16, False, True),  # vLLM: fragment order
+        "gate": encode_upload(ops, weights_like_model((E, N, H), seed=4), HP, 16, False, True),  # vLLM: fragment order
+        "up": encode_upload(ops, weights_like_model((E, N, H), seed=5), HP, 16, False, True),
+        "down": encode_upload(ops, weights_like_model((E, H, N), seed=6), HP, 16, False, True),
     }
 
 

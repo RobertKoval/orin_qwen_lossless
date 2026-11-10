@@ -70,7 +70,7 @@ The same rules in both engines (llama.cpp `LLAMA_BF16N=hybrid`, the default; vLL
 
 | tensor | format |
 |---|---|
-| routed experts (`*_exps`) | HUFPAIR, `R = 16` if ≥ 2048 rows per expert else 8; chunk-major units when `K > 512` |
+| routed experts (`*_exps`) | HUFPAIR, `R = 16` if ≥ 2048 rows per expert else 8; chunk-major units when `K > 512`; vLLM: 16-row fragment-order bands for `K = 512` (≥ 2048 rows) and `K = 2048` (rows a multiple of 16) |
 | dense with ≥ 8M weights (lm_head, embedding, qkv, gates, out projections) | HUFPAIR, largest `R` with ≥ 512 units; vLLM linear layers and lm_head (not the embedding, whose `get_rows` reads every prompt token): 16-row fragment-order bands |
 | smaller dense (k/v, shared expert, α/β) | NIBBLE |
 | F32 router `ffn_gate_inp` | NIBBLE, after checking every value is exactly BF16 |

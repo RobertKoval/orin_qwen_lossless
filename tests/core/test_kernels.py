@@ -308,19 +308,25 @@ def test_mmv_frag_order_k_split_rejects_fp32_input(ops):
 E, N, H, TOPK = 16, 512, 2048, 8  # production per-expert shapes (gate/up 512 x 2048, down 2048 x 512), 16 experts
 
 
-@pytest.fixture(scope="module", params=["row_major", "frag_order"])
+def expert_layouts(policy, rows, K):
+    """(format, R, chunk_major, frag_order) of routed experts: llama.cpp's (chunk-major R = 8 above one chunk, row-major
+    R = 16 at K = 512) or what vLLM's policy chooses (fragment order for gate / up and down)."""
+    if policy == "llama":
+        return (HP, 8, True, False) if K > 512 else (HP, 16, False, False)
+    from vllm_bf16n.policy import choose
+
+    c = choose(rows, K, E)
+    return c.format, c.R, c.chunk_major, c.frag_order
+
+
+@pytest.fixture(scope="module", params=["llama", "vllm"])
 def experts(ops, request):
-    """Production expert layouts; down row-major (llama.cpp's) or in fragment order (vLLM's policy)."""
+    """Production expert layouts of both engines (gate / up 512 x 2048, down 2048 x 512, 16 experts)."""
     gate = weights_like_model((E, N, H), seed=31)
     up = weights_like_model((E, N, H), seed=32)
     down = weights_like_model((E, H, N), seed=33)
-    fo = request.param == "frag_order"
-    enc = (
-        encode_upload(ops, gate, HP, 8, True),
-        encode_upload(ops, up, HP, 8, True),
-        encode_upload(ops, down, HP, 16, False, fo),
-    )
-    assert enc[2].meta.frag_order is fo
+    enc = tuple(encode_upload(ops, w, *expert_layouts(request.param, w.shape[1], w.shape[2])) for w in (gate, up, down))
+    assert all(e.meta.frag_order is (request.param == "vllm") for e in enc)
     return (gate.cuda(), up.cuda(), down.cuda()), enc
 
 
@@ -440,8 +446,11 @@ def test_moe_mm_ids_down_token_tiles(ops, experts, T):
 
 @pytest.mark.parametrize("T", [9, 128, 300])
 def test_moe_mm_ids_gate_alone_stage(ops, experts, T):
-    """Batched gate kernel without GLU fusion (the non-fused 2048 x 8 instance)."""
+    """Batched gate kernel without GLU fusion (the non-fused chunk-major 2048 x 8 instance; fragment-order gate / up
+    have only the fused kernel)."""
     (gate, _, _), (eg, _, _) = experts
+    if eg.meta.frag_order:
+        pytest.skip("fragment-order gate / up: fused kernel only")
     ids, _ = routing(T, "one_expert_all", seed=T)
     x = act(T, H, seed=T)
     y = ops.moe_mm_ids(x, ids, eg, E)
@@ -449,11 +458,95 @@ def test_moe_mm_ids_gate_alone_stage(ops, experts, T):
     assert_within(y, ref, S)
 
 
+def glu_ref(gate, up, ids, x):
+    """FP64 silu(g) * u per routed (token, slot) and its bound: the FP32 accumulation of g and u through silu."""
+    T = ids.shape[0]
+    xs = x[:, None, :].expand(T, ids.shape[1], x.shape[1])
+    g, Sg = per_slot_ref(gate, ids, xs)
+    u, Su = per_slot_ref(up, ids, xs)
+    s = g * torch.sigmoid(g)
+    return s * u, 2 * GEMV_REL * (1.1 * Sg * u.abs() + s.abs() * Su) + 1e-6 * (s * u).abs()
+
+
+@pytest.mark.parametrize("T, mode", [(1, "uniform"), (2, "uniform"), (3, "one_expert_all"), (4, "half_empty"),
+                                     (7, "uniform"), (8, "one_expert_all"), (8, "half_empty"), (9, "one_expert_all"),
+                                     (17, "uniform")])
+def test_mmv_gate_up_experts_pair_alone(ops, experts, T, mode):
+    """Decode gate / up GEMV over routed pairs whose activation is the token's row (fragment order: grouped by expert,
+    up to 8 tokens per launch, T = 9 / 17 in two / three launches): within the FP32 accumulation bound of FP64, and every
+    (token, slot) result bitwise the one of that token routed alone."""
+    (gate, up, _), (eg, eu, _) = experts
+    ids, _ = routing(T, mode, seed=70 + T)
+    x = act(T, H, seed=80 + T)
+    for w, ew in ((gate, eg), (up, eu)):
+        y = ops.mmv(x, ew, ids, N)
+        ref, S = per_slot_ref(w, ids, x[:, None, :].expand(T, TOPK, H))
+        assert_within(y, ref, S)
+        for t in range(T):
+            alone = ops.mmv(x[t:t + 1], ew, ids[t:t + 1].contiguous(), N)
+            assert torch.equal(bits(y[t]), bits(alone[0])), f"token {t}"
+
+
+@pytest.mark.parametrize("T", [4, 5, 8])
+def test_mmv_experts_repeated_expert_in_token(ops, experts, T):
+    """Every token routes expert 0 in two slots, so expert 0 has 2 T pairs: more than one mma tile (gate / up, groups of
+    8 pairs) or than the down kernel's per-token staging (groups of T pairs). Each result within the FP32 bound and
+    bitwise the token's own when routed alone."""
+    (gate, _, down), (eg, _, ed) = experts
+    g = torch.Generator().manual_seed(90 + T)
+    ids = torch.stack([torch.cat([torch.zeros(2, dtype=torch.long), 1 + torch.randperm(E - 1, generator=g)[: TOPK - 2]])
+                       for _ in range(T)]).to(torch.int32).cuda()
+    x = act(T, H, seed=91 + T)
+    a = act(T * TOPK, N, seed=92 + T, dtype=torch.float32).view(T, TOPK, N)
+    for w, ew, inp, rows in ((gate, eg, x, N), (down, ed, a, H)):
+        y = ops.mmv(inp, ew, ids, rows)
+        ref, S = per_slot_ref(w, ids, inp[:, None, :].expand(T, TOPK, H) if inp.dim() == 2 else inp)
+        assert_within(y, ref, S)
+        for t in range(T):
+            alone = ops.mmv(inp[t:t + 1].contiguous(), ew, ids[t:t + 1].contiguous(), rows)
+            assert torch.equal(bits(y[t]), bits(alone[0])), f"token {t}"
+
+
+@pytest.mark.parametrize("T, mode", [(9, "uniform"), (95, "one_expert_all"), (96, "one_expert_all"),
+                                     (97, "one_expert_all"), (193, "one_expert_all"), (300, "half_empty")])
+def test_moe_mm_ids_gate_up_glu_stage(ops, experts, T, mode):
+    """Batched gate / up + SWIGLU alone: within the FP32 bound of FP64 at the fragment-order kernel's 96-token tiles
+    (one expert with 95 / 96 / 97 / 193 tokens) and with experts without tokens; the BF16 output is the rounding of the
+    FP32 one."""
+    (gate, up, _), (eg, eu, _) = experts
+    ids, _ = routing(T, mode, seed=T)
+    x = act(T, H, seed=T)
+    y = ops.moe_mm_ids(x, ids, eg, E, up=eu)
+    ref, bound = glu_ref(gate, up, ids, x)
+    assert_within(y, ref, bound / GEMV_REL, rel=GEMV_REL)
+    assert torch.equal(bits(ops.moe_mm_ids(x, ids, eg, E, up=eu, out_dtype=torch.bfloat16)), bits(y.to(torch.bfloat16)))
+
+
+@pytest.mark.parametrize("rows", [16, 48, 144])  # 1, 3, 9 bands: one partial group of 8 bands, 9 = one full + one band
+def test_frag_order_gate_up_band_counts(ops, rows):
+    """Fragment-order gate / up with band counts that are not a multiple of the prefill kernel's 8-band item (and of the
+    decode kernel's work split): decode GEMV and batched GLU against FP64."""
+    gate = weights_like_model((E, rows, H), seed=41 + rows)
+    up = weights_like_model((E, rows, H), seed=42 + rows)
+    eg, eu = (encode_upload(ops, w, HP, 16, False, True) for w in (gate, up))
+    gate, up = gate.cuda(), up.cuda()
+    for T in (4, 40):
+        ids, _ = routing(T, "uniform", seed=rows + T)
+        x = act(T, H, seed=rows + T)
+        if T <= 8:
+            y = ops.mmv(x, eg, ids, rows)
+            ref, S = per_slot_ref(gate, ids, x[:, None, :].expand(T, TOPK, H))
+            assert_within(y, ref, S)
+        y = ops.moe_mm_ids(x, ids, eg, E, up=eu)
+        ref, bound = glu_ref(gate, up, ids, x)
+        assert_within(y, ref, bound / GEMV_REL, rel=GEMV_REL)
+
+
 def test_moe_mm_ids_rejects_unsupported_layout(ops, experts):
     (_, _, _), (eg, eu, ed) = experts
     ids, _ = routing(16, "uniform")
     with pytest.raises(ValueError, match="no batched kernel"):
-        ops.moe_mm_ids(act(16, N), ids, ed, E, up=ed)  # GLU needs chunk-major 2048 x 8 matrices
+        ops.moe_mm_ids(act(16, N), ids, ed, E, up=ed)  # GLU needs K = 2048 (chunk-major R = 8 or fragment order)
 
 
 @pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])

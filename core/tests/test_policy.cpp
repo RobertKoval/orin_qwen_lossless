@@ -46,7 +46,10 @@ int main() {
     };
     for (auto engine : {policy_engine::llama, policy_engine::vllm}) {
         for (const auto & s : gguf) {
-            expect(s.rows, s.K, s.n, {engine, policy_mode::hybrid, 8ll << 20, s.n > 1}, s.format, s.R, s.cm);
+            // vLLM's gate / up experts: fragment order (16-row bands, not chunk-major; T-060 b2)
+            const bool fo_gate_up = engine == policy_engine::vllm && s.K == 2048 && s.n > 1;
+            expect(s.rows, s.K, s.n, {engine, policy_mode::hybrid, 8ll << 20, s.n > 1}, s.format, fo_gate_up ? 16 : s.R,
+                   fo_gate_up ? false : s.cm);
         }
     }
 
@@ -66,10 +69,14 @@ int main() {
             expect(512 * r + 1, 512, 1, forced, FMT_HUFPAIR, 1, false);
         }
     }
-    // Fragment order: vLLM's K = 512 experts with 16-row bands only; never for llama (its adapter has no such kernels).
+    // Fragment order: vLLM's K = 512 experts with 16-row bands and K = 2048 experts (gate / up) whose rows split into
+    // bands; never for llama (its adapter has no such kernels).
     struct fo_case { int64_t rows, K, n; policy_engine engine; bool fo; };
     for (const fo_case & f : {fo_case{2048, 512, 256, policy_engine::vllm, true}, fo_case{2048, 512, 256, policy_engine::llama, false},
                               fo_case{2040, 512, 256, policy_engine::vllm, false}, fo_case{2048, 1024, 256, policy_engine::vllm, false},
+                              fo_case{512, 2048, 256, policy_engine::vllm, true}, fo_case{512, 2048, 256, policy_engine::llama, false},
+                              fo_case{520, 2048, 256, policy_engine::vllm, false}, fo_case{16, 2048, 2, policy_engine::vllm, true},
+                              fo_case{512, 4096, 256, policy_engine::vllm, false},
                               fo_case{16384, 512, 1, policy_engine::vllm, false}}) {
         const auto c = choose(f.rows, f.K, f.n, {f.engine, policy_mode::hybrid, 8ll << 20, f.n > 1});
         if (!c || c->frag_order != f.fo) {
@@ -133,7 +140,7 @@ int main() {
     }
     // llama's name-based expert classification and configurable total-element threshold are independent of n.
     expect(512, 2048, 2, llama, FMT_NIBBLE, 0, false);
-    expect(512, 2048, 2, vllm, FMT_HUFPAIR, 8, true);
+    expect(512, 2048, 2, vllm, FMT_HUFPAIR, 16, false); // fragment order
     expect(512, 2048, 1, {policy_engine::llama, policy_mode::hybrid, 8ll << 20, true}, FMT_HUFPAIR, 1, false);
     for (int64_t min : {1023, 1024, 1025}) {
         expect(1, 512, 2, {policy_engine::llama, policy_mode::hybrid, min},

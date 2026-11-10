@@ -2,8 +2,8 @@
 
 <p align="center">
   <b>Bit-exact BF16 Qwen3.6-35B-A3B on a 64 GB Jetson: one format, two engines.<br>
-  33 % less memory, every weight bit-identical; ≈ 31 tokens/s, ≈ 41 with the model's own MTP draft,<br>
-  in llama.cpp and in vLLM.</b>
+  33 % less memory, every weight bit-identical; ≈ 31 tokens/s, and with the model's own MTP draft<br>
+  ≈ 40 in llama.cpp and ≈ 55 in vLLM.</b>
 </p>
 
 <p align="center">
@@ -29,8 +29,8 @@ One implementation of the format and kernels (`core/`) runs in two engines: **ll
   flip (see [Limitations](#limitations)).
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671): the model's full 262,144-token window
   and its vision encoder fit beside the weights.
-* **Fast.** ≈ 31 tok/s single-stream decode, 49.4 with the checkpoint's own multi-token-prediction layer as a
-  speculative draft (vLLM; 40.2 in llama.cpp), 830–1900 tok/s prefill on a 60 W board. Per matrix, the fused decode+GEMV beats raw BF16: the
+* **Fast.** ≈ 31 tok/s single-stream decode, 54.8 with the checkpoint's own multi-token-prediction layer as a
+  speculative draft (vLLM; 40.2 in llama.cpp), 830–2070 tok/s prefill on a 60 W board. Per matrix, the fused decode+GEMV beats raw BF16: the
   248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **Two engines, one format.** llama.cpp: an ordinary BF16 GGUF and `LLAMA_BF16N=hybrid`; vLLM: the original
   safetensors and `--quantization bf16n`. Both serve the OpenAI-compatible API with text, images, tools and reasoning.
@@ -51,12 +51,13 @@ Both engines with BF16N on the same board (MAXN, pinned clocks). Decode is singl
 
 | | llama.cpp + BF16N | vLLM 0.20 + BF16N |
 |---|---|---|
-| weights resident | 46.5 GB (0.671), 472/472 tensors bit-exact at load | 43.5 GiB text model + 1.0 MTP layer (+ 0.9 BF16 vision), every tensor bit-exact at load |
+| weights resident | 46.5 GB (0.671), 472/472 tensors bit-exact at load | 45.8 GiB with the MTP layer and the BF16 vision encoder (43.5 + 1.0 + 0.9 at the 11-01 release; fragment-order padding since), every tensor bit-exact at load |
 | decode, no draft, same client | 28.6 | 32.7 (FlashInfer, M2); 31.1 in the M6 configuration |
-| decode with the MTP draft, same client | 35.5 (1 draft token) | 48.6 (3 draft tokens); **49.4** without logprobs |
+| decode with the MTP draft, same client | 35.5 (1 draft token) | 53.8 (3 draft tokens); **54.8** without logprobs |
 | decode, `llama-bench` tg64 / `llama-server` MTP (4 × 400 tokens) | 31.2 / 40.2 | — |
-| prefill 8k / 23k tokens | 832–1481 (`llama-bench`, ub 512–4096) / 1192 (server) | 1903 / 1744 (production config) |
-| long-context decode (MTP) | 27.1 @ 64K, 22.6 @ 224K | 34.1 @ 72K, 31.7 @ 197K (11-09 haystack; step 72.8 / 89.9 ms) |
+| prefill 8k / 23k tokens | 832–1481 (`llama-bench`, ub 512–4096) / 1192 (server) | 2068 / 1885 (production config) |
+| long-context decode (MTP) | 27.1 @ 64K, 22.6 @ 224K | 39.1 @ 72K, 32.0 @ 197K (11-09 haystack; step 66.9 / 84.0 ms) |
+| two concurrent sessions | — | 87 ms per step, 30.6–36.4 tok/s each (68 % of one stream) |
 | full 262,144 window + images | yes | yes (images capped at 4.19 MP) |
 | uncompressed BF16, either engine | does not fit: 64.6 GiB > 61.4 GiB | same |
 
@@ -152,19 +153,49 @@ Correctness, methodology and the full history of what was tried: [docs/llamacpp/
 
 ## vLLM results
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/vllm-decode-dark.svg">
+    <img alt="vLLM + BF16N decode by release, production, MTP with 3 draft tokens, tokens per second: cutover 33.9, M6 40.9, batched MoE prefill 41.4, fragment-order down experts 41.5, 2-bit draft head 42.1, 6432-token chunks 42.3, BF16 activations in shared memory 45.6, dense GEMVs on the tensor cores 47.2, lm_head in fragment order 48.0, drafter graphs 47.8, down experts once per distinct expert 49.4, gate / up experts in fragment order 54.8; llama.cpp + BF16N with MTP, same client, 35.5" src="docs/img/vllm-decode-light.svg" width="760">
+  </picture>
+</p>
+
 Production on the board runs vLLM-BF16N with the shared core (since 2026-11-01): 262,144-token window, vision, MTP
-with 3 draft tokens, prefix caching, tool and reasoning parsers. Short-context decode **49.4 tok/s** (48.6 with
-logprobs), 34.1 tok/s at 72K and 31.7 at 197K (step 72.8 / 89.9 ms; draft acceptance varies with the text: 0.50 /
-0.62 on the haystack; with `--max-num-seqs 2` a step of two sessions takes 101 ms, 27.6–31.8 tok/s each); prefill
-1903 tok/s at 8K, 1744 at 23K, 1269 at 72K, 895 at 197K in 6432-token chunks (releases of 2026-11-09: batched BF16N kernels for every MoE
-prefill chunk with the down experts in tensor-core fragment order, one split-KV program per multi-token sequence, a
-2-bit draft-only candidate head, dense decode GEMVs and lm_head on the tensor cores (8 tokens per weight decode), GDN
-state fixes, MTP drafter graphs at the drafter's own row count, routed experts decoded once per distinct expert;
-target sampling unmodified);
-≥ 2.4 GiB free at the full window after a 4K image and a 246K request. Against llama.cpp-BF16N on identical prompts
-and its own tokens: top-1 agreement 99.5 %, mean KL ≈ 2e-3.
-The milestones, the step analysis and what did not help: [docs/vllm/RESULTS.md](docs/vllm/RESULTS.md); design and
-settings: [docs/vllm/README.md](docs/vllm/README.md).
+with 3 draft tokens, prefix caching, tool and reasoning parsers. Each bar above is the production check after a
+release (`bench_openai.py`, 4 prompts × 256 greedy tokens, without logprobs); every release kept the weights bit-exact
+and was A/B-tested against the previous one on the same board before it shipped.
+
+| production, 2026-11-10 (wheel `0.1.0+g5bde7a8faf58`) | |
+|---|---|
+| short-context decode, MTP 3 | **54.8 tok/s** (53.8 with logprobs) |
+| long context (haystack, needle found) | 72K: prefill 1396 tok/s, decode 39.1; 197K: prefill 930, decode 32.0 (step 66.9 / 84.0 ms; decode speed follows the draft acceptance of the generated text, here 0.54 / 0.56) |
+| prefill | 2068 tok/s at 8K, 1885 at 23K (6432-token chunks) |
+| two concurrent sessions (`--max-num-seqs 2`) | 87 ms per step, 30.6–36.4 tok/s each: 68 % of one stream per session (goal: 80 %) |
+| memory at the full window | ≥ 2.59 GiB free after a 4K image and a 246K request |
+| output agreement (teacher-forced, 382–383 tokens) | top-1 99.74 %, mean KL 1.6e-3 against vLLM's exact-dequant reference path (stock torch kernels); 100 % / 2.1e-3 against llama.cpp-BF16N |
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/vllm-prefill-dark.svg">
+    <img alt="vLLM + BF16N prefill of an 8192-token prompt by release, production, tokens per second: dequant + Triton fused_experts 1439, batched BF16N MoE kernels 1516, fragment-order down experts and split-KV 1762, 6432-token chunks 1903, gate / up in fragment order with fused SwiGLU 2068" src="docs/img/vllm-prefill-light.svg" width="760">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/vllm-streams-dark.svg">
+    <img alt="vLLM + BF16N, one step of two concurrent sessions in ms, each release's A/B, lower is better: BF16 activations in shared memory 134, dense GEMVs on the tensor cores 121, lm_head in fragment order 112, drafter graphs and 2-bit head kernel 106, down experts once per distinct expert 101, gate / up experts in fragment order 87" src="docs/img/vllm-streams-light.svg" width="760">
+  </picture>
+</p>
+
+What the releases of 2026-11-09/10 changed: batched BF16N kernels for every MoE prefill chunk; every routed expert
+(down, then gate / up with the SwiGLU fused) in tensor-core fragment order and decoded once per distinct expert of a
+verification batch; one split-KV program per multi-token sequence; a 2-bit draft-only candidate head; dense decode
+GEMVs and lm_head on the tensor cores (8 tokens per weight decode); GDN state fixes; MTP drafter graphs at the
+drafter's own row count; target sampling unmodified. Greedy texts change between releases at near ties (the
+summation order changes), the weights never do.
+The milestones, the step analysis, every release's A/B and what did not help: [docs/vllm/RESULTS.md](docs/vllm/RESULTS.md);
+design and settings: [docs/vllm/README.md](docs/vllm/README.md).
 
 ## Quick start (on the Orin)
 
@@ -275,16 +306,21 @@ what worked, what did not, and by how much.
   ≈ 11 %, [details](docs/llamacpp/RESULTS.md#kv-cache-compressibility-measured-dropped); vLLM BF16, where an
   experimental reference codec saves ≈ 25 % on all ten layers up to 200K tokens, but attention reading it is slower on
   this GPU, [details](docs/RESULTS.md#experimental-bf16-kv-reference)).
-* More draft tokens do not pay on this board: every extra verified token reads its own 8 experts (≈ 8.3 ms per token
-  in vLLM), so llama.cpp gains most with one draft token (+29 %,
-  [details](docs/llamacpp/RESULTS.md#speculative-decoding-with-the-mtp-head)) and vLLM with three; a block-diffusion
-  drafter and a sliding window for the draft layer were evaluated and not adopted
+* More draft tokens did not pay on this board when last measured: every extra verified token read its own 8 experts
+  (≈ 8.3 ms per token in vLLM), so llama.cpp gains most with one draft token (+29 %,
+  [details](docs/llamacpp/RESULTS.md#speculative-decoding-with-the-mtp-head)) and vLLM with three (four: 31.3 against
+  41.1 tok/s, 10-30). vLLM's decode GEMVs now decode each distinct expert once per verification batch (about two of
+  three routed experts are distinct in served text); four draft tokens have not been re-measured since. A
+  block-diffusion drafter and a sliding window for the draft layer were evaluated and not adopted
   ([ROADMAP](docs/ROADMAP.md)).
 * vLLM: the board's vLLM 0.20 carries local patches whose sources are not distributed here.
 * Dense matrices in prefill are still dequantised to BF16 per micro-batch.
-* Outputs are deterministic for a given build and settings, but not bitwise equal across prefill kernels, micro-batch
-  sizes or engines: summation order moves next-token distributions by a mean KLD ≈ 0.002 (top-1 agreement ≈ 98.4 % on wikitext-2,
-  perplexity unchanged). The weights are bit-exact either way; see [docs/llamacpp/RESULTS.md](docs/llamacpp/RESULTS.md).
+* Outputs are not bitwise equal across prefill kernels, micro-batch sizes, releases or engines: summation order moves
+  next-token distributions by a mean KLD ≈ 0.002 (top-1 agreement ≈ 98.4 % on wikitext-2, perplexity unchanged), and
+  greedy texts part at near ties. In vLLM the greedy texts of one build can also differ between server starts (two
+  text sets; the trigger is measured, the mechanism is not identified:
+  [fidelity boundaries](docs/vllm/README.md#fidelity-boundaries)). The weights are bit-exact either way; see
+  [docs/llamacpp/RESULTS.md](docs/llamacpp/RESULTS.md).
 * llama.cpp: the chunk-major expert layout that the prefill kernel needs costs 0.5 % of decode speed (gate/up GEMV 82 vs 80 µs).
 * llama.cpp: the in-place recurrent-state read is only enabled for single-sequence batches (and not for the last recurrent layer,
   whose row index is freed before its kernel runs).
@@ -292,10 +328,12 @@ what worked, what did not, and by how much.
 ## Roadmap
 
 Short-context decode runs its matrix–vector work at the DRAM limit of its access pattern (≈ 161–170 GB/s), so the
-remaining headroom is at long context and in prefill. A lossless BF16 KV cache is ≈ 25 % smaller, but on this GPU
-attention reading it is slower than reading raw BF16, so it is not used. The down experts are decoded straight into
-tensor-core fragments in vLLM's prefill (2.3× faster down kernel at 2048 tokens); gate/up (K = 2048) are not yet.
-More draft tokens need cheaper experts per extra verified token. Expected gains and how each is measured: [docs/ROADMAP.md](docs/ROADMAP.md).
+remaining headroom is in verifying several tokens per weight read, at long context and in prefill. Every routed
+expert in vLLM is decoded straight into tensor-core fragments (down: 2.3× faster prefill kernel at 2048 tokens; gate /
+up with the SwiGLU fused: 1.4×) and once per distinct expert of a verification batch. Next: two concurrent sessions at
+80 % of one stream each (68 % now), then lossless KV coding so that two long windows fit (a lossless BF16 KV cache is
+≈ 25 % smaller, but on this GPU attention reading it is slower than reading raw BF16, so it is not used for decode
+yet). Expected gains and how each is measured: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License and credits
 

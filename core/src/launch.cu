@@ -97,6 +97,7 @@ template <typename TX> size_t mc_shm(int C, int NC) { return (size_t) NC * C * 5
 
 constexpr int MM_MAX_EXPERTS_INIT = 512;
 constexpr int FO_NTOK = 96, FO_NW = 16; // fragment-order batched kernel: tokens per item, warps (T-023 prototype)
+constexpr int FOG_NTOK = 96;             // fragment-order gate/up + SWIGLU kernel: tokens per item (T-060 b2)
 size_t mm_shm(bool glu, int NW, int IL, int B, int n_experts) {
     return ((glu ? 8u : 4u) << HP_LP) + 64 * HPM_LD * 2 + (size_t) NW * IL * 32 * 16 * B +
            (size_t) (n_experts + 1) * (sizeof(int) + sizeof(uint16_t));
@@ -110,7 +111,28 @@ void launch_mmv_t(const weight & e, const cols_t & p, int ncols, cudaStream_t st
         dim3 g2; int nt;
         hp_launch_dims(e, p.nrows, ncols, g2, nt);
         const size_t shm = K * sizeof(TX) + (4u << HP_LP); // activations in the input type
-        if (e.fo && !p.ids && sizeof(TX) == 2) {
+        if (e.fo && p.ids && sizeof(TX) == 2 && p.ne11 == 1) {
+            // routed experts whose activation is the token's own BF16 row (gate / up, T-060 b2): pairs grouped by
+            // expert, up to FO8_NTOK tokens and FO_GRP_MAXP pairs per launch; a pair's bits do not depend on the batch
+            BF16N_REQUIRE(ncols % p.n_used == 0 && p.n_used <= FO_GRP_MAXP, "bf16n: routed pairs must be whole tokens");
+            const int C = (int) (K / FO_K), ntok = ncols / p.n_used, tpl = std::min(FO8_NTOK, FO_GRP_MAXP / p.n_used);
+            int nw; unsigned blocks;
+            fo8_launch_dims(C, p.nrows / 16, nw, blocks);
+            for (int t0 = 0; t0 < ntok; t0 += tpl) {
+                cols_t q = p;
+                q.x += t0 * p.x_tok;
+                q.ids += t0 * p.ids_s1;
+                q.dst += t0 * p.dst_tok;
+                const int nt = std::min(tpl, ntok - t0);
+                const size_t shm = fo8_shm(C, nt, nw);
+                switch (C) {
+#define FG8_CASE(CC) case CC: k_fo_mmv8_grp<CC><<<g_sms, nw * 32, shm, stream>>>(hpp(e), q, nt); break;
+                    FG8_CASE(1) FG8_CASE(2) FG8_CASE(4) FG8_CASE(8)
+#undef FG8_CASE
+                    default: throw std::invalid_argument("bf16n: unsupported K");
+                }
+            }
+        } else if (e.fo && !p.ids && sizeof(TX) == 2) {
             // dense fragment order: up to 8 BF16 columns per launch on the tensor cores, bands split into slabs
             const int C = (int) (K / FO_K);
             int nw; unsigned blocks;
@@ -130,7 +152,7 @@ void launch_mmv_t(const weight & e, const cols_t & p, int ncols, cudaStream_t st
             }
         } else if (e.fo) {
             if (K != FO_K) {
-                throw std::invalid_argument("bf16n: fragment-order matrices with K > 512 take BF16 activations without expert ids");
+                throw std::invalid_argument("bf16n: fragment-order matrices with K > 512 take BF16 activations (one row per token with expert ids)");
             }
             // routed pairs grouped by expert from FO_GRP_MINT tokens (decode verification: 4 tokens per session); fewer
             // tokens share few experts and go per pair; both give the same bits (k_fo_mmv_grp)
@@ -261,13 +283,16 @@ void ensure_init() { std::call_once(g_once, [] {
     MC_ATTRS(float) MC_ATTRS(bf16)
 #undef MC_ATTRS
 #undef MC_ATTR
-#define FO8_ATTR(CC) BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mmv8<CC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fo8_shm(CC, FO8_NTOK, 32)));
+#define FO8_ATTR(CC) BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mmv8<CC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fo8_shm(CC, FO8_NTOK, 32))); \
+    BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mmv8_grp<CC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fo8_shm(CC, FO8_NTOK, 32)));
     FO8_ATTR(1) FO8_ATTR(2) FO8_ATTR(4) FO8_ATTR(8)
 #undef FO8_ATTR
     BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mmv_grp<float>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fo_grp_shm(FO_GRP_MAXT)));
     BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mmv_grp<bf16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fo_grp_shm(FO_GRP_MAXT)));
     BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mm_ids<FO_NTOK, FO_NW>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                           (int) std::min<size_t>(g_smem_optin, fo_mm_shm(FO_NTOK, MM_MAX_EXPERTS_INIT))));
+    BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mm_glu<4, FOG_NTOK, FO_NW>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          (int) std::min<size_t>(g_smem_optin, fo_glu_shm(FOG_NTOK, MM_MAX_EXPERTS_INIT))));
 #define MM_ATTR(CC, RR, NW, IL, WT, B, G) BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_hp_mm_ids<CC, RR, NW, IL, WT, B, G>, \
     cudaFuncAttributeMaxDynamicSharedMemorySize, (int) std::min<size_t>(g_smem_optin, mm_shm(G, NW, IL, B, MM_MAX_EXPERTS_INIT))));
     MM_ATTR(4, 8, 16, 1, 2, 2, true) MM_ATTR(4, 8, 16, 1, 2, 2, false) MM_ATTR(1, 16, 8, 1, 4, 2, false)
@@ -424,8 +449,10 @@ bool mm_ids_supported(const weight & w, const weight * up) {
     if (!up) {
         return shape; // K = 512, R = 16: k_hp_mm_ids row-major, k_fo_mm_ids in fragment order
     }
-    return shape && w.K == 2048 && w.R == 8 && up->format == FMT_HUFPAIR && up->cm && up->K == w.K && up->R == w.R &&
-           up->rows == w.rows;
+    const bool same = up->format == w.format && up->K == w.K && up->R == w.R && up->cm == w.cm && up->fo == w.fo &&
+                      up->rows == w.rows;
+    // gate/up + SWIGLU: k_hp_mm_ids (chunk-major R = 8) or k_fo_mm_glu (fragment order, K = 2048)
+    return same && w.format == FMT_HUFPAIR && w.K == 2048 && ((w.cm && w.R == 8) || (w.fo && w.R == 16));
 }
 
 void mm_ids_route(const void * ids, bool ids_i64, int64_t ids_row_stride, int32_t * ids_src1, int32_t * ids_dst,
@@ -470,6 +497,16 @@ void mm_ids(const weight & e, const weight * u, const void * x_bf16, int64_t x_r
                                                   cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm));            \
         }                                                                                                              \
         k_hp_mm_ids<CC, RR, NW, IL, WT, B, G><<<g_sms, NW * 32, shm, stream>>>(hpp(e), hpp(G ? *u : e), a);           \
+    }
+    if (e.fo && u) {
+        const size_t shm = fo_glu_shm(FOG_NTOK, n_experts);
+        BF16N_REQUIRE(shm <= (size_t) g_smem_optin, "too many experts for the fragment-order gate/up kernel's shared memory");
+        if (n_experts > MM_MAX_EXPERTS_INIT) {
+            BF16N_CUDA_CHECK(cudaFuncSetAttribute(k_fo_mm_glu<4, FOG_NTOK, FO_NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm));
+        }
+        k_fo_mm_glu<4, FOG_NTOK, FO_NW><<<g_sms, FO_NW * 32, shm, stream>>>(hpp(e), hpp(*u), a);
+        BF16N_CUDA_CHECK(cudaGetLastError());
+        return;
     }
     if (e.fo) {
         const size_t shm = fo_mm_shm(FO_NTOK, n_experts);

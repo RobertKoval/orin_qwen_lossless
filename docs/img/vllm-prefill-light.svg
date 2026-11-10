@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="348" viewBox="0 0 760 348" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="vLLM + BF16N: prefill by release">
+<title>vLLM + BF16N: prefill by release</title>
+<rect x="0.5" y="0.5" width="759" height="347" rx="12" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<text x="24" y="36" font-size="17" font-weight="600" fill="#0b0b0b">vLLM + BF16N: prefill by release</text>
+<text x="24" y="58" font-size="13" fill="#52514e">production, 8192-token prompt, median of 3, tokens per second</text>
+<line x1="424.0" y1="86" x2="424.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
+<text x="424.0" y="314" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="465.0" y1="86" x2="465.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
+<text x="465.0" y="314" font-size="11" fill="#898781" text-anchor="middle">400</text>
+<line x1="506.0" y1="86" x2="506.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
+<text x="506.0" y="314" font-size="11" fill="#898781" text-anchor="middle">800</text>
+<line x1="547.0" y1="86" x2="547.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
+<text x="547.0" y="314" font-size="11" fill="#898781" text-anchor="middle">1200</text>
+<line x1="588.0" y1="86" x2="588.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
+<text x="588.0" y="314" font-size="11" fill="#898781" text-anchor="middle">1600</text>
+<line x1="629.0" y1="86" x2="629.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
+<text x="629.0" y="314" font-size="11" fill="#898781" text-anchor="middle">2000</text>
+<line x1="670.0" y1="86" x2="670.0" y2="296" stroke="#e1e0d9" stroke-width="1"/>
+<text x="670.0" y="314" font-size="11" fill="#898781" text-anchor="middle">2400</text>
+<line x1="424.00000000000006" y1="86" x2="424.00000000000006" y2="296" stroke="#c3c2b7" stroke-width="1"/>
+<text x="670" y="334" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
+<g fill="#86b6ef"><path d="M424.00000000000006,101.0 H567.4975000000001 Q571.4975000000001,101.0 571.4975000000001,105.0 V119.0 Q571.4975000000001,123.0 567.4975000000001,123.0 H424.00000000000006 Z"/></g>
+<text x="412.00000000000006" y="116.5" font-size="13" fill="#52514e" text-anchor="end">11-01: dequant + Triton fused_experts</text>
+<rect x="574.5" y="101.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="579.5" y="116.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1439</text>
+<g fill="#86b6ef"><path d="M424.00000000000006,141.0 H575.3900000000001 Q579.3900000000001,141.0 579.3900000000001,145.0 V159.0 Q579.3900000000001,163.0 575.3900000000001,163.0 H424.00000000000006 Z"/></g>
+<text x="412.00000000000006" y="156.5" font-size="13" fill="#52514e" text-anchor="end">11-09: batched BF16N MoE kernels</text>
+<rect x="582.4" y="141.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="587.4" y="156.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1516</text>
+<g fill="#86b6ef"><path d="M424.00000000000006,181.0 H600.605 Q604.605,181.0 604.605,185.0 V199.0 Q604.605,203.0 600.605,203.0 H424.00000000000006 Z"/></g>
+<text x="412.00000000000006" y="196.5" font-size="13" fill="#52514e" text-anchor="end">+ fragment-order down experts, split-KV</text>
+<rect x="607.6" y="181.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="612.6" y="196.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1762</text>
+<g fill="#86b6ef"><path d="M424.00000000000006,221.0 H615.0575 Q619.0575,221.0 619.0575,225.0 V239.0 Q619.0575,243.0 615.0575,243.0 H424.00000000000006 Z"/></g>
+<text x="412.00000000000006" y="236.5" font-size="13" fill="#52514e" text-anchor="end">+ 6432-token prefill chunks</text>
+<rect x="622.1" y="221.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="627.1" y="236.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1903</text>
+<g fill="#2a78d6"><path d="M424.00000000000006,261.0 H631.97 Q635.97,261.0 635.97,265.0 V279.0 Q635.97,283.0 631.97,283.0 H424.00000000000006 Z"/></g>
+<text x="412.00000000000006" y="276.5" font-size="13" fill="#52514e" text-anchor="end">11-10: + gate / up in fragment order, fused SwiGLU</text>
+<rect x="639.0" y="261.0" width="37.1" height="22" fill="#fcfcfb"/>
+<text x="644.0" y="276.5" font-size="13" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">2068</text>
+</svg>

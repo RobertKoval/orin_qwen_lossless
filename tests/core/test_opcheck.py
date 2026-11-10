@@ -17,6 +17,8 @@ def m(ops):
         "up": encode_upload(ops, weights_like_model((8, 512, 2048), seed=4), HP, 8, True),
         "down": encode_upload(ops, weights_like_model((8, 2048, 512), seed=5), HP, 16),
         "down_fo": encode_upload(ops, weights_like_model((8, 2048, 512), seed=6), HP, 16, False, True),
+        "gate_fo": encode_upload(ops, weights_like_model((8, 512, 2048), seed=7), HP, 16, False, True),
+        "up_fo": encode_upload(ops, weights_like_model((8, 512, 2048), seed=8), HP, 16, False, True),
     }
 
 
@@ -26,6 +28,7 @@ def cases(m):
     x12 = torch.randn(12, 2048, device="cuda").to(torch.bfloat16)
     ids = torch.stack([torch.randperm(8)[:4] for _ in range(12)]).to(torch.int32).cuda()
     hp, nib, gate, up, down, dfo = m["hp"], m["nib"], m["gate"], m["up"], m["down"], m["down_fo"]
+    gfo, ufo = m["gate_fo"], m["up_fo"]
     a12 = torch.randn(12, 4, 512, device="cuda").to(torch.bfloat16)
     w2 = (torch.randn(64, 2048, device="cuda") * 0.02).to(torch.bfloat16)  # rows of a draft-head copy
     return {
@@ -44,6 +47,8 @@ def cases(m):
         "dequant_fo": (b.dequant, (dfo.plane, dfo.aux, dfo.m, 2048, 2048)),
         "mmv_ids_fo": (b.mmv, (a12, dfo.plane, dfo.aux, dfo.m, ids, 2048, False)),
         "moe_mm_ids_down_fo": (b.moe_mm_ids, (a12, ids, dfo.plane, dfo.aux, dfo.m, None, None, [], 8, False)),
+        "mmv_ids_fo_gate": (b.mmv, (x12[:5], gfo.plane, gfo.aux, gfo.m, ids[:5], 512, False)),
+        "moe_mm_ids_glu_fo": (b.moe_mm_ids, (x12, ids, gfo.plane, gfo.aux, gfo.m, ufo.plane, ufo.aux, ufo.m, 8, True)),
         "moe_combine": (b.moe_combine, (torch.randn(12, 4, 2048, device="cuda"), torch.rand(12, 4, device="cuda"), True)),
         "swiglu": (b.swiglu, (torch.randn(12, 4, 512, device="cuda"), torch.randn(12, 4, 512, device="cuda"))),
         "int2_quantize": (b.int2_quantize, (w2,)),
@@ -55,7 +60,8 @@ def cases(m):
 
 NAMES = ["encode", "dequant", "mmv_dense", "mmv_ids", "mmv_glu", "linear_gemv", "linear_gemm", "get_rows",
          "moe_mm_ids_glu", "moe_mm_ids_down", "moe_combine", "swiglu", "encode_fo", "dequant_fo", "mmv_ids_fo",
-         "moe_mm_ids_down_fo", "int2_quantize", "int2_gemv", "int4_quantize", "int4_gemv"]
+         "moe_mm_ids_down_fo", "mmv_ids_fo_gate", "moe_mm_ids_glu_fo", "int2_quantize", "int2_gemv", "int4_quantize",
+         "int4_gemv"]
 
 
 @pytest.mark.parametrize("name", NAMES)

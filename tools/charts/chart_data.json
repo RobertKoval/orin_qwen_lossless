@@ -249,5 +249,179 @@
         "highlight": true
       }
     ]
+  },
+  "vllm_decode": {
+    "title": "vLLM + BF16N: decode by release",
+    "subtitle": "production, MTP with 3 draft tokens, 4 prompts x 256 greedy tokens without logprobs, tokens per second",
+    "unit": "tokens / s",
+    "axis_max": 60,
+    "ticks": [
+      0,
+      10,
+      20,
+      30,
+      40,
+      50,
+      60
+    ],
+    "reference": {
+      "value": 35.5,
+      "label": "llama.cpp + BF16N, MTP, same client 35.5"
+    },
+    "rows": [
+      {
+        "label": "10-30: cutover to vLLM, FlashInfer",
+        "value": 33.9,
+        "value_label": "33.9"
+      },
+      {
+        "label": "10-30 M6: Triton attention, async bookkeeping",
+        "value": 40.9,
+        "value_label": "40.9"
+      },
+      {
+        "label": "11-09: batched MoE prefill, GDN state fixes",
+        "value": 41.4,
+        "value_label": "41.4"
+      },
+      {
+        "label": "+ fragment-order down experts, split-KV",
+        "value": 41.5,
+        "value_label": "41.5"
+      },
+      {
+        "label": "+ 2-bit draft head",
+        "value": 42.1,
+        "value_label": "42.1"
+      },
+      {
+        "label": "+ 6432-token prefill chunks",
+        "value": 42.3,
+        "value_label": "42.3"
+      },
+      {
+        "label": "+ BF16 activations in shared memory",
+        "value": 45.6,
+        "value_label": "45.6"
+      },
+      {
+        "label": "+ dense GEMVs on the tensor cores",
+        "value": 47.2,
+        "value_label": "47.2"
+      },
+      {
+        "label": "11-10: + lm_head in fragment order",
+        "value": 48.0,
+        "value_label": "48.0"
+      },
+      {
+        "label": "+ drafter graphs at their own size",
+        "value": 47.8,
+        "value_label": "47.8"
+      },
+      {
+        "label": "+ down experts once per distinct expert",
+        "value": 49.4,
+        "value_label": "49.4"
+      },
+      {
+        "label": "+ gate / up experts in fragment order",
+        "value": 54.82,
+        "value_label": "54.8",
+        "highlight": true
+      }
+    ]
+  },
+  "vllm_prefill": {
+    "title": "vLLM + BF16N: prefill by release",
+    "subtitle": "production, 8192-token prompt, median of 3, tokens per second",
+    "unit": "tokens / s",
+    "axis_max": 2400,
+    "ticks": [
+      0,
+      400,
+      800,
+      1200,
+      1600,
+      2000,
+      2400
+    ],
+    "rows": [
+      {
+        "label": "11-01: dequant + Triton fused_experts",
+        "value": 1439,
+        "value_label": "1439"
+      },
+      {
+        "label": "11-09: batched BF16N MoE kernels",
+        "value": 1516,
+        "value_label": "1516"
+      },
+      {
+        "label": "+ fragment-order down experts, split-KV",
+        "value": 1762,
+        "value_label": "1762"
+      },
+      {
+        "label": "+ 6432-token prefill chunks",
+        "value": 1903,
+        "value_label": "1903"
+      },
+      {
+        "label": "11-10: + gate / up in fragment order, fused SwiGLU",
+        "value": 2068,
+        "value_label": "2068",
+        "highlight": true
+      }
+    ]
+  },
+  "vllm_streams": {
+    "title": "vLLM + BF16N: one step of two concurrent sessions",
+    "subtitle": "--max-num-seqs 2, ms per step with both decoding (vLLM log), each release's A/B; lower is better",
+    "unit": "ms per step",
+    "axis_max": 140,
+    "ticks": [
+      0,
+      20,
+      40,
+      60,
+      80,
+      100,
+      120,
+      140
+    ],
+    "rows": [
+      {
+        "label": "11-09: BF16 activations in shared memory",
+        "value": 134,
+        "value_label": "134"
+      },
+      {
+        "label": "+ dense GEMVs on the tensor cores",
+        "value": 121,
+        "value_label": "121"
+      },
+      {
+        "label": "11-10: + lm_head in fragment order",
+        "value": 112,
+        "value_label": "112"
+      },
+      {
+        "label": "+ drafter graphs, 2-bit head kernel",
+        "value": 106.3,
+        "value_label": "106"
+      },
+      {
+        "label": "+ down experts once per distinct expert",
+        "value": 101.3,
+        "value_label": "101"
+      },
+      {
+        "label": "+ gate / up experts in fragment order",
+        "value": 87.3,
+        "value_label": "87",
+        "highlight": true
+      }
+    ]
   }
 }

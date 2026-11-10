@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Render the README figures as static SVG (light + dark) from the measured numbers in docs/llamacpp/RESULTS.md.
+"""Render the README figures as static SVG (light + dark) from the measured numbers in docs/llamacpp/RESULTS.md and
+docs/vllm/RESULTS.md (the vllm-* charts: production per release, two-session steps from each release's A/B).
 
     python3 tools/charts/make_charts.py   ->  docs/img/*.svg
 """
@@ -168,4 +169,6 @@ if __name__ == "__main__":
     if "context" in DATA:
         line_chart("context", DATA["context"])
     format_diagram("format")
+    for key in ("vllm_decode", "vllm_prefill", "vllm_streams"):
+        bar_chart(key.replace("_", "-"), DATA[key])
     print("wrote", sorted(p.name for p in OUT.glob("*.svg")))

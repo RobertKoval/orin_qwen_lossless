@@ -1,6 +1,8 @@
-# vLLM + BF16N: results (M1–M6)
+# vLLM + BF16N: results (M1–M6 and the production releases since)
 
-Measured 2026-10-30 on the Jetson AGX Orin 64GB (pinned clocks unless stated, production stopped). Comparisons are
+Milestones measured 2026-10-30, production releases 2026-11-09 / 11-10 (from
+[the 11-09 release](#2026-11-09-release-batched-moe-prefill-gdn-state-fixes-unmodified-sampling-measured) on), on the
+Jetson AGX Orin 64GB (pinned clocks unless stated, production stopped for A/B runs). Comparisons are
 BF16 only: vLLM-BF16N against llama.cpp-BF16N (same client where stated), vLLM-BF16N plain against MTP, and per op
 against stock BF16 kernels. Design and knobs: [README.md](README.md); headline table for both engines:
 [../RESULTS.md](../RESULTS.md).
@@ -698,3 +700,55 @@ Production wheel `0.1.0+g2073cc586b59` against `0.1.0+g462b5b055fea`.
 * **Production** (texts and top-1 logprobs identical to the previous release's check): decode **49.4** tok/s without
   logprobs (47.8), 48.6 with (47.1); 72K 34.1 tok/s (33.4), 197K 31.7 (31.1) at the same acceptance (step 72.8 /
   89.9 ms); prefill 8K 1874, 23K 1747 (unchanged).
+
+## 2026-11-10 tenth release: gate / up experts in fragment order (measured)
+
+Production wheel `0.1.0+g5bde7a8faf58` against `0.1.0+g2073cc586b59`; new compile-cache key.
+
+* **Change (T-060, second step).** The routed gate / up experts (256 × 512 × 2048 each) were chunk-major `R = 8`: a
+  per-pair FMA GEMV in decode, and in prefill a batched kernel that decoded them into a shared-memory slab layout.
+  vLLM now encodes them like the down experts and the dense layers: 16-row bands in `mma` A-fragment order, 4 slabs of
+  512 columns. Decode (`k_fo_mmv8_grp`) stages each token's BF16 row once, groups the routed pairs by expert (up to 8
+  per group) and decodes each group's bands once, the `mma` B rows pointing at the group's tokens; a band is K-split
+  over 4 warps and slab 0 adds the partial sums in slab order. Prefill (`k_fo_mm_glu`): one item is an expert × a
+  96-token tile × 8 bands; gate and up warps keep their sums over the 4 slabs and the SwiGLU is fused. A pair's result
+  does not depend on the other pairs batched with it (bitwise, tested). Resident weights +165 MiB (band padding of the
+  fragment layout); memory at the full window stays above 2 GiB (below).
+* **Kernels** (layer 20, all 256 experts). Decode, gate per matrix, chunk-major → grouped: 3 tokens 222 → 165 µs,
+  4 tokens (22 distinct experts) 250 → 204, 8 tokens as two sessions (37 distinct) 467 → 329, 8 tokens on 8 experts
+  378 → 74, 64 distinct 569 → 546; 1 and 2 tokens (the drafter's passes) are slower, 60 → 64 and 121 → 137 µs.
+  Prefill, gate + up + SwiGLU per layer, 512 / 2048 / 6432 tokens: 8.1 / 12.4 / 31.8 → 7.7 / 8.7 / 22.4 ms with
+  uniform routing, 8.2 / 12.9 / 29.4 → 7.7 / 10.5 / 21.8 with skewed routing.
+* **Numerics.** Weights stay bit-exact; the sums run in FP32 on the tensor cores in another order (max |error| / Σ|w x|
+  ≤ 1.1e-7 against FP64 in every case). Greedy texts against the previous release part only where the previous one had
+  an exact tie (top-2 margin 0.0000, twice in four prompts). Teacher-forced over 382 tokens against a third reference,
+  vLLM's `BF16N_REFERENCE=1` (exact dequantised weights, stock torch kernels, eager): top-1 agreement 99.74 % (previous
+  release 99.48 %), mean KL 1.60e-3 (1.56e-3); the pass criterion, set before the run, was top-1 ≥ previous − 1/383 and
+  KL ≤ 1.15 × previous. Against llama.cpp-BF16N, which shares the previous release's chunk-major kernel family: 100 %
+  / 2.07e-3 (99.74 % / 1.68e-3).
+* **A/B** (`:8010`, order A B B A at `--max-num-seqs 1`, then A B B A at 2; each side started from its own copy of
+  production's compile caches, the first start under the new key discarded; texts bitwise equal within each side):
+
+| | previous (2 starts) | this release (2 starts) | change |
+|---|---|---|---|
+| decode, 4 prompts, no logprobs | 49.15 / 49.64 | 54.27 / 54.71 | +10.3 % |
+| decode with logprobs | 48.29 / 48.81 | 53.00 / 53.50 | +9.7 % |
+| one 512-token stream | 44.44 / 45.62 | 49.11 / 49.60 | +9.6 % |
+| prefill 8K / 23K | 1909, 1907 / 1748, 1743 | 2066, 2072 / 1878, 1882 | +8.4 / +7.7 % |
+| 72K: prefill / decode | 1318, 1314 / 33.94, 34.44 | 1286, 1390 / 39.20, 39.13 | +2 % / +15 % |
+| 197K: prefill / decode | 897, 898 / 31.29, 31.95 | 924, 924 / 31.99, 31.82 | +3 % / +1 % |
+| 246K: prefill / decode | 721 / 25.76 | 743 / 27.49 | +3 / +7 % |
+| lowest MemFree + Cached (full window, 4K image, 246K request) | 2.55 GiB | 2.59 GiB | |
+| two sessions: step with both decoding | 99.2 / 99.9 ms | 85.4 / 89.2 ms | −12 % |
+| two sessions: per stream (second run) | 29.1 + 30.6 / 28.7 + 30.1 | 30.6 + 36.2 / 30.8 + 36.4 | |
+| two sessions: aggregate incl. prefill | 56.8 / 56.0 tok/s | 59.7 / 60.1 tok/s | +6.2 % |
+| one session at `--max-num-seqs 2`: step | 65.0 / 66.3 ms | 59.7 / 58.9 ms | −10 % |
+
+  Long-context decode follows the acceptance of the text each build generates (72K: 0.495 → 0.539), so at 72K part of
+  the gain is the different continuation; 197K had 0.615 → 0.562 and still held its speed. Two sessions get 68 % of
+  one stream each (65 % before); the goal is 80 %.
+* **Production** (greedy texts equal to the A/B's for this release, top-1 logprob drift ≤ 2.1e-7; state checks pass):
+  decode **54.8** tok/s without logprobs (49.4), 53.8 with (48.6); 72K 39.1 tok/s (34.1) at draft acceptance 0.539
+  (0.495), 197K 32.0 (31.7) at 0.562 (0.615), i.e. step 66.9 / 84.0 ms (72.8 / 89.9); prefill 8K 2068 (1874), 23K
+  1885 (1747), 72K 1396, 197K 930; MemFree + Cached 2.63–2.80 GiB, needles found; model loading 45.76 GiB (45.60).
+  After a watchdog restart (compiled graph loaded, no recompile): the same texts and acceptance, state checks pass.

@@ -144,13 +144,14 @@ def embedding(ids: torch.Tensor, w: Weight) -> torch.Tensor:
 
 def mm_ids_supported(w: Weight, up: Weight | None = None) -> bool:
     """Mirror of launch.cu mm_ids_supported: shapes with a batched (prefill) MoE kernel instance (K = 512, R = 16: the
-    row-major or the fragment-order kernel)."""
+    row-major or the fragment-order kernel; gate/up + SWIGLU: chunk-major R = 8 or fragment order, K = 2048)."""
     m = w.meta
-    ok = m.format == FMT_HUFPAIR and ((m.K == 2048 and m.R == 8 and m.chunk_major) or (m.K == 512 and m.R == 16))
     if up is None:
-        return ok
+        return m.format == FMT_HUFPAIR and ((m.K == 2048 and m.R == 8 and m.chunk_major) or (m.K == 512 and m.R == 16))
     u = up.meta
-    return ok and m.K == 2048 and (u.format, u.K, u.R, u.chunk_major, u.rows) == (m.format, m.K, m.R, True, m.rows)
+    same = (u.format, u.K, u.R, u.chunk_major, u.frag_order, u.rows) == (m.format, m.K, m.R, m.chunk_major, m.frag_order, m.rows)
+    return same and m.format == FMT_HUFPAIR and m.K == 2048 and (
+        (m.chunk_major and m.R == 8) or (m.frag_order and m.R == 16))
 
 
 def moe_mm_ids(x: torch.Tensor, topk_ids: torch.Tensor, w: Weight, n_experts: int, up: Weight | None = None,

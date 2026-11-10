@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="388" viewBox="0 0 760 388" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="vLLM + BF16N: one step of two concurrent sessions">
+<title>vLLM + BF16N: one step of two concurrent sessions</title>
+<rect x="0.5" y="0.5" width="759" height="387" rx="12" fill="#1a1a19" stroke="rgba(255,255,255,0.10)"/>
+<text x="24" y="36" font-size="17" font-weight="600" fill="#f0efec">vLLM + BF16N: one step of two concurrent sessions</text>
+<text x="24" y="58" font-size="13" fill="#c3c2b7">--max-num-seqs 2, ms per step with both decoding (vLLM log), each release's A/B; lower is better</text>
+<line x1="351.2" y1="86" x2="351.2" y2="336" stroke="#2c2c2a" stroke-width="1"/>
+<text x="351.2" y="354" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="396.7" y1="86" x2="396.7" y2="336" stroke="#2c2c2a" stroke-width="1"/>
+<text x="396.7" y="354" font-size="11" fill="#898781" text-anchor="middle">20</text>
+<line x1="442.3" y1="86" x2="442.3" y2="336" stroke="#2c2c2a" stroke-width="1"/>
+<text x="442.3" y="354" font-size="11" fill="#898781" text-anchor="middle">40</text>
+<line x1="487.8" y1="86" x2="487.8" y2="336" stroke="#2c2c2a" stroke-width="1"/>
+<text x="487.8" y="354" font-size="11" fill="#898781" text-anchor="middle">60</text>
+<line x1="533.4" y1="86" x2="533.4" y2="336" stroke="#2c2c2a" stroke-width="1"/>
+<text x="533.4" y="354" font-size="11" fill="#898781" text-anchor="middle">80</text>
+<line x1="578.9" y1="86" x2="578.9" y2="336" stroke="#2c2c2a" stroke-width="1"/>
+<text x="578.9" y="354" font-size="11" fill="#898781" text-anchor="middle">100</text>
+<line x1="624.5" y1="86" x2="624.5" y2="336" stroke="#2c2c2a" stroke-width="1"/>
+<text x="624.5" y="354" font-size="11" fill="#898781" text-anchor="middle">120</text>
+<line x1="670.0" y1="86" x2="670.0" y2="336" stroke="#2c2c2a" stroke-width="1"/>
+<text x="670.0" y="354" font-size="11" fill="#898781" text-anchor="middle">140</text>
+<line x1="351.20000000000005" y1="86" x2="351.20000000000005" y2="336" stroke="#383835" stroke-width="1"/>
+<text x="670" y="374" font-size="11" fill="#898781" text-anchor="end">ms per step</text>
+<g fill="#184f95"><path d="M351.20000000000005,101.0 H652.3371428571429 Q656.3371428571429,101.0 656.3371428571429,105.0 V119.0 Q656.3371428571429,123.0 652.3371428571429,123.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="116.5" font-size="13" fill="#c3c2b7" text-anchor="end">11-09: BF16 activations in shared memory</text>
+<rect x="659.3" y="101.0" width="29.8" height="22" fill="#1a1a19"/>
+<text x="664.3" y="116.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">134</text>
+<g fill="#184f95"><path d="M351.20000000000005,141.0 H622.7342857142858 Q626.7342857142858,141.0 626.7342857142858,145.0 V159.0 Q626.7342857142858,163.0 622.7342857142858,163.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="156.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ dense GEMVs on the tensor cores</text>
+<rect x="629.7" y="141.0" width="29.8" height="22" fill="#1a1a19"/>
+<text x="634.7" y="156.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">121</text>
+<g fill="#184f95"><path d="M351.20000000000005,181.0 H602.24 Q606.24,181.0 606.24,185.0 V199.0 Q606.24,203.0 602.24,203.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="196.5" font-size="13" fill="#c3c2b7" text-anchor="end">11-10: + lm_head in fragment order</text>
+<rect x="609.2" y="181.0" width="29.8" height="22" fill="#1a1a19"/>
+<text x="614.2" y="196.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">112</text>
+<g fill="#184f95"><path d="M351.20000000000005,221.0 H589.2602857142857 Q593.2602857142857,221.0 593.2602857142857,225.0 V239.0 Q593.2602857142857,243.0 589.2602857142857,243.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="236.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ drafter graphs, 2-bit head kernel</text>
+<rect x="596.3" y="221.0" width="29.8" height="22" fill="#1a1a19"/>
+<text x="601.3" y="236.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">106</text>
+<g fill="#184f95"><path d="M351.20000000000005,261.0 H577.8745714285715 Q581.8745714285715,261.0 581.8745714285715,265.0 V279.0 Q581.8745714285715,283.0 577.8745714285715,283.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="276.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ down experts once per distinct expert</text>
+<rect x="584.9" y="261.0" width="29.8" height="22" fill="#1a1a19"/>
+<text x="589.9" y="276.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">101</text>
+<g fill="#3987e5"><path d="M351.20000000000005,301.0 H545.9945714285715 Q549.9945714285715,301.0 549.9945714285715,305.0 V319.0 Q549.9945714285715,323.0 545.9945714285715,323.0 H351.20000000000005 Z"/></g>
+<text x="339.20000000000005" y="316.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ gate / up experts in fragment order</text>
+<rect x="553.0" y="301.0" width="22.6" height="22" fill="#1a1a19"/>
+<text x="558.0" y="316.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">87</text>
+</svg>

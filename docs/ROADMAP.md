@@ -6,10 +6,11 @@ encoder, kernels in `core/`, used by both engines), `[llamacpp]`, `[vllm]`. Numb
 [vllm/RESULTS.md](vllm/RESULTS.md), M6); "gain" estimates come from the measurements in [RESULTS.md](llamacpp/RESULTS.md) and are
 hypotheses until measured with alternating A/B runs.
 
-Production runs the vLLM engine (since 10-30; releases of 2026-11-09/10: 49.4 tok/s short decode with MTP 3, step
-72.8 ms @ 72K and 89.9 ms @ 197K, two sessions 101 ms per step, prefill 1903 tok/s at 8k); llama.cpp is the rollback engine. The fragment-order down
-experts in vLLM's prefill (Stage 1) and the tensor-core dense decode GEMV are done; next: two parallel sessions on the
-production server (speed, then lossless KV coding for two long windows).
+Production runs the vLLM engine (since 10-30; releases of 2026-11-09/10: 54.8 tok/s short decode with MTP 3, step
+66.9 ms @ 72K and 84.0 ms @ 197K, two sessions 87 ms per step, prefill 2068 tok/s at 8k); llama.cpp is the rollback
+engine. Every routed expert in vLLM is in fragment order (Stage 1) and the dense decode GEMVs run on the tensor cores;
+next: two parallel sessions on the production server (each gets 68 % of one stream; goal 80 %), then lossless KV
+coding for two long windows.
 
 ## Ceiling `[core]`
 
@@ -49,7 +50,9 @@ matrices, 6 % in the gated delta net, 4.3 % in F32→BF16 conversions, 3.3 % in 
    (2026-11-09):** every MoE prefill chunk runs the batched BF16N kernels and the down experts are encoded in fragment
    order (down 9.95 → 4.34 ms per layer at 2048 tokens; prefill 8K 1439 → 1762 tok/s, 23K 1367 → 1696, 197K → 892);
    the fragment-order decode GEMV is faster than row-major at 2–4 tokens (4 tokens 290 vs 298 µs per layer) and within
-   noise at 1. Open: gate/up.
+   noise at 1. **Gate/up done in vLLM (2026-11-10):** fragment order, decode grouped by expert, SwiGLU fused into the
+   batched kernel (gate + up per layer at 2048 tokens 12.4 → 8.7 ms, 6432 tokens 31.8 → 22.4; prefill 8K 1874 → 2068
+   tok/s, 23K 1747 → 1885).
 2. **Conversions** (≈ 4 %, at bandwidth): every BF16N matmul converts its F32 input again (≈ 300 conversions per
    forward for ≈ 80 distinct tensors). Converting each tensor once is worth ≈ 2 % and needs a BF16 buffer that lives
    across ops and stays valid under CUDA graph replay.

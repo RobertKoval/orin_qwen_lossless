@@ -63,7 +63,7 @@ and refuses a source checkout unless `VBF16N_ALLOW_SOURCE_PACKAGE=1`.
 
 | vLLM module | rows × K | format |
 |---|---|---|
-| experts w13 (gate, up) | 256 × 512 × 2048 each | HUFPAIR R = 8, chunk-major |
+| experts w13 (gate, up) | 256 × 512 × 2048 each | HUFPAIR R = 16, fragment order |
 | experts w2 (down) | 256 × 2048 × 512 | HUFPAIR R = 16, fragment order |
 | `self_attn.qkv_proj` (merged q, k, v) | 9216 × 2048 | HUFPAIR R = 16, fragment order |
 | `self_attn.o_proj`, `linear_attn.out_proj`, MTP `fc` | 2048 × 4096 | HUFPAIR R = 16, fragment order |
@@ -73,8 +73,9 @@ and refuses a source checkout unless `VBF16N_ALLOW_SOURCE_PACKAGE=1`.
 | `embed_tokens` | 248320 × 2048 | HUFPAIR R = 16 |
 | router `gate`, `shared_expert_gate`, conv1d, norms, `A_log`, `dt_bias`, vision tower | — | BF16 (not encoded) |
 
-The rules are llama.cpp's (`llama_bf16n_format_for` + the unit sizes of `ggml_backend_cuda_bf16n_convert`), with two
-additions. Linear layers (`linear.py`) and `lm_head` opt in to fragment order (`dense_frag_order`): 16-row bands
+The rules are llama.cpp's (`llama_bf16n_format_for` + the unit sizes of `ggml_backend_cuda_bf16n_convert`), with three
+additions. Routed experts are in fragment order (16-row bands; gate / up as 4 slabs of 512 columns, not chunk-major
+R = 8), for the grouped decode GEMV and the tensor-core prefill kernels below. Linear layers (`linear.py`) and `lm_head` opt in to fragment order (`dense_frag_order`): 16-row bands
 decoded straight into tensor-core operands, so the decode GEMV multiplies up to 8 tokens per decode (T-077, T-080); the
 draft head's exact rescoring gathers lm_head rows with the fragment-order `get_rows` (one quad per row and slab decodes
 only the lanes holding the row). `embed_tokens` stays row-major: `get_rows` of every prompt token. For other dense shapes
@@ -101,7 +102,13 @@ llama.cpp's shapes), because vLLM's merged projections leave "largest R with ≥
   row-major 298). From 3 to 8 tokens the decode GEMV groups the routed pairs by expert (`k_fo_mmv_grp`): each distinct
   expert's bands are decoded once for all its pairs (three FP32-split columns per pair, up to 8 pairs per `mma`), with
   results bitwise those of the per-pair kernel (served text: 21 of 32 and 38 of 64 pairs are distinct experts; layer
-  20 down, 4 / 8 tokens 237 / 492 → 184 / 338 µs). Dense linear layers in fragment order take `k_fo_mmv8`: one decode of a band feeds `mma` with up to 8
+  20 down, 4 / 8 tokens 237 / 492 → 184 / 338 µs). Gate / up (T-060 b2) take the token's own BF16 row, so the decode
+  GEMV (`k_fo_mmv8_grp`) stages each token's row once and points the `mma` B rows of each expert group at its tokens:
+  up to 8 pairs of an expert per decode, a band K-split over 4 warps as in `k_fo_mmv8` (layer 20 gate, 4 / 8 tokens
+  246 / 468 → 203 / 328 µs; 1 / 2 tokens 61 / 120 → 65 / 136). Their batched kernel (`k_fo_mm_glu`) stages a 96-token
+  tile one 512-column slab at a time, gate and up warps of the same bands keep their sums over the 4 slabs, and the
+  SWIGLU is fused (gate + up per layer: 512 / 2048 / 6432 tokens 8.1 / 12.4 / 31.8 → 7.7 / 8.7 / 22.4 ms). A pair's
+  result never depends on the other pairs batched with it. Dense linear layers in fragment order take `k_fo_mmv8`: one decode of a band feeds `mma` with up to 8
   BF16 token columns, a group of `K / 512` warps splits the band along K and slab 0 adds the partial sums in slab order
   (in_proj_qkvz 12288 × 2048: 1 / 4 / 8 tokens 213 / 245 / 490 → 212 / 213 / 216 µs; prefill keeps exact dequant +
   cuBLAS).

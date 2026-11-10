@@ -1728,6 +1728,48 @@ __global__ void __launch_bounds__(HP_NT) k_fo_mmv(const hp_ptrs w, cols_t p) {
 constexpr int FO_GRP_NW = 32, FO_GRP_MINT = 3, FO_GRP_MAXT = 8, FO_GRP_MAXP = 64;
 inline size_t fo_grp_shm(int ntok) { return (4u << HP_LP) + (size_t) ntok * FO_MMV_XB * 16; }
 
+// The (token, slot) pairs of a decode batch grouped by expert, block-wide: distinct experts in order of first
+// occurrence, each one's pairs in pair order, cut into groups of at most cap <= FO_GRP_MAXT pairs (what the kernel
+// stages or multiplies at once; an expert repeated within a token would otherwise give it more pairs than tokens).
+// Group d: pairs gp[d][0 .. gn[d] - 1] of expert ge[d]; D groups. npairs <= FO_GRP_MAXP <= blockDim.x; ends with a
+// barrier.
+struct fo_groups {
+    int e[FO_GRP_MAXP], slot[FO_GRP_MAXP], cnt[FO_GRP_MAXP];
+    int gp[FO_GRP_MAXP][FO_GRP_MAXT], gn[FO_GRP_MAXP], ge[FO_GRP_MAXP], D;
+};
+
+__device__ __forceinline__ void fo_group_pairs(fo_groups & s, const cols_t & p, int npairs, int cap) {
+    const int q = threadIdx.x;
+    if (q < npairs) { s.e[q] = *(const int32_t *) (p.ids + (q / p.n_used) * p.ids_s1 + (q % p.n_used) * p.ids_s0); }
+    __syncthreads();
+    if (q < npairs) { // rank among the pairs of the expert, pairs of the expert
+        const int e = s.e[q];
+        int slot = 0, cnt = 0;
+        for (int r = 0; r < npairs; r++) {
+            if (s.e[r] == e) { cnt++; slot += r < q; }
+        }
+        s.slot[q] = slot; s.cnt[q] = cnt;
+    }
+    __syncthreads();
+    if (q < npairs) { // a group's leader is its first pair (rank a multiple of cap); index = leaders before it
+        const int e = s.e[q], slot = s.slot[q], s0 = slot - slot % cap;
+        int lead = q;
+        for (int r = 0; r < q; r++) {
+            if (s.e[r] == e && s.slot[r] == s0) { lead = r; }
+        }
+        int d = 0;
+        for (int r = 0; r < lead; r++) { d += s.slot[r] % cap == 0; }
+        s.gp[d][slot % cap] = q;
+        if (q == lead) { s.ge[d] = e; s.gn[d] = min(cap, s.cnt[q] - slot); }
+    }
+    if (q == 0) {
+        int D = 0;
+        for (int r = 0; r < npairs; r++) { D += s.slot[r] % cap == 0; }
+        s.D = D;
+    }
+    __syncthreads();
+}
+
 // one band of one expert for its ne pairs (ceil(3 ne / 8) n8 tiles of split columns), stored to the pairs' outputs
 __device__ __forceinline__ void fo_grp_band(const hp_ptrs & w, const uint32_t * lut, const uint4 * gxb, const cols_t & p,
         const int * pairs, int ne, int64_t gu, int64_t band, uint32_t & s_next, bool has_next, uint32_t nxt, int lane) {
@@ -1799,45 +1841,15 @@ __global__ void __launch_bounds__(FO_GRP_NW * 32) k_fo_mmv_grp(const hp_ptrs w, 
     extern __shared__ __align__(16) uint32_t grp_shm[];
     uint32_t * lut = grp_shm;
     uint4 * xb = (uint4 *) (grp_shm + (1 << HP_LP)); // the current expert's pairs (at most one per token)
-    __shared__ int s_e[FO_GRP_MAXP], s_first[FO_GRP_MAXP], s_slot[FO_GRP_MAXP], s_cntq[FO_GRP_MAXP];
-    __shared__ int s_exp[FO_GRP_MAXP], s_cnt[FO_GRP_MAXP], s_pair[FO_GRP_MAXP][FO_GRP_MAXT], s_D;
+    __shared__ fo_groups grp;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    if (threadIdx.x < npairs) {
-        const int q = threadIdx.x;
-        s_e[q] = *(const int32_t *) (p.ids + (q / p.n_used) * p.ids_s1 + (q % p.n_used) * p.ids_s0);
-    }
     for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += blockDim.x) { ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i); }
-    __syncthreads();
-    if (threadIdx.x < npairs) { // first occurrence, rank among the pairs of the expert, pairs per expert
-        const int q = threadIdx.x, e = s_e[q];
-        int first = q, slot = 0, cnt = 0;
-        for (int r = 0; r < npairs; r++) {
-            if (s_e[r] == e) {
-                cnt++;
-                if (r < q) { slot++; first = min(first, r); }
-            }
-        }
-        s_first[q] = first; s_slot[q] = slot; s_cntq[q] = cnt;
-    }
-    __syncthreads();
-    if (threadIdx.x < npairs) { // expert index = first occurrences before this expert's first one
-        const int q = threadIdx.x;
-        int d = 0;
-        for (int r = 0; r < s_first[q]; r++) { d += s_first[r] == r; }
-        s_pair[d][s_slot[q]] = q;
-        if (s_first[q] == q) { s_exp[d] = s_e[q]; s_cnt[d] = s_cntq[q]; }
-    }
-    if (threadIdx.x == 0) { // distinct experts
-        int D = 0;
-        for (int r = 0; r < npairs; r++) { D += s_first[r] == r; }
-        s_D = D;
-    }
-    __syncthreads();
-    const int D = s_D, ipe = (int) (p.nrows / 16 / NW); // items per expert: chunks of NW bands
+    fo_group_pairs(grp, p, npairs, min(FO_GRP_MAXT, npairs / p.n_used)); // xb holds one pair per token
+    const int D = grp.D, ipe = (int) (p.nrows / 16 / NW); // items per group: chunks of NW bands
     const int total = D * ipe, per = (total + gridDim.x - 1) / gridDim.x;
     const int i0 = min(total, blockIdx.x * per), i1 = min(total, i0 + per);
     auto unit_of = [&](int item) -> int64_t { // this warp's band of an item, as a global unit index
-        return (p.row0 + (int64_t) s_exp[item / ipe] * p.rows_per_matrix) / 16 + (item % ipe) * NW + warp;
+        return (p.row0 + (int64_t) grp.ge[item / ipe] * p.rows_per_matrix) / 16 + (item % ipe) * NW + warp;
     };
     uint32_t s_next = 0;
     if (i0 < i1) {
@@ -1846,11 +1858,11 @@ __global__ void __launch_bounds__(FO_GRP_NW * 32) k_fo_mmv_grp(const hp_ptrs w, 
     }
     int cur = -1;
     for (int it = i0; it < i1; it++) {
-        const int d = it / ipe, ne = s_cnt[d];
+        const int d = it / ipe, ne = grp.gn[d];
         if (d != cur) { // block-uniform: stage the split activations of the expert's pairs
             __syncthreads();
             for (int i = threadIdx.x; i < ne * FO_MMV_XB; i += blockDim.x) {
-                const int q0 = s_pair[d][i / FO_MMV_XB], e = i % FO_MMV_XB;
+                const int q0 = grp.gp[d][i / FO_MMV_XB], e = i % FO_MMV_XB;
                 const TX * xg = (const TX *) (p.x + (q0 / p.n_used) * p.x_tok + ((q0 % p.n_used) % p.ne11) * p.x_slot);
                 const int tt = e & 3, n = (e >> 2) % 3, q = e / 12;
                 uint32_t r[4];
@@ -1871,7 +1883,7 @@ __global__ void __launch_bounds__(FO_GRP_NW * 32) k_fo_mmv_grp(const hp_ptrs w, 
             nxt = __ldg(w.ubase + un) + __ldg(w.lrel + un * 32 + lane);
         }
         const int64_t gu = unit_of(it), band = (it % ipe) * NW + warp;
-        fo_grp_band(w, lut, xb, p, s_pair[d], ne, gu, band, s_next, has_next, nxt, lane);
+        fo_grp_band(w, lut, xb, p, grp.gp[d], ne, gu, band, s_next, has_next, nxt, lane);
     }
 }
 
@@ -1974,6 +1986,117 @@ __global__ void __launch_bounds__(1024) k_fo_mmv8(const hp_ptrs w, cols_t p, int
                     const ydst out = {p.dst + n * p.dst_tok, p.dst_bf16};
                     out.set(u * 16 + g, acc[h]);
                     out.set(u * 16 + g + 8, acc[2 + h]);
+                }
+            }
+        }
+    }
+}
+
+// Routed-expert GEMV of up to FO8_NTOK BF16 token columns grouped by expert (T-060 b2: gate / up, whose activation is
+// the token's own row, K = C x 512). The tokens' rows are staged once per block as in k_fo_mmv8; the pairs are grouped
+// by expert (fo_group_pairs, one n8 tile each), and for each group the ldmatrix row of lane l points at the token of the
+// group's pair l % 8 (the zero block past its last pair), so no restaging between groups. Work: (group, band) items in
+// contiguous runs per group of C warps (warp s: slab s, K-split summed in slab order as k_fo_mmv8), band starts
+// pipelined. A pair's result is its token's column of mma with the expert's fragments summed over K in a fixed order:
+// the same bits whatever else is batched with it (and as k_fo_mmv8 on that expert alone).
+template <int C>
+__global__ void __launch_bounds__(1024) k_fo_mmv8_grp(const hp_ptrs w, cols_t p, int ntok) {
+    constexpr int K = C * FO_K, LD = K + 8, NP = FO_K / 32, PF = 2;
+    extern __shared__ __align__(16) uint32_t fg8_shm[];
+    uint32_t * lut = fg8_shm;
+    __nv_bfloat16 * xs = (__nv_bfloat16 *) (lut + (1 << HP_LP));
+    uint4 * zero = (uint4 *) (xs + ntok * LD);
+    float4 * part = (float4 *) (zero + 1); // [warps][32] slab partial sums (C > 1)
+    __shared__ fo_groups grp;
+    const int nw = blockDim.x >> 5, G = nw / C;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int gid = warp / C, s = warp % C;
+    for (int i = threadIdx.x; i < ntok * (K / 8); i += blockDim.x) {
+        const int r = i / (K / 8), c8 = i % (K / 8);
+        *(uint4 *) (xs + r * LD + c8 * 8) = __ldg((const uint4 *) (p.x + r * p.x_tok) + c8);
+    }
+    if (threadIdx.x == 0) { *zero = make_uint4(0, 0, 0, 0); }
+    for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += blockDim.x) { ((uint4 *) lut)[i] = __ldg((const uint4 *) w.lut + i); }
+    fo_group_pairs(grp, p, ntok * p.n_used, FO_GRP_MAXT);
+    const int64_t bands = p.nrows / 16;
+    const int64_t total = grp.D * bands, workers = (int64_t) gridDim.x * G, per = (total + workers - 1) / workers;
+    const int64_t i0 = min(total, ((int64_t) blockIdx.x * G + gid) * per), i1 = min(total, i0 + per);
+    auto unit_of = [&](int64_t item) -> int64_t { // this warp's slab unit of an item
+        return ((p.row0 + (int64_t) grp.ge[item / bands] * p.rows_per_matrix) / 16 + item % bands) * C + s;
+    };
+    uint32_t s_next = 0; // this lane's stream position in its warp's next unit
+    if (i0 < i1) {
+        const int64_t un = unit_of(i0);
+        s_next = __ldg(w.ubase + un) + __ldg(w.lrel + un * 32 + lane);
+    }
+    const uint32_t xs_s = (uint32_t) __cvta_generic_to_shared(xs), zero_s = (uint32_t) __cvta_generic_to_shared(zero);
+    int cur = -1, ne = 0;
+    uint32_t lrow = zero_s, lstep = 0;
+    for (int64_t it = i0; it < i1; it++) {
+        const int d = (int) (it / bands);
+        if (d != cur) { // ldmatrix row of this lane: the token of the group's pair lane % 8, or the zero block
+            ne = grp.gn[d];
+            const int j = lane & 7;
+            const bool present = j < ne;
+            lrow = present ? xs_s + ((grp.gp[d][j] / p.n_used) * LD + s * FO_K + 8 * (lane >> 3)) * 2 : zero_s;
+            lstep = present ? 64 : 0;
+            cur = d;
+        }
+        const bool has_next = it + 1 < i1;
+        uint32_t ub_n = 0, lr_n = 0;
+        if (has_next) {
+            const int64_t un = unit_of(it + 1);
+            ub_n = __ldg(w.ubase + un);
+            lr_n = __ldg(w.lrel + un * 32 + lane);
+        }
+        const int64_t gu = unit_of(it), band = it % bands;
+        HP_UNIT_BEGIN_AT(w, s_next)
+        const uint4 * pp = (const uint4 *) (w.sm + (gu / C) * 16 * K + s * 16 * FO_K) + lane;
+        uint4 ring[PF];
+#pragma unroll
+        for (int i = 0; i < PF; i++) { ring[i] = ld_plane(pp + i * 32); }
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int q = 0; q < NP; q++) {
+            if (q == NP / 2 && has_next) {
+                s_next = ub_n + lr_n;
+                prefetch_l1(lst + s_next);
+            }
+            const uint4 pl = ring[q % PF];
+            if (q + PF < NP) { ring[q % PF] = ld_plane(pp + (q + PF) * 32); }
+            uint32_t ex[8], a[8], b[4];
+            HP_PAIRS(ex)
+            fo_a(pl, ex, a);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(lrow + q * lstep));
+            mma_bf16(acc, *(const uint32_t (*)[4]) a, b[0], b[1]);
+            mma_bf16(acc, *(const uint32_t (*)[4]) (a + 4), b[2], b[3]);
+        }
+        if (C > 1) { // slab 0 sums the group's partials in slab order
+            if (s > 0) { part[warp * 32 + lane] = make_float4(acc[0], acc[1], acc[2], acc[3]); }
+            asm volatile("bar.sync %0, %1;" :: "r"(1 + gid), "r"(C * 32) : "memory");
+            if (s == 0) {
+#pragma unroll
+                for (int j = 1; j < C; j++) {
+                    const float4 v = part[(warp + j) * 32 + lane];
+                    acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w;
+                }
+            }
+            asm volatile("bar.sync %0, %1;" :: "r"(1 + gid), "r"(C * 32) : "memory");
+        }
+        // lane (g, t) holds D[g][2t], D[g][2t + 1], D[g + 8][2t], D[g + 8][2t + 1]: rows g, g + 8 of pairs 2t, 2t + 1
+        if (s == 0) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int n = 2 * t + h;
+                if (n < ne) {
+                    const int q0 = grp.gp[d][n];
+                    ydst out;
+                    out.init(p.dst_bf16);
+                    out.point(p.dst + (q0 / p.n_used) * p.dst_tok + (q0 % p.n_used) * p.dst_slot);
+                    out.set(band * 16 + g, acc[h]);
+                    out.set(band * 16 + g + 8, acc[2 + h]);
                 }
             }
         }
@@ -2096,6 +2219,170 @@ __global__ void __launch_bounds__(NW * 32, 1) k_fo_mm_ids(const hp_ptrs w, hpm_a
                         const int64_t o = (int64_t) a.ids_dst[jb + col] * a.dst_col + row;
                         out.set(o, acc[n][h]);
                         out.set(o + 8, acc[n][2 + h]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Batched gate/up + SWIGLU (prefill) over fragment-order experts with K = C x 512 (T-060 b2). Persistent as k_fo_mm_ids:
+// item = (expert, tile of up to NTOK routed tokens, group of NW / 2 bands). Warp w takes band w % (NW / 2) of the group,
+// of gate (w < NW / 2) or of up. Per slab s the tile's activations of columns 512 s .. 512 s + 511 are staged once
+// (cp.async, rows FOM_LD apart) and each warp multiplies its unit (band, s) into accumulators kept over the C slabs (K
+// summed in slab order); the next slab's lane-stream positions are loaded during the current one and its first stream
+// line prefetched. At the end the up warps hand their sums to the gate warps through the then free staging buffer, and
+// dst = up * silu(gate) as k_hp_mm_ids's GLU. Every weight is decoded once per (expert, token tile).
+inline size_t fo_glu_shm(int ntok, int n_experts) {
+    return (8u << HP_LP) + (size_t) ntok * FOM_LD * 2 + (size_t) (n_experts + 1) * 2 * sizeof(int);
+}
+
+template <int C, int NTOK, int NW>
+__global__ void __launch_bounds__(NW * 32, 1) k_fo_mm_glu(const hp_ptrs wg, const hp_ptrs wu, hpm_args a) {
+    constexpr int K = C * FO_K, NP = FO_K / 32, NT = NTOK / 8, NB = NW / 2; // tile pairs per unit, 8-token tiles, bands per item
+    static_assert(NTOK % 16 == 0 && NW % 2 == 0, "tokens in pairs of 8-token tiles, gate and up warps in pairs");
+    static_assert(NB * NT * 4 * 32 * sizeof(float) <= NTOK * FOM_LD * 2, "the up sums must fit the staging buffer");
+    extern __shared__ __align__(16) uint32_t fog_shm[];
+    uint32_t * lut = fog_shm; // gate, then up
+    __nv_bfloat16 * xs = (__nv_bfloat16 *) (fog_shm + 2 * (1 << HP_LP));
+    const int E = a.n_experts;
+    int * bnd = (int *) (xs + NTOK * FOM_LD); // routing bounds, E + 1
+    int * toff = bnd + E + 1;                 // first token tile of each expert, E + 1
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const bool upw = warp >= NB;
+    const hp_ptrs w = upw ? wu : wg;
+    const uint32_t * lutm = lut + (upw ? (1 << HP_LP) : 0);
+    const int64_t bands = a.rows / 16;                 // per expert
+    const int nbg = (int) ((bands + NB - 1) / NB);     // band groups per token tile
+    const ydst out = {a.dst, a.dst_bf16};
+    for (int i = threadIdx.x; i <= E; i += NW * 32) { bnd[i] = a.bounds[i]; }
+    for (int i = threadIdx.x; i < (1 << HP_LP) / 4; i += NW * 32) {
+        ((uint4 *) lut)[i] = __ldg((const uint4 *) wg.lut + i);
+        ((uint4 *) (lut + (1 << HP_LP)))[i] = __ldg((const uint4 *) wu.lut + i);
+    }
+    __syncthreads();
+    if (warp == 0) { // exclusive scan of the token tiles per expert
+        int run = 0;
+        for (int e0 = 0; e0 < E; e0 += 32) {
+            const int e = e0 + lane;
+            const int nt = e < E ? (bnd[e + 1] - bnd[e] + NTOK - 1) / NTOK : 0;
+            int incl = nt;
+#pragma unroll
+            for (int d = 1; d < 32; d <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, incl, d);
+                incl += lane >= d ? y : 0;
+            }
+            if (e < E) { toff[e] = run + incl - nt; }
+            run += __shfl_sync(0xffffffffu, incl, 31);
+        }
+        if (lane == 0) { toff[E] = run; }
+    }
+    __syncthreads();
+    const int n_items = toff[E] * nbg;
+    const uint32_t xs_s = (uint32_t) __cvta_generic_to_shared(xs);
+    const uint32_t lrow = xs_s + (((lane >> 4) * 8 + (lane & 7)) * FOM_LD + ((lane >> 3) & 1) * 8) * 2;
+    for (int it = blockIdx.x; it < n_items; it += gridDim.x) {
+        const int tile = it / nbg;
+        int lo = 0, hi = E; // the tile belongs to the largest e with toff[e] <= tile
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) / 2;
+            if (toff[mid] <= tile) { lo = mid; } else { hi = mid; }
+        }
+        const int e = lo;
+        const int jb = bnd[e] + (tile - toff[e]) * NTOK;
+        const int ncol = min(NTOK, bnd[e + 1] - jb);
+        const int npair = (ncol + 15) / 16;
+        const int64_t band = (int64_t) (it % nbg) * NB + warp % NB;
+        const bool live = band < bands;
+        const int64_t gb = (int64_t) e * bands + (live ? band : 0); // global band (a missing band is never stored)
+        float acc[NT][4];
+#pragma unroll
+        for (int n = 0; n < NT; n++) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f; }
+        uint32_t s_next = __ldg(w.ubase + gb * C) + __ldg(w.lrel + gb * C * 32 + lane);
+#pragma unroll 1
+        for (int s = 0; s < C; s++) {
+            __syncthreads(); // the previous slab's (or item's) readers of xs are done
+            for (int i = threadIdx.x; i < npair * 16 * (FO_K / 8); i += NW * 32) {
+                const int r = i / (FO_K / 8), c8 = i % (FO_K / 8);
+                __nv_bfloat16 * dst = xs + r * FOM_LD + c8 * 8;
+                if (r < ncol) {
+                    cp_async16(dst, a.x + (int64_t) a.ids_src1[jb + r] * a.x_row + s * FO_K + c8 * 8);
+                } else {
+                    *(uint4 *) dst = make_uint4(0, 0, 0, 0);
+                }
+            }
+            cp_async_commit();
+            const bool has_next = s + 1 < C;
+            uint32_t ub_n = 0, lr_n = 0;
+            if (has_next) {
+                ub_n = __ldg(w.ubase + gb * C + s + 1);
+                lr_n = __ldg(w.lrel + (gb * C + s + 1) * 32 + lane);
+            }
+            cp_async_wait<0>();
+            __syncthreads();
+            if (live) {
+                HP_UNIT_BEGIN_AT(w, s_next)
+                const uint4 * pp = (const uint4 *) (w.sm + gb * 16 * K + s * 16 * FO_K) + lane;
+                uint4 nxt = ld_plane(pp);
+#pragma unroll 1
+                for (int q = 0; q < NP; q++) {
+                    if (q == NP / 2 && has_next) {
+                        s_next = ub_n + lr_n;
+                        prefetch_l1(lst + s_next);
+                    }
+                    const uint4 pl = nxt;
+                    if (q + 1 < NP) { nxt = ld_plane(pp + (q + 1) * 32); }
+                    uint32_t ex[8], af[8];
+                    {
+                        const uint32_t * lut = lutm;
+                        HP_PAIRS(ex)
+                    }
+                    fo_a(pl, ex, af);
+#pragma unroll
+                    for (int kk = 0; kk < 2; kk++) {
+                        const uint32_t kofs = (uint32_t) ((2 * q + kk) * 16 * 2);
+                        const uint32_t (&ak)[4] = *(const uint32_t (*)[4]) (af + 4 * kk);
+#pragma unroll
+                        for (int n = 0; n < NT / 2; n++) {
+                            if (n < npair) {
+                                uint32_t b[4];
+                                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                             : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3])
+                                             : "r"(lrow + n * 16 * FOM_LD * 2 + kofs));
+                                mma_bf16(acc[2 * n], ak, b[0], b[1]);
+                                mma_bf16(acc[2 * n + 1], ak, b[2], b[3]);
+                            }
+                        }
+                    }
+                }
+            } else if (has_next) {
+                s_next = ub_n + lr_n;
+            }
+        }
+        __syncthreads(); // every warp is done with xs
+        float * red = (float *) xs; // [band][tile][4][lane]: the up sums
+        if (upw) {
+#pragma unroll
+            for (int n = 0; n < NT; n++) {
+#pragma unroll
+                for (int v = 0; v < 4; v++) { red[(((warp - NB) * NT + n) * 4 + v) * 32 + lane] = acc[n][v]; }
+            }
+        }
+        __syncthreads();
+        if (!upw && live) {
+            const int64_t row = band * 16 + g;
+#pragma unroll
+            for (int n = 0; n < NT; n++) {
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int col = n * 8 + 2 * t + h;
+                    if (col < ncol) {
+                        const int64_t o = (int64_t) a.ids_dst[jb + col] * a.dst_col + row;
+                        const float u0 = red[((warp * NT + n) * 4 + h) * 32 + lane];
+                        const float u8 = red[((warp * NT + n) * 4 + 2 + h) * 32 + lane];
+                        out.set(o, u0 * silu_single(acc[n][h]));
+                        out.set(o + 8, u8 * silu_single(acc[n][2 + h]));
                     }
                 }
             }
