@@ -1,72 +1,76 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="628" viewBox="0 0 760 628" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="vLLM + BF16N: decode by release">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="668" viewBox="0 0 760 668" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="vLLM + BF16N: decode by release">
 <title>vLLM + BF16N: decode by release</title>
-<rect x="0.5" y="0.5" width="759" height="627" rx="12" fill="#1a1a19" stroke="rgba(255,255,255,0.10)"/>
+<rect x="0.5" y="0.5" width="759" height="667" rx="12" fill="#1a1a19" stroke="rgba(255,255,255,0.10)"/>
 <text x="24" y="36" font-size="17" font-weight="600" fill="#f0efec">vLLM + BF16N: decode by release</text>
 <text x="24" y="58" font-size="13" fill="#c3c2b7">production, MTP with 3 draft tokens, 4 prompts x 256 greedy tokens without logprobs, tokens per second</text>
-<line x1="387.6" y1="86" x2="387.6" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="387.6" y="594" font-size="11" fill="#898781" text-anchor="middle">0</text>
-<line x1="434.7" y1="86" x2="434.7" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="434.7" y="594" font-size="11" fill="#898781" text-anchor="middle">10</text>
-<line x1="481.7" y1="86" x2="481.7" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="481.7" y="594" font-size="11" fill="#898781" text-anchor="middle">20</text>
-<line x1="528.8" y1="86" x2="528.8" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="528.8" y="594" font-size="11" fill="#898781" text-anchor="middle">30</text>
-<line x1="575.9" y1="86" x2="575.9" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="575.9" y="594" font-size="11" fill="#898781" text-anchor="middle">40</text>
-<line x1="622.9" y1="86" x2="622.9" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="622.9" y="594" font-size="11" fill="#898781" text-anchor="middle">50</text>
-<line x1="670.0" y1="86" x2="670.0" y2="576" stroke="#2c2c2a" stroke-width="1"/>
-<text x="670.0" y="594" font-size="11" fill="#898781" text-anchor="middle">60</text>
-<line x1="387.6" y1="86" x2="387.6" y2="576" stroke="#383835" stroke-width="1"/>
-<text x="670" y="614" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
-<line x1="554.7" y1="82" x2="554.7" y2="576" stroke="#c3c2b7" stroke-width="1.5"/>
-<text x="548.7" y="78" font-size="12" fill="#c3c2b7" text-anchor="end">llama.cpp + BF16N, MTP, same client 35.5</text>
-<g fill="#184f95"><path d="M387.6,101.0 H543.156 Q547.156,101.0 547.156,105.0 V119.0 Q547.156,123.0 543.156,123.0 H387.6 Z"/></g>
-<text x="375.6" y="116.5" font-size="13" fill="#c3c2b7" text-anchor="end">10-30: cutover to vLLM, FlashInfer</text>
-<rect x="550.2" y="101.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="555.2" y="116.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">33.9</text>
-<g fill="#184f95"><path d="M387.6,141.0 H576.1026666666667 Q580.1026666666667,141.0 580.1026666666667,145.0 V159.0 Q580.1026666666667,163.0 576.1026666666667,163.0 H387.6 Z"/></g>
-<text x="375.6" y="156.5" font-size="13" fill="#c3c2b7" text-anchor="end">10-30 M6: Triton attention, async bookkeeping</text>
-<rect x="583.1" y="141.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="588.1" y="156.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">40.9</text>
-<g fill="#184f95"><path d="M387.6,181.0 H578.456 Q582.456,181.0 582.456,185.0 V199.0 Q582.456,203.0 578.456,203.0 H387.6 Z"/></g>
-<text x="375.6" y="196.5" font-size="13" fill="#c3c2b7" text-anchor="end">11-09: batched MoE prefill, GDN state fixes</text>
-<rect x="585.5" y="181.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="590.5" y="196.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">41.4</text>
-<g fill="#184f95"><path d="M387.6,221.0 H578.9266666666667 Q582.9266666666667,221.0 582.9266666666667,225.0 V239.0 Q582.9266666666667,243.0 578.9266666666667,243.0 H387.6 Z"/></g>
-<text x="375.6" y="236.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ fragment-order down experts, split-KV</text>
-<rect x="585.9" y="221.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="590.9" y="236.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">41.5</text>
-<g fill="#184f95"><path d="M387.6,261.0 H581.7506666666667 Q585.7506666666667,261.0 585.7506666666667,265.0 V279.0 Q585.7506666666667,283.0 581.7506666666667,283.0 H387.6 Z"/></g>
-<text x="375.6" y="276.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ 2-bit draft head</text>
-<rect x="588.8" y="261.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="593.8" y="276.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">42.1</text>
-<g fill="#184f95"><path d="M387.6,301.0 H582.692 Q586.692,301.0 586.692,305.0 V319.0 Q586.692,323.0 582.692,323.0 H387.6 Z"/></g>
-<text x="375.6" y="316.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ 6432-token prefill chunks</text>
-<rect x="589.7" y="301.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="594.7" y="316.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">42.3</text>
-<g fill="#184f95"><path d="M387.6,341.0 H598.2239999999999 Q602.2239999999999,341.0 602.2239999999999,345.0 V359.0 Q602.2239999999999,363.0 598.2239999999999,363.0 H387.6 Z"/></g>
-<text x="375.6" y="356.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ BF16 activations in shared memory</text>
-<rect x="605.2" y="341.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="610.2" y="356.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">45.6</text>
-<g fill="#184f95"><path d="M387.6,381.0 H605.7546666666667 Q609.7546666666667,381.0 609.7546666666667,385.0 V399.0 Q609.7546666666667,403.0 605.7546666666667,403.0 H387.6 Z"/></g>
-<text x="375.6" y="396.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ dense GEMVs on the tensor cores</text>
-<rect x="612.8" y="381.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="617.8" y="396.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">47.2</text>
-<g fill="#184f95"><path d="M387.6,421.0 H609.52 Q613.52,421.0 613.52,425.0 V439.0 Q613.52,443.0 609.52,443.0 H387.6 Z"/></g>
-<text x="375.6" y="436.5" font-size="13" fill="#c3c2b7" text-anchor="end">11-10: + lm_head in fragment order</text>
-<rect x="616.5" y="421.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="621.5" y="436.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">48.0</text>
-<g fill="#184f95"><path d="M387.6,461.0 H608.5786666666667 Q612.5786666666667,461.0 612.5786666666667,465.0 V479.0 Q612.5786666666667,483.0 608.5786666666667,483.0 H387.6 Z"/></g>
-<text x="375.6" y="476.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ drafter graphs at their own size</text>
-<rect x="615.6" y="461.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="620.6" y="476.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">47.8</text>
-<g fill="#184f95"><path d="M387.6,501.0 H616.1093333333333 Q620.1093333333333,501.0 620.1093333333333,505.0 V519.0 Q620.1093333333333,523.0 616.1093333333333,523.0 H387.6 Z"/></g>
-<text x="375.6" y="516.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ down experts once per distinct expert</text>
-<rect x="623.1" y="501.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="628.1" y="516.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">49.4</text>
-<g fill="#3987e5"><path d="M387.6,541.0 H641.6194666666668 Q645.6194666666668,541.0 645.6194666666668,545.0 V559.0 Q645.6194666666668,563.0 641.6194666666668,563.0 H387.6 Z"/></g>
-<text x="375.6" y="556.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ gate / up experts in fragment order</text>
-<rect x="648.6" y="541.0" width="37.1" height="22" fill="#1a1a19"/>
-<text x="653.6" y="556.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">54.8</text>
+<line x1="409.4" y1="86" x2="409.4" y2="616" stroke="#2c2c2a" stroke-width="1"/>
+<text x="409.4" y="634" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="452.9" y1="86" x2="452.9" y2="616" stroke="#2c2c2a" stroke-width="1"/>
+<text x="452.9" y="634" font-size="11" fill="#898781" text-anchor="middle">10</text>
+<line x1="496.3" y1="86" x2="496.3" y2="616" stroke="#2c2c2a" stroke-width="1"/>
+<text x="496.3" y="634" font-size="11" fill="#898781" text-anchor="middle">20</text>
+<line x1="539.7" y1="86" x2="539.7" y2="616" stroke="#2c2c2a" stroke-width="1"/>
+<text x="539.7" y="634" font-size="11" fill="#898781" text-anchor="middle">30</text>
+<line x1="583.1" y1="86" x2="583.1" y2="616" stroke="#2c2c2a" stroke-width="1"/>
+<text x="583.1" y="634" font-size="11" fill="#898781" text-anchor="middle">40</text>
+<line x1="626.6" y1="86" x2="626.6" y2="616" stroke="#2c2c2a" stroke-width="1"/>
+<text x="626.6" y="634" font-size="11" fill="#898781" text-anchor="middle">50</text>
+<line x1="670.0" y1="86" x2="670.0" y2="616" stroke="#2c2c2a" stroke-width="1"/>
+<text x="670.0" y="634" font-size="11" fill="#898781" text-anchor="middle">60</text>
+<line x1="409.44000000000005" y1="86" x2="409.44000000000005" y2="616" stroke="#383835" stroke-width="1"/>
+<text x="670" y="654" font-size="11" fill="#898781" text-anchor="end">tokens / s</text>
+<line x1="563.6" y1="82" x2="563.6" y2="616" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="557.6" y="78" font-size="12" fill="#c3c2b7" text-anchor="end">llama.cpp + BF16N, MTP, same client 35.5</text>
+<g fill="#184f95"><path d="M409.44000000000005,101.0 H552.6564000000001 Q556.6564000000001,101.0 556.6564000000001,105.0 V119.0 Q556.6564000000001,123.0 552.6564000000001,123.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="116.5" font-size="13" fill="#c3c2b7" text-anchor="end">10-30: cutover to vLLM, FlashInfer</text>
+<rect x="559.7" y="101.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="564.7" y="116.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">33.9</text>
+<g fill="#184f95"><path d="M409.44000000000005,141.0 H583.0550666666667 Q587.0550666666667,141.0 587.0550666666667,145.0 V159.0 Q587.0550666666667,163.0 583.0550666666667,163.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="156.5" font-size="13" fill="#c3c2b7" text-anchor="end">10-30 M6: Triton attention, async bookkeeping</text>
+<rect x="590.1" y="141.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="595.1" y="156.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">40.9</text>
+<g fill="#184f95"><path d="M409.44000000000005,181.0 H585.2264 Q589.2264,181.0 589.2264,185.0 V199.0 Q589.2264,203.0 585.2264,203.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="196.5" font-size="13" fill="#c3c2b7" text-anchor="end">11-09: batched MoE prefill, GDN state fixes</text>
+<rect x="592.2" y="181.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="597.2" y="196.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">41.4</text>
+<g fill="#184f95"><path d="M409.44000000000005,221.0 H585.6606666666667 Q589.6606666666667,221.0 589.6606666666667,225.0 V239.0 Q589.6606666666667,243.0 585.6606666666667,243.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="236.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ fragment-order down experts, split-KV</text>
+<rect x="592.7" y="221.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="597.7" y="236.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">41.5</text>
+<g fill="#184f95"><path d="M409.44000000000005,261.0 H588.2662666666666 Q592.2662666666666,261.0 592.2662666666666,265.0 V279.0 Q592.2662666666666,283.0 588.2662666666666,283.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="276.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ 2-bit draft head</text>
+<rect x="595.3" y="261.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="600.3" y="276.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">42.1</text>
+<g fill="#184f95"><path d="M409.44000000000005,301.0 H589.1348 Q593.1348,301.0 593.1348,305.0 V319.0 Q593.1348,323.0 589.1348,323.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="316.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ 6432-token prefill chunks</text>
+<rect x="596.1" y="301.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="601.1" y="316.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">42.3</text>
+<g fill="#184f95"><path d="M409.44000000000005,341.0 H603.4656 Q607.4656,341.0 607.4656,345.0 V359.0 Q607.4656,363.0 603.4656,363.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="356.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ BF16 activations in shared memory</text>
+<rect x="610.5" y="341.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="615.5" y="356.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">45.6</text>
+<g fill="#184f95"><path d="M409.44000000000005,381.0 H610.4138666666668 Q614.4138666666668,381.0 614.4138666666668,385.0 V399.0 Q614.4138666666668,403.0 610.4138666666668,403.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="396.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ dense GEMVs on the tensor cores</text>
+<rect x="617.4" y="381.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="622.4" y="396.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">47.2</text>
+<g fill="#184f95"><path d="M409.44000000000005,421.0 H613.888 Q617.888,421.0 617.888,425.0 V439.0 Q617.888,443.0 613.888,443.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="436.5" font-size="13" fill="#c3c2b7" text-anchor="end">11-10: + lm_head in fragment order</text>
+<rect x="620.9" y="421.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="625.9" y="436.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">48.0</text>
+<g fill="#184f95"><path d="M409.44000000000005,461.0 H613.0194666666666 Q617.0194666666666,461.0 617.0194666666666,465.0 V479.0 Q617.0194666666666,483.0 613.0194666666666,483.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="476.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ drafter graphs at their own size</text>
+<rect x="620.0" y="461.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="625.0" y="476.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">47.8</text>
+<g fill="#184f95"><path d="M409.44000000000005,501.0 H619.9677333333334 Q623.9677333333334,501.0 623.9677333333334,505.0 V519.0 Q623.9677333333334,523.0 619.9677333333334,523.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="516.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ down experts once per distinct expert</text>
+<rect x="627.0" y="501.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="632.0" y="516.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">49.4</text>
+<g fill="#184f95"><path d="M409.44000000000005,541.0 H643.5049866666667 Q647.5049866666667,541.0 647.5049866666667,545.0 V559.0 Q647.5049866666667,563.0 643.5049866666667,563.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="556.5" font-size="13" fill="#c3c2b7" text-anchor="end">+ gate / up experts in fragment order</text>
+<rect x="650.5" y="541.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="655.5" y="556.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">54.8</text>
+<g fill="#3987e5"><path d="M409.44000000000005,581.0 H641.1599466666667 Q645.1599466666667,581.0 645.1599466666667,585.0 V599.0 Q645.1599466666667,603.0 641.1599466666667,603.0 H409.44000000000005 Z"/></g>
+<text x="397.44000000000005" y="596.5" font-size="13" fill="#c3c2b7" text-anchor="end">11-11: + FA2 prefill (one prompt's text changed)</text>
+<rect x="648.2" y="581.0" width="37.1" height="22" fill="#1a1a19"/>
+<text x="653.2" y="596.5" font-size="13" font-weight="600" fill="#f0efec" stroke="#1a1a19" stroke-width="5" stroke-linejoin="round" paint-order="stroke">54.3</text>
 </svg>

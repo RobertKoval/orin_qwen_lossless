@@ -1,6 +1,6 @@
 # vLLM + BF16N: results (M1–M6 and the production releases since)
 
-Milestones measured 2026-10-30, production releases 2026-11-09 / 11-10 (from
+Milestones measured 2026-10-30, production releases 2026-11-09 / 11-10 / 11-11 (from
 [the 11-09 release](#2026-11-09-release-batched-moe-prefill-gdn-state-fixes-unmodified-sampling-measured) on), on the
 Jetson AGX Orin 64GB (pinned clocks unless stated, production stopped for A/B runs). Comparisons are
 BF16 only: vLLM-BF16N against llama.cpp-BF16N (same client where stated), vLLM-BF16N plain against MTP, and per op
@@ -752,3 +752,62 @@ Production wheel `0.1.0+g5bde7a8faf58` against `0.1.0+g2073cc586b59`; new compil
   (0.495), 197K 32.0 (31.7) at 0.562 (0.615), i.e. step 66.9 / 84.0 ms (72.8 / 89.9); prefill 8K 2068 (1874), 23K
   1885 (1747), 72K 1396, 197K 930; MemFree + Cached 2.63–2.80 GiB, needles found; model loading 45.76 GiB (45.60).
   After a watchdog restart (compiled graph loaded, no recompile): the same texts and acceptance, state checks pass.
+
+## 2026-11-11 eleventh release: FA2 prefill attention over prefix segments (measured)
+
+Production wheel `0.1.0+gb0bda1b4749f` against `0.1.0+g5bde7a8faf58`; the same compile-cache key (the change is
+outside the compiled graphs).
+
+* **Why.** A 111K-token prompt took 96.6 s to prefill, 52 % of it in attention (an nsys trace of every chunk). The
+  attention cost grows with the cached prefix, and FlashInfer's paged prefill ran at ~24.5 TFLOPS at every length: its
+  tile is 64 queries × 32 keys, and its own tile variants gained ≤ 7 %. vLLM's FA2 (128 × 64 tile, 8 warps) reaches
+  29.5 TFLOPS on contiguous K / V, but over the whole paged prefix of a ≥ 161K context it falls back to ~24.6. At that
+  length one layer's K + V outgrows the GPU's TLB reach (64 KB pages; `bench/micro/tlbprobe.cu`: L1 reach 64–96 MB,
+  L2 256–384 MB). Splitting the prefix into 32K-token segments keeps 29.4 at 246K.
+* **Change (T-101).** A one-request prefill chunk of ≥ 384 tokens runs FA2. The chunk attends to its own keys causally,
+  straight into the output. The cached prefix is split into 30-page (32,160-token) segments: each segment is gathered
+  into a 224 MB scratch allocated at engine start and attended with no mask. The partial results are merged by their
+  log-sum-exp in FP32 by a Triton kernel. All query heads of a layer go into one FA2 call, since per-KV-head calls left
+  half-empty waves on the 16 SMs. Smaller chunks, mixed and two-request batches, and MTP verification keep their
+  previous kernels. `BF16N_FA2_PREFILL=0` turns the route off.
+* **Kernels** (one layer, `bench/micro/prefill_attn.py`, production stopped). Against FlashInfer:
+  * 6432 queries: 1.16× over a 111K context, 1.19× over 240K;
+  * 768–3200 queries: 1.12–1.15×; 384 queries: 1.07×;
+  * 256 queries: 1.01–1.04×; 128 queries: 0.90–0.93× (hence the 384-token threshold).
+
+  The route is bitwise deterministic: repeated calls with a NaN-filled scratch and two page permutations of the same
+  sequence give the same bits. Tests compare it against an FP32 reference at segment and
+  page boundaries (prior 0, S − 1, S, S + 1, not page-aligned).
+* **Numerics.** Weights unchanged. Attention outputs move at BF16 rounding (FA2 sums in another order). Prompts under
+  384 tokens are unaffected. The A/B ran 5 long prompts (1K–77K tokens, 200 greedy tokens each): every text diverges
+  from the previous release at a near-tie (top-2 margin 0–0.5 nat). Before each divergence the top-1 logprob drifts
+  by at most 0.18 nat, about one BF16 logit ulp. Each side's texts are identical across its own two starts.
+* **A/B** (`:8010`, order A B B A, `--max-num-seqs 1`; the long prompts use a random salt, so there are no prefix hits):
+
+| | previous (2 starts) | this release (2 starts) | change |
+|---|---|---|---|
+| 111K prompt, time to first token | 92.5 / 94.9 s | 86.4 / 86.2 s | −7.9 % |
+| 197K prompt, time to first token | 227.0 / 227.2 s | 206.1 / 205.8 s | −9.4 % (868 → 956 tok/s) |
+| 72K prompt, time to first token | 50.2 / 49.8 s | 49.8 / 47.2 s | −3 % |
+| needle at 193K / 77K: prefill | 879, 878 / 1398, 1396 | 967, 969 / 1483, 1487 | +10 / +6 % |
+| prefill 23K | 1885, 1887 | 1916, 1901 | +1.2 % |
+| prefill 8K | 2064, 2063 | 2066, 1772 (one noisy run) | = (production 2076) |
+| decode, 4 prompts, no logprobs | 55.02 / 54.65 | 54.27 / 54.61 | = (prompt 3's text changed: acceptance 0.556 → 0.530) |
+| EngineCore RSS after start (installed wheel, route off / on) | 52.24 / 52.24 GiB | 52.70 / 52.70 GiB | +0.46 GiB |
+
+* **Memory.** RSS after start is 0.46 GiB higher: 0.21 GiB is the scratch, and the rest is FA2's warm-up at engine start.
+  After an 8K and a 23K prefill, the two settings read the same (54.2 GiB). The off side allocates FlashInfer's prefill
+  memory at its first request; the on side here never planned a FlashInfer prefill. In production, after short and
+  long prompts, RSS reads 54.35–54.36 GiB. The 11-10 production read 54.0 (T-091).
+* **Production** (state checks pass; the long-prompt texts are bitwise those of the A/B's B; short prompts are
+  identical to the previous release):
+  * time to first token: 111K 86.0 s (92.5 / 94.9), 197K 205.4 s (227.0 / 227.2);
+  * prefill 8K 2076 (2068), 23K 1923 (1885);
+  * decode 54.3 tok/s without logprobs (54.8), 53.3 with (53.8): prompt 3's text and acceptance changed;
+  * full window: a 245,818-token request prefills at 836 tok/s (743 for the previous build), needle found; free
+    memory after a 4K image, that request and a second image stays ≥ 2.86 GiB, and 2.45 GiB after the 111K / 197K
+    requests (budget ≥ 2 GiB);
+  * the harness used for earlier releases, whose 200K prompt shares ~36K leading tokens with its 65K one (T-103):
+    72K 1516 tok/s (1396), 197K 1044 (930).
+
+  The server loaded its compiled graph (0 compiles).

@@ -29,7 +29,7 @@ One implementation of the format and kernels (`core/`) runs in two engines: **ll
   flip (see [Limitations](#limitations)).
 * **Fits with room to spare.** 46.5 GB resident instead of 69.3 GB (ratio 0.671): the model's full 262,144-token window
   and its vision encoder fit beside the weights.
-* **Fast.** ≈ 31 tok/s single-stream decode, 54.8 with the checkpoint's own multi-token-prediction layer as a
+* **Fast.** ≈ 31 tok/s single-stream decode, 54.3 with the checkpoint's own multi-token-prediction layer as a
   speculative draft (vLLM; 40.2 in llama.cpp), 830–2070 tok/s prefill on a 60 W board. Per matrix, the fused decode+GEMV beats raw BF16: the
   248320×2048 output projection takes 4.3 ms vs 5.7 ms for cuBLAS BF16.
 * **Two engines, one format.** llama.cpp: an ordinary BF16 GGUF and `LLAMA_BF16N=hybrid`; vLLM: the original
@@ -53,9 +53,9 @@ Both engines with BF16N on the same board (MAXN, pinned clocks). Decode is singl
 |---|---|---|
 | weights resident | 46.5 GB (0.671), 472/472 tensors bit-exact at load | 45.8 GiB with the MTP layer and the BF16 vision encoder (43.5 + 1.0 + 0.9 at the 11-01 release; fragment-order padding since), every tensor bit-exact at load |
 | decode, no draft, same client | 28.6 | 32.7 (FlashInfer, M2); 31.1 in the M6 configuration |
-| decode with the MTP draft, same client | 35.5 (1 draft token) | 53.8 (3 draft tokens); **54.8** without logprobs |
+| decode with the MTP draft, same client | 35.5 (1 draft token) | 53.3 (3 draft tokens); **54.3** without logprobs |
 | decode, `llama-bench` tg64 / `llama-server` MTP (4 × 400 tokens) | 31.2 / 40.2 | — |
-| prefill 8k / 23k tokens | 832–1481 (`llama-bench`, ub 512–4096) / 1192 (server) | 2068 / 1885 (production config) |
+| prefill 8k / 23k tokens | 832–1481 (`llama-bench`, ub 512–4096) / 1192 (server) | 2076 / 1923 (production config) |
 | long-context decode (MTP) | 27.1 @ 64K, 22.6 @ 224K | 39.1 @ 72K, 32.0 @ 197K (11-09 haystack; step 66.9 / 84.0 ms) |
 | two concurrent sessions | — | 87 ms per step, 30.6–36.4 tok/s each (68 % of one stream) |
 | full 262,144 window + images | yes | yes (images capped at 4.19 MP) |
@@ -156,7 +156,7 @@ Correctness, methodology and the full history of what was tried: [docs/llamacpp/
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/vllm-decode-dark.svg">
-    <img alt="vLLM + BF16N decode by release, production, MTP with 3 draft tokens, tokens per second: cutover 33.9, M6 40.9, batched MoE prefill 41.4, fragment-order down experts 41.5, 2-bit draft head 42.1, 6432-token chunks 42.3, BF16 activations in shared memory 45.6, dense GEMVs on the tensor cores 47.2, lm_head in fragment order 48.0, drafter graphs 47.8, down experts once per distinct expert 49.4, gate / up experts in fragment order 54.8; llama.cpp + BF16N with MTP, same client, 35.5" src="docs/img/vllm-decode-light.svg" width="760">
+    <img alt="vLLM + BF16N decode by release, production, MTP with 3 draft tokens, tokens per second: cutover 33.9, M6 40.9, batched MoE prefill 41.4, fragment-order down experts 41.5, 2-bit draft head 42.1, 6432-token chunks 42.3, BF16 activations in shared memory 45.6, dense GEMVs on the tensor cores 47.2, lm_head in fragment order 48.0, drafter graphs 47.8, down experts once per distinct expert 49.4, gate / up experts in fragment order 54.8, FA2 prefill (one prompt's text changed) 54.3; llama.cpp + BF16N with MTP, same client, 35.5" src="docs/img/vllm-decode-light.svg" width="760">
   </picture>
 </p>
 
@@ -165,19 +165,20 @@ with 3 draft tokens, prefix caching, tool and reasoning parsers. Each bar above 
 release (`bench_openai.py`, 4 prompts × 256 greedy tokens, without logprobs); every release kept the weights bit-exact
 and was A/B-tested against the previous one on the same board before it shipped.
 
-| production, 2026-11-10 (wheel `0.1.0+g5bde7a8faf58`) | |
+| production, 2026-11-11 (wheel `0.1.0+gb0bda1b4749f`) | |
 |---|---|
-| short-context decode, MTP 3 | **54.8 tok/s** (53.8 with logprobs) |
-| long context (haystack, needle found) | 72K: prefill 1396 tok/s, decode 39.1; 197K: prefill 930, decode 32.0 (step 66.9 / 84.0 ms; decode speed follows the draft acceptance of the generated text, here 0.54 / 0.56) |
-| prefill | 2068 tok/s at 8K, 1885 at 23K (6432-token chunks) |
+| short-context decode, MTP 3 | **54.3 tok/s** (53.3 with logprobs; 54.8 / 53.8 before this release changed one prompt's greedy text and its draft acceptance) |
+| long context, no cached prefix | 111K prompt: first token after 86.0 s (1291 tok/s); 197K: 205.4 s (959 tok/s); 246K: 836 tok/s, needle found |
+| long context (haystack, needle found) | 72K: prefill 1516 tok/s, decode 40.0; 197K: prefill 1044 (its 200K prompt shares ~36K leading tokens with the 65K one), decode 34.2 (decode speed follows the draft acceptance of the generated text, here 0.57 / 0.63; step 66.9 / 84.0 ms at 0.54 / 0.56 on 11-10) |
+| prefill | 2076 tok/s at 8K, 1923 at 23K (6432-token chunks) |
 | two concurrent sessions (`--max-num-seqs 2`) | 87 ms per step, 30.6–36.4 tok/s each: 68 % of one stream per session (goal: 80 %) |
-| memory at the full window | ≥ 2.59 GiB free after a 4K image and a 246K request |
-| output agreement (teacher-forced, 382–383 tokens) | top-1 99.74 %, mean KL 1.6e-3 against vLLM's exact-dequant reference path (stock torch kernels); 100 % / 2.1e-3 against llama.cpp-BF16N |
+| memory at the full window | ≥ 2.86 GiB free after a 4K image and a 246K request; 2.45 GiB after 111K / 197K requests |
+| output agreement (teacher-forced, 382–383 tokens; 11-10 build, the same kernels for prompts under 384 tokens) | top-1 99.74 %, mean KL 1.6e-3 against vLLM's exact-dequant reference path (stock torch kernels); 100 % / 2.1e-3 against llama.cpp-BF16N |
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/vllm-prefill-dark.svg">
-    <img alt="vLLM + BF16N prefill of an 8192-token prompt by release, production, tokens per second: dequant + Triton fused_experts 1439, batched BF16N MoE kernels 1516, fragment-order down experts and split-KV 1762, 6432-token chunks 1903, gate / up in fragment order with fused SwiGLU 2068" src="docs/img/vllm-prefill-light.svg" width="760">
+    <img alt="vLLM + BF16N prefill of an 8192-token prompt by release, production, tokens per second: dequant + Triton fused_experts 1439, batched BF16N MoE kernels 1516, fragment-order down experts and split-KV 1762, 6432-token chunks 1903, gate / up in fragment order with fused SwiGLU 2068, FA2 prefill over prefix segments 2076" src="docs/img/vllm-prefill-light.svg" width="760">
   </picture>
 </p>
 
@@ -192,7 +193,8 @@ What the releases of 2026-11-09/10 changed: batched BF16N kernels for every MoE 
 (down, then gate / up with the SwiGLU fused) in tensor-core fragment order and decoded once per distinct expert of a
 verification batch; one split-KV program per multi-token sequence; a 2-bit draft-only candidate head; dense decode
 GEMVs and lm_head on the tensor cores (8 tokens per weight decode); GDN state fixes; MTP drafter graphs at the
-drafter's own row count; target sampling unmodified. Greedy texts change between releases at near ties (the
+drafter's own row count; target sampling unmodified. On 2026-11-11: long prefill chunks through FA2 over 32K-token
+prefix segments (−8 % / −9 % to the first token at 111K / 197K). Greedy texts change between releases at near ties (the
 summation order changes), the weights never do.
 The milestones, the step analysis, every release's A/B and what did not help: [docs/vllm/RESULTS.md](docs/vllm/RESULTS.md);
 design and settings: [docs/vllm/README.md](docs/vllm/README.md).

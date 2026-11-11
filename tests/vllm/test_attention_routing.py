@@ -123,3 +123,100 @@ def test_fi_prefill_plan_matches_reference(seq_lens, q_lens):
     out = torch.empty_like(q)
     w.run(q, cache, out=out)
     check(out, reference(q, dense, q_lens))
+
+
+# ---- FA2 route for long prefill chunks (triton_spec module docstring, 3; T-101)
+BS = 1072
+
+
+@pytest.mark.parametrize("seg_pages", [1, 2, 30])
+@pytest.mark.parametrize("prior_in_segments", [0, 1, BS - 1, BS, BS + 1, "S-1", "S", "S+1", "2S", "2S+1", "3S-5"])
+def test_fa2_segments_partition_the_prefix(prior_in_segments, seg_pages):
+    """Segments cover [0, prior) exactly, in order, page-aligned, none longer than seg_pages pages."""
+    from vllm_bf16n.triton_spec import fa2_segments
+
+    S = seg_pages * BS
+    named = {"S-1": S - 1, "S": S, "S+1": S + 1, "2S": 2 * S, "2S+1": 2 * S + 1, "3S-5": 3 * S - 5}
+    prior = named.get(prior_in_segments, prior_in_segments)
+    segs = fa2_segments(prior, BS, seg_pages)
+    assert len(segs) == -(-prior // S)
+    t = 0
+    for p0, pages, tokens in segs:
+        assert p0 * BS == t and 0 < tokens <= S and pages == -(-tokens // BS) <= seg_pages
+        t += tokens
+    assert t == prior
+
+
+def test_fa2_segments_rejects_invalid_arguments():
+    from vllm_bf16n.triton_spec import fa2_segments
+
+    for args in ((-1, BS, 30), (10, 0, 30), (10, BS, 0)):
+        with pytest.raises(ValueError):
+            fa2_segments(*args)
+
+
+def test_fa2_route_threshold():
+    from vllm_bf16n.triton_spec import fa2_route
+
+    t = 512
+    assert not fa2_route(1, t - 1, t)
+    assert fa2_route(1, t, t) and fa2_route(1, t + 1, t)
+    assert not fa2_route(2, 4 * t, t)  # several requests keep FlashInfer
+
+
+def _needles(cache, bt, dense, q, positions):
+    """Make every query of the batch attend strongly to the keys at `positions` (score 10 against N(0, 1) for the
+    rest) with a distinct value each, so a key lost or counted twice at a segment boundary moves the output by ~0.1+.
+    All queries are one vector shared by every head."""
+    qv = q[0, 0].float()
+    k = (qv * (10.0 / (qv.dot(qv).item() * D ** -0.5))).to(torch.bfloat16).cpu()
+    for j, pos in enumerate(positions):
+        v = torch.zeros(D)
+        v[j % D] = 4.0
+        b, o = int(bt[0, pos // BS]), pos % BS
+        for h in range(HKV):
+            dense[0][0, pos, h] = k
+            dense[0][1, pos, h] = v.to(torch.bfloat16)
+        cache[b, 0, o] = k.cuda()
+        cache[b, 1, o] = v.to(torch.bfloat16).cuda()
+
+
+@pytest.mark.parametrize("kv_per_call", [1, 2])
+@pytest.mark.parametrize("q_len", [9, 600, 1000])
+@pytest.mark.parametrize("prior", [0, 2 * BS - 1, 2 * BS, 2 * BS + 1, 4 * BS + 700])
+def test_fa2_prefill_matches_reference(prior, q_len, kv_per_call):
+    """The FA2 route at 2-page segments (S = 2144 tokens), one or both KV heads per FA2 call: no prefix, a prefix one key short of / exactly / one key
+    past a segment, and three segments ending inside a page; needles at 0, around every segment boundary, at the last
+    prefix key and at the chunk's first key."""
+    from vllm_bf16n.triton_spec import Fa2Buffers, fa2_prefill, fa2_segments
+
+    seg_pages, S = 2, 2 * BS
+    s = prior + q_len
+    cache, bt, dense = paged([s], BS, seed=prior + 31 * q_len)
+    q = torch.randn(1, 1, D, generator=torch.Generator().manual_seed(q_len)).expand(q_len, HQ, D)
+    q = q.to(torch.bfloat16).contiguous().cuda()
+    marks = {0, prior}
+    for b in range(S, prior + 1, S):
+        marks |= {b - 1, b, b + 1}
+    marks |= {prior - 1} if prior else set()
+    _needles(cache, bt, dense, q, sorted(m for m in marks if 0 <= m < s))
+    segs = fa2_segments(prior, BS, seg_pages)
+    cu_k = torch.tensor([[0, t] for _, _, t in segs], dtype=torch.int32).cuda() if segs else None
+    cu_q = torch.tensor([0, q_len], dtype=torch.int32).cuda()
+    kv = dense[0][:, prior:].cuda()  # the chunk's own keys / values, as forward receives them
+    out = torch.full_like(q, float("nan"))
+    fa2_prefill(q, kv[0].contiguous(), kv[1].contiguous(), cache[:, 0], cache[:, 1], out, cu_q, bt[0], segs, cu_k,
+                D ** -0.5, Fa2Buffers(q_len, HQ // HKV * kv_per_call, kv_per_call, D, seg_pages * BS, "cuda"))
+    check(out, reference(q, dense, [q_len]))
+
+
+def test_fa2_prefill_rejects_rows_beyond_the_scratch():
+    from vllm_bf16n.triton_spec import Fa2Buffers, fa2_prefill
+
+    q = torch.zeros(65, HQ, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.zeros(65, HKV, D, dtype=torch.bfloat16, device="cuda")
+    cache = torch.zeros(1, BS, HKV, D, dtype=torch.bfloat16, device="cuda")
+    cu = torch.tensor([0, 65], dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError):
+        fa2_prefill(q, kv, kv, cache, cache, torch.empty_like(q), cu, torch.zeros(1, dtype=torch.int32, device="cuda"),
+                    [], None, D ** -0.5, Fa2Buffers(64, HQ, HKV, D, BS, "cuda"))

@@ -125,6 +125,14 @@ llama.cpp's shapes), because vLLM's merged projections leave "largest R with ≥
   context segments (vLLM: 16), and a multi-token batch puts all query tokens of a sequence into one program
   (`BLOCK_Q` = next power of two of the query length; vLLM's block holds 2 tokens at 8 query heads per KV head):
   one 4-token verification at 200K 2.77 → 2.49 ms per layer (`bench/micro/spec_attn_blockq.py`).
+* Long prefill chunks (one request, ≥ 384 tokens; 11-11 release) run FA2 instead of FlashInfer: the chunk's own keys
+  causally, the cached prefix in 32,160-token segments gathered into a 224 MB scratch allocated at engine start and
+  attended without a mask, the partial results merged by their log-sum-exp in FP32. FlashInfer's prefill kernel stays
+  at ~24.5 TFLOPS at every length (its tile shape); FA2 reaches 29.5 on contiguous K / V but over the whole paged
+  prefix of a ≥ 161K context falls back to ~24.6, because one layer's K + V no longer fits the GPU's TLB reach (64 KB
+  pages); 32K segments keep 29.4 at 246K. One layer, 6432 queries: 1.16× FlashInfer over 111K, 1.19× over 240K
+  (`bench/micro/prefill_attn.py`). Shorter chunks and batches of two requests keep FlashInfer;
+  `BF16N_FA2_PREFILL=0` turns the route off.
 * Align-mode prefix caching with asynchronous accepted-token bookkeeping (`async_align.py`).
 * GDN state correctness on vLLM 0.20 (`hybrid_state.py`, T-066), three upstream defects that made the target read a
   recurrent state not its own: a prefill of exactly 1 + 3 tokens was dispatched to the FULL spec-decode CUDA graph

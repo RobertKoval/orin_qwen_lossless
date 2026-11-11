@@ -327,7 +327,12 @@
       {
         "label": "+ gate / up experts in fragment order",
         "value": 54.82,
-        "value_label": "54.8",
+        "value_label": "54.8"
+      },
+      {
+        "label": "11-11: + FA2 prefill (one prompt's text changed)",
+        "value": 54.28,
+        "value_label": "54.3",
         "highlight": true
       }
     ]
@@ -370,7 +375,12 @@
       {
         "label": "11-10: + gate / up in fragment order, fused SwiGLU",
         "value": 2068,
-        "value_label": "2068",
+        "value_label": "2068"
+      },
+      {
+        "label": "11-11: + FA2 prefill over prefix segments",
+        "value": 2076,
+        "value_label": "2076",
         "highlight": true
       }
     ]

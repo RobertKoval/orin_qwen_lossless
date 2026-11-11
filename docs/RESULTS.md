@@ -14,17 +14,17 @@ Benchmark inputs are frozen (`bench/prompts/`). Details and methodology per engi
 | decode, no draft | llama.cpp | 31.2 tok/s (tg64, ±0.3 %); 28.6 same client | `llama-bench`; `bench_openai.py` |
 | decode, no draft | vLLM | 32.7 tok/s (M2, FlashInfer); 31.1 (M6 config) | `bench_openai.py` |
 | decode, MTP draft | llama.cpp | 40.2 tok/s (1 draft token, 4 × 400 tokens); 35.5 same client | `llama-server`; `bench_openai.py` |
-| decode, MTP draft | vLLM | **54.8 tok/s** (3 draft tokens, without logprobs; 2026-11-10); 53.8 with logprobs | `bench_openai.py` |
+| decode, MTP draft | vLLM | **54.3 tok/s** (3 draft tokens, without logprobs; 2026-11-11: one prompt's greedy text changed and its draft acceptance with it, 54.8 on 2026-11-10); 53.3 with logprobs | `bench_openai.py` |
 | decode, two concurrent streams | vLLM | 30.6–36.4 tok/s per stream, 68 % of one stream (`--max-num-seqs 2`, 512 greedy tokens, two starts; 28.7–30.6 and 65 % for the previous release in the same session); step 87 ms for two sessions (99.5 before, 134 on 2026-11-09), 59 ms for one | `bench_streams.py`, vLLM log |
 | prefill 8k | llama.cpp | 832 / 1323 / 1481 tok/s (ub 512 / 2048 / 4096) | `llama-bench` |
-| prefill 8k / 23k | vLLM | 2068 / 1885 tok/s in the production config (6432-token chunks; 1874 / 1747 before the fragment-order gate / up experts, 1762 / 1696 with 4288-token chunks, 1516 / 1488 before the fragment-order down experts, 1439 / 1367 before the batched MoE prefill) | `bench_prefill.py` |
+| prefill 8k / 23k | vLLM | 2076 / 1923 tok/s in the production config (2026-11-11; 6432-token chunks; 2068 / 1885 before the FA2 prefill route, 1874 / 1747 before the fragment-order gate / up experts, 1762 / 1696 with 4288-token chunks, 1516 / 1488 before the fragment-order down experts, 1439 / 1367 before the batched MoE prefill) | `bench_prefill.py` |
 | prefill 23k | llama.cpp | 1192 tok/s | `llama-server`, same client |
 | long-context decode | llama.cpp | 27.1 @ 64K, 22.6 @ 224K (MTP); 25.1 / 16.6 without | `llama-server` / `llama-bench` |
 | long-context prefill | llama.cpp | 648 tok/s at 224K (585 with the MTP draft) | `llama-server` |
-| long-context prefill | vLLM | 1396 tok/s at 72K, 930 at 197K (production, 2026-11-10); 743 at 246K (A/B, same build) | `long_ctx_test.py` |
+| long-context prefill | vLLM | 111K prompt in 86.0 s (1291 tok/s), 197K in 205.4 s (959) with no cached prefix; 836 tok/s at 246K (production, 2026-11-11; 92.5–94.9 s / 227 s / 743 before the FA2 prefill route). The harness of earlier releases, whose 200K prompt shares ~36K leading tokens with its 65K one: 1516 tok/s at 72K, 1044 at 197K (1396 / 930 on 2026-11-10) | `long_ctx_test.py`; the no-prefix figures from one request with a random salt |
 | long-context decode | vLLM | 39.1 @ 72K, 32.0 @ 197K (MTP 3, 2026-11-09 haystack, draft acceptance 0.54 / 0.56; step 66.9 / 84.0 ms; production 2026-11-10); 27.5 @ 246K (A/B, same build) | `long_ctx_test.py` |
 | free memory, full window + vision | llama.cpp | ≈ 3 GB (process 56.4–56.7 GB after a 4K image) | |
-| free memory, full window + vision | vLLM | ≥ 2.59 GiB after a 4K image and a 246K request (2026-11-10) | MemFree + Cached |
+| free memory, full window + vision | vLLM | ≥ 2.86 GiB after a 4K image and a 246K request, 2.45 GiB after 111K / 197K requests (2026-11-11; 2.59 on 2026-11-10) | MemFree + Cached |
 | agreement between engines | both | top-1 99.5–100 %, mean KL ≈ 2e-3 (teacher-forced on llama.cpp's tokens) | `compare_llama.py` |
 | per op: lm_head 248320 × 2048 | both | 4.3 ms fused decode+GEMV vs 5.7 ms cuBLAS BF16 | nsys |
 | per op: prefill MoE | llama.cpp | batched kernel 2.4–2.7× over dequant + cuBLAS | `moe_prefill.cpp` |
